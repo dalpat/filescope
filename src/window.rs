@@ -106,7 +106,9 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
     header.pack_end(&zoom_out);
 
     let tab_view = adw::TabView::new();
-    let tab_bar = adw::TabBar::builder().view(&tab_view).autohide(false).expand_tabs(false).build();
+    // Autohide: the tab bar disappears when only one tab is open (no point
+    // showing a single-tab strip) and returns as soon as a second tab exists.
+    let tab_bar = adw::TabBar::builder().view(&tab_view).autohide(true).expand_tabs(false).build();
 
     let status = gtk::Label::builder().xalign(0.0).build();
     status.add_css_class("dim-label");
@@ -243,8 +245,17 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
 
     window.present();
 
-    let start = initial.map(PathBuf::from).filter(|p| p.is_dir()).unwrap_or_else(glib::home_dir);
-    new_tab(&state, gio::File::for_path(start), true);
+    // Startup: if a folder was passed on the command line, open it; otherwise
+    // land on "This PC" (the drives overview) rather than Home. The tab is still
+    // seeded at Home so Back/Up have a sensible base to fall to.
+    match initial.map(PathBuf::from).filter(|p| p.is_dir()) {
+        Some(dir) => new_tab(&state, gio::File::for_path(dir), true),
+        None => {
+            new_tab(&state, gio::File::for_path(glib::home_dir()), true);
+            let tab = active_tab(&state);
+            show_computer(&state, &tab);
+        }
+    }
 }
 
 // --- Tabs -------------------------------------------------------------------
@@ -601,6 +612,7 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     action!("up", |s: &Rc<App>| { let t = active_tab(s); go_up(s, &t); });
     action!("home", |s: &Rc<App>| { let t = active_tab(s); navigate(s, &t, gio::File::for_path(glib::home_dir())); });
     action!("open", open_selected);
+    action!("open-with", open_with);
     action!("preview", toggle_preview);
     action!("copy", |s: &Rc<App>| set_clipboard(s, false));
     action!("cut", |s: &Rc<App>| set_clipboard(s, true));
@@ -701,6 +713,31 @@ fn open_selected(app: &Rc<App>) {
             launch(app, &file);
         }
     }
+}
+
+/// "Open With…": let the user pick which application opens the selected file.
+/// Uses the platform app chooser (via `FileLauncher::always_ask`), so it lists
+/// every app that handles the type plus an "Other Application…" escape hatch.
+fn open_with(app: &Rc<App>) {
+    let tab = active_tab(app);
+    let items = selected(&tab);
+    let [(file, info)] = items.as_slice() else {
+        return;
+    };
+    if info.file_type() == gio::FileType::Directory {
+        return; // "Open With" is only meaningful for files.
+    }
+    let launcher = gtk::FileLauncher::new(Some(file));
+    launcher.set_always_ask(true);
+    let app = app.clone();
+    launcher.launch(Some(&app.window.clone()), gio::Cancellable::NONE, move |res| {
+        if let Err(err) = res {
+            // Dismissing the chooser isn't an error worth a toast.
+            if !err.matches(gtk::DialogError::Dismissed) {
+                toast(&app, &format!("Couldn't open: {err}"));
+            }
+        }
+    });
 }
 
 /// Space toggles a Quick-Look style preview of the single selected file.
@@ -958,12 +995,33 @@ fn update_chrome(app: &Rc<App>) {
     app.fwd_btn.set_sensitive(!tab.fwd.borrow().is_empty());
     app.up_btn.set_sensitive(tab.dir_list.file().and_then(|f| f.parent()).is_some());
 
+    // The window (and, via it, the header) title follows the active tab's
+    // location, so it always names the folder you're in — or "This PC".
+    let in_computer = tab.view_stack.visible_child_name().as_deref() == Some("computer");
+    let win_title = if in_computer {
+        "This PC".to_string()
+    } else {
+        tab.dir_list
+            .file()
+            .map(|f| f.basename().map(|b| b.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into()))
+            .unwrap_or_else(|| "filescope".into())
+    };
+    app.window.set_title(Some(&win_title));
+
     let total = tab.selection.n_items();
     let sel = selected(&tab);
-    let text = if tab.view_stack.visible_child_name().as_deref() == Some("computer") {
+    let text = if in_computer {
         "This PC".to_string()
     } else if sel.is_empty() {
         format!("{total} item{}", plural(total as usize))
+    } else if let [(_, info)] = sel.as_slice() {
+        // A single selection: show its full name (folders) or name and size.
+        let name = info.display_name();
+        if info.file_type() == gio::FileType::Directory {
+            name.to_string()
+        } else {
+            format!("{name} — {}", format::human_size(info.size().max(0) as u64))
+        }
     } else {
         let bytes: u64 = sel
             .iter()
@@ -982,9 +1040,9 @@ fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
     let one = count == 1;
     let has_clip = !app.clipboard.borrow().files.is_empty();
     for (name, enabled) in [
-        ("open", has_sel), ("preview", one), ("cut", has_sel), ("copy", has_sel),
-        ("paste", has_clip), ("rename", one), ("trash", has_sel), ("delete", has_sel),
-        ("properties", one),
+        ("open", has_sel), ("open-with", one), ("preview", one), ("cut", has_sel),
+        ("copy", has_sel), ("paste", has_clip), ("rename", one), ("trash", has_sel),
+        ("delete", has_sel), ("properties", one),
     ] {
         if let Some(act) = app.window.lookup_action(name) {
             act.downcast::<gio::SimpleAction>().unwrap().set_enabled(enabled);
@@ -1098,6 +1156,7 @@ fn context_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     let a = gio::Menu::new();
     a.append(Some("Open"), Some("win.open"));
+    a.append(Some("Open With…"), Some("win.open-with"));
     a.append(Some("Preview (Space)"), Some("win.preview"));
     menu.append_section(None, &a);
     let b = gio::Menu::new();
@@ -1192,6 +1251,8 @@ fn name_column(icon_size: i32) -> gtk::ColumnViewColumn {
             set_thumbnail(&image, &info, icon_size);
         }
         label.set_label(&info.display_name());
+        // The name column ellipsizes; show the full name on hover.
+        row.set_tooltip_text(Some(&info.display_name()));
     });
     let col =
         gtk::ColumnViewColumn::builder().title("Name").factory(&factory).expand(true).resizable(true).build();
@@ -1256,6 +1317,13 @@ fn grid_factory(size: i32) -> gtk::SignalListItemFactory {
         let label = gtk::Label::builder()
             .justify(gtk::Justification::Center)
             .wrap(true)
+            // Character-level wrapping: long unbroken filenames (e.g.
+            // `_OceanofPDF.com_Everyday_Ayurveda_..._Bhattacharya.pdf`, common in
+            // Downloads) have no spaces to break on. With the default word wrap
+            // the label's *minimum* width becomes the whole filename, which blows
+            // each grid cell out to full width and collapses the grid to a single
+            // column. WordChar lets it break mid-word, keeping cells narrow.
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
             .lines(2)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .max_width_chars((size / 6).max(8))
@@ -1278,6 +1346,9 @@ fn grid_factory(size: i32) -> gtk::SignalListItemFactory {
         set_themed_icon(&image, &info);
         set_thumbnail(&image, &info, size);
         label.set_label(&info.display_name());
+        // Names are wrapped/ellipsized in the grid, so surface the full name on
+        // hover.
+        cell.set_tooltip_text(Some(&info.display_name()));
     });
     factory
 }
