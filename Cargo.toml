@@ -14,3 +14,5 @@ gtk = { version = "0.9", package = "gtk4", features = ["v4_16"] }
 adw = { version = "0.7", package = "libadwaita", features = ["v1_5"] }
 # For getuid/getgid, so an ntfs-3g mount is owned by the current user.
 libc = "0.2"
+# Worker-thread → GTK-main-loop channel for the background file-op engine.
+async-channel = "2"

@@ -51,6 +51,10 @@ Built with **Rust + GTK4 + libadwaita**.
 - **File operations** — copy, cut, paste, rename, new folder, move-to-Trash,
   permanent delete, properties, open, and open-with — from the toolbar,
   right-click menu, or keyboard.
+- **Background operations** — copy / move / delete run on a worker thread with a
+  live **progress bar** and **Cancel**, so the window never freezes on a big
+  transfer. Name clashes raise a **conflict dialog** (Replace / Skip / Keep Both,
+  with “apply to all”).
 - **Theming** — file icons follow your **icon theme**; libadwaita follows the
   system **light/dark** preference and **accent colour**.
 

@@ -6,12 +6,13 @@ use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use crate::{bookmarks, fileops, format, preview};
+use crate::{bookmarks, fileops, format, ops, preview};
 
 const CSS: &str = "
 .fs-grid { padding: 8px; }
@@ -81,6 +82,9 @@ struct App {
     /// model), and seeded into new tabs.
     sort_key: Cell<u8>,
     sort_desc: Cell<bool>,
+    /// Bottom area that reveals a row per in-flight background operation.
+    progress_box: gtk::Box,
+    progress_revealer: gtk::Revealer,
 }
 
 pub fn build(app: &adw::Application, initial: Option<String>) {
@@ -131,12 +135,22 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
     let status_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     status_bar.append(&status);
 
+    // Background-operation progress: a revealer holding one row per running job.
+    let progress_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
+    progress_box.set_margin_start(12);
+    progress_box.set_margin_end(12);
+    progress_box.set_margin_top(6);
+    progress_box.set_margin_bottom(6);
+    let progress_revealer =
+        gtk::Revealer::builder().child(&progress_box).reveal_child(false).build();
+
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&tab_view));
     let content = adw::ToolbarView::new();
     content.add_top_bar(&header);
     content.add_top_bar(&tab_bar);
     content.set_content(Some(&toasts));
+    content.add_bottom_bar(&progress_revealer);
     content.add_bottom_bar(&status_bar);
 
     let sidebar_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
@@ -183,6 +197,8 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
         preview: RefCell::new(None),
         sort_key: Cell::new(0),
         sort_desc: Cell::new(false),
+        progress_box,
+        progress_revealer,
     });
 
     install_actions(app, &state);
@@ -1192,6 +1208,128 @@ fn set_clipboard(app: &Rc<App>, cut: bool) {
     toast(app, &format!("{} {n} item{}", if cut { "Cut" } else { "Copied" }, plural(n)));
 }
 
+/// Launch a background copy/move/delete job: spawn the worker thread, show a
+/// progress row, and pump its events on the main loop (updating the bar, popping
+/// conflict dialogs, refreshing when done).
+fn start_job(app: &Rc<App>, kind: ops::Kind, sources: Vec<PathBuf>, dest: PathBuf) {
+    if sources.is_empty() {
+        return;
+    }
+    let (verb, past) = match kind {
+        ops::Kind::Copy => ("Copying", "Copied"),
+        ops::Kind::Move => ("Moving", "Moved"),
+        ops::Kind::Delete => ("Deleting", "Deleted"),
+    };
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (ev_tx, ev_rx) = async_channel::unbounded::<ops::Event>();
+    let (dec_tx, dec_rx) = std::sync::mpsc::channel::<ops::Decision>();
+
+    // Progress row: a title line and a bar with a stop button.
+    let title = gtk::Label::builder().xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::Middle).build();
+    title.add_css_class("caption");
+    title.set_label(&format!("{verb}…"));
+    let bar = gtk::ProgressBar::builder().hexpand(true).valign(gtk::Align::Center).build();
+    let stop = gtk::Button::from_icon_name("process-stop-symbolic");
+    stop.add_css_class("flat");
+    stop.set_tooltip_text(Some("Cancel"));
+    {
+        let cancel = cancel.clone();
+        stop.connect_clicked(move |_| cancel.store(true, AtomicOrdering::Relaxed));
+    }
+    let bar_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    bar_row.append(&bar);
+    bar_row.append(&stop);
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    row.append(&title);
+    row.append(&bar_row);
+    app.progress_box.append(&row);
+    app.progress_revealer.set_reveal_child(true);
+
+    // Worker thread.
+    {
+        let cancel = cancel.clone();
+        std::thread::spawn(move || ops::run(kind, sources, dest, cancel, ev_tx, dec_rx));
+    }
+
+    // Pump events on the main loop.
+    let app = app.clone();
+    glib::spawn_future_local(async move {
+        let (mut total_bytes, mut total_items) = (0u64, 0u64);
+        while let Ok(event) = ev_rx.recv().await {
+            match event {
+                ops::Event::Total { bytes, items } => {
+                    total_bytes = bytes;
+                    total_items = items;
+                }
+                ops::Event::Advance { bytes_done, items_done, current } => {
+                    let frac = if total_bytes > 0 {
+                        bytes_done as f64 / total_bytes as f64
+                    } else if total_items > 0 {
+                        items_done as f64 / total_items as f64
+                    } else {
+                        0.0
+                    };
+                    bar.set_fraction(frac.clamp(0.0, 1.0));
+                    let sizes = if total_bytes > 0 {
+                        format!(" · {} / {}", format::human_size(bytes_done), format::human_size(total_bytes))
+                    } else {
+                        String::new()
+                    };
+                    title.set_label(&format!("{verb} {current} — {items_done}/{total_items}{sizes}"));
+                }
+                ops::Event::Conflict { name } => {
+                    let dialog = adw::AlertDialog::new(
+                        Some(&format!("“{name}” already exists")),
+                        Some("An item with the same name is already in the destination."),
+                    );
+                    let apply_all = gtk::CheckButton::with_label("Apply to all conflicts");
+                    dialog.set_extra_child(Some(&apply_all));
+                    dialog.add_responses(&[
+                        ("cancel", "Cancel"),
+                        ("skip", "Skip"),
+                        ("rename", "Keep Both"),
+                        ("replace", "Replace"),
+                    ]);
+                    dialog.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
+                    dialog.set_default_response(Some("rename"));
+                    dialog.set_close_response("cancel");
+                    let dec_tx = dec_tx.clone();
+                    dialog.choose(&app.window, gio::Cancellable::NONE, move |resp| {
+                        let all = apply_all.is_active();
+                        let decision = match resp.as_str() {
+                            "replace" => if all { ops::Decision::ReplaceAll } else { ops::Decision::Replace },
+                            "skip" => if all { ops::Decision::SkipAll } else { ops::Decision::Skip },
+                            "rename" => ops::Decision::Rename,
+                            _ => ops::Decision::Cancel,
+                        };
+                        let _ = dec_tx.send(decision);
+                    });
+                }
+                ops::Event::Finished { ok, failed } => {
+                    app.progress_box.remove(&row);
+                    if app.progress_box.first_child().is_none() {
+                        app.progress_revealer.set_reveal_child(false);
+                    }
+                    for tab in app.tabs.borrow().iter() {
+                        refresh(tab);
+                    }
+                    update_chrome(&app);
+                    let message = if cancel.load(AtomicOrdering::Relaxed) {
+                        format!("{verb} cancelled — {ok} done")
+                    } else if failed > 0 {
+                        format!("{past} {ok}; {failed} failed")
+                    } else {
+                        format!("{past} {ok} item{}", plural(ok as usize))
+                    };
+                    toast(&app, &message);
+                    break;
+                }
+            }
+        }
+    });
+}
+
 fn paste(app: &Rc<App>) {
     let tab = active_tab(app);
     let Some(dir) = tab.dir_list.file().and_then(|f| f.path()) else { return };
@@ -1199,26 +1337,15 @@ fn paste(app: &Rc<App>) {
         let clip = app.clipboard.borrow();
         (clip.files.clone(), clip.cut)
     };
-    if files.is_empty() {
+    let sources: Vec<PathBuf> = files.iter().filter_map(|f| f.path()).collect();
+    if sources.is_empty() {
         return;
-    }
-    let (mut ok, mut failed) = (0u32, 0u32);
-    for file in &files {
-        let Some(src) = file.path() else {
-            failed += 1;
-            continue;
-        };
-        let r = if cut { fileops::move_into(&src, &dir) } else { fileops::copy_into(&src, &dir) };
-        if r.is_ok() { ok += 1 } else { failed += 1 }
     }
     if cut {
         app.clipboard.borrow_mut().files.clear();
+        update_chrome(app);
     }
-    update_chrome(app);
-    refresh(&tab);
-    let verb = if cut { "Moved" } else { "Pasted" };
-    toast(app, &format!("{verb} {ok} item{}{}", plural(ok as usize),
-        if failed > 0 { format!("; {failed} failed") } else { String::new() }));
+    start_job(app, if cut { ops::Kind::Move } else { ops::Kind::Copy }, sources, dir);
 }
 
 fn trash_selected(app: &Rc<App>) {
@@ -1256,17 +1383,9 @@ fn delete_selected(app: &Rc<App>) {
         if resp != "delete" {
             return;
         }
-        let tab = active_tab(&app);
-        let (mut ok, mut failed) = (0u32, 0u32);
-        for (file, _) in &selected(&tab) {
-            match file.path().ok_or(()).and_then(|p| fileops::remove(&p).map_err(|_| ())) {
-                Ok(()) => ok += 1,
-                Err(()) => failed += 1,
-            }
-        }
-        refresh(&tab);
-        toast(&app, &format!("Deleted {ok} item{}{}", plural(ok as usize),
-            if failed > 0 { format!("; {failed} failed") } else { String::new() }));
+        let sources: Vec<PathBuf> =
+            selected(&active_tab(&app)).into_iter().filter_map(|(f, _)| f.path()).collect();
+        start_job(&app, ops::Kind::Delete, sources, PathBuf::new());
     });
 }
 

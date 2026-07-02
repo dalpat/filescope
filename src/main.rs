@@ -8,6 +8,7 @@
 mod bookmarks;
 mod fileops;
 mod format;
+mod ops;
 mod preview;
 mod window;
 

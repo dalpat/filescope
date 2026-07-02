@@ -34,50 +34,6 @@ fn split_name(name: &str) -> (&str, &str) {
     }
 }
 
-/// Copy `src` into directory `dir` (recursively for directories), choosing a
-/// non-colliding destination name. Returns the path created.
-pub fn copy_into(src: &Path, dir: &Path) -> io::Result<PathBuf> {
-    let name = file_name(src)?;
-    let dest = unique_destination(dir, &name);
-    copy_recursive(src, &dest)?;
-    Ok(dest)
-}
-
-/// Move `src` into directory `dir`, choosing a non-colliding destination name.
-/// Uses a rename when possible, falling back to copy-then-delete across
-/// filesystems. Returns the path created.
-pub fn move_into(src: &Path, dir: &Path) -> io::Result<PathBuf> {
-    let name = file_name(src)?;
-    let dest = unique_destination(dir, &name);
-    match fs::rename(src, &dest) {
-        Ok(()) => Ok(dest),
-        // EXDEV (cross-device): copy then remove the original.
-        Err(_) => {
-            copy_recursive(src, &dest)?;
-            remove(src)?;
-            Ok(dest)
-        }
-    }
-}
-
-/// Recursively copy `src` to the exact path `dest`.
-pub fn copy_recursive(src: &Path, dest: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(src)?;
-    if meta.file_type().is_symlink() {
-        let target = fs::read_link(src)?;
-        std::os::unix::fs::symlink(target, dest)?;
-    } else if meta.is_dir() {
-        fs::create_dir(dest)?;
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            copy_recursive(&entry.path(), &dest.join(entry.file_name()))?;
-        }
-    } else {
-        fs::copy(src, dest)?;
-    }
-    Ok(())
-}
-
 /// Permanently remove `path` — a single file/symlink, or a whole directory tree.
 pub fn remove(path: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
@@ -127,13 +83,6 @@ pub fn dir_size(path: &Path) -> (u64, u64) {
     (bytes, count)
 }
 
-/// The final path component as a string, or an error for a path that has none.
-fn file_name(path: &Path) -> io::Result<String> {
-    path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .ok_or_else(|| io::Error::other("path has no file name"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,22 +112,20 @@ mod tests {
     }
 
     #[test]
-    fn copy_and_remove_round_trip_a_tree() {
-        let tmp = std::env::temp_dir().join(format!("filescope-tree-{}", std::process::id()));
-        let src = tmp.join("src");
-        fs::create_dir_all(src.join("sub")).unwrap();
-        fs::write(src.join("a.txt"), b"hello").unwrap();
-        fs::write(src.join("sub/b.txt"), b"world").unwrap();
+    fn remove_deletes_a_file_and_a_whole_tree() {
+        let tmp = std::env::temp_dir().join(format!("filescope-rm-{}", std::process::id()));
+        fs::create_dir_all(tmp.join("tree/sub")).unwrap();
+        fs::write(tmp.join("tree/a.txt"), b"hello").unwrap();
+        fs::write(tmp.join("tree/sub/b.txt"), b"world").unwrap();
+        let file = tmp.join("lone.bin");
+        fs::write(&file, b"x").unwrap();
 
-        let dest_dir = tmp.join("dest");
-        fs::create_dir_all(&dest_dir).unwrap();
-        let created = copy_into(&src, &dest_dir).unwrap();
-        assert!(created.join("a.txt").exists());
-        assert!(created.join("sub/b.txt").exists());
-        assert_eq!(fs::read(created.join("a.txt")).unwrap(), b"hello");
-
-        remove(&created).unwrap();
-        assert!(!created.exists());
+        // A whole directory tree is removed recursively…
+        remove(&tmp.join("tree")).unwrap();
+        assert!(!tmp.join("tree").exists());
+        // …and a single file too.
+        remove(&file).unwrap();
+        assert!(!file.exists());
         let _ = fs::remove_dir_all(&tmp);
     }
 }
