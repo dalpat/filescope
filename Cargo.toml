@@ -1,0 +1,13 @@
+[package]
+name = "filescope"
+description = "A simple, fast, native file manager for Linux"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "filescope"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { version = "0.9", package = "gtk4", features = ["v4_16"] }
+adw = { version = "0.7", package = "libadwaita", features = ["v1_5"] }

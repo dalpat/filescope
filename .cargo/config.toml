@@ -1,0 +1,5 @@
+# The GTK4/libadwaita runtime is installed system-wide, but the -dev files
+# (pkg-config .pc files) live under ~/gtk-dev. Point pkg-config there so
+# `cargo build` finds gtk4/libadwaita without any manual environment setup.
+[env]
+PKG_CONFIG_PATH = { value = "/home/dsp/gtk-dev/usr/lib/x86_64-linux-gnu/pkgconfig:/home/dsp/gtk-dev/usr/share/pkgconfig", force = true }
