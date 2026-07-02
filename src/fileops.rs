@@ -103,6 +103,30 @@ pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
     Ok(dest)
 }
 
+/// Total apparent size (bytes) and entry count of a directory tree, for the
+/// Properties dialog. Symlinks are counted as entries but not followed (so the
+/// walk stays cycle-free and nothing outside the tree is double-counted), and
+/// unreadable sub-entries are skipped rather than aborting the walk. Can be slow
+/// on a large tree — run it off the UI thread.
+pub fn dir_size(path: &Path) -> (u64, u64) {
+    let (mut bytes, mut count) = (0u64, 0u64);
+    let Ok(entries) = fs::read_dir(path) else {
+        return (bytes, count);
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        count += 1;
+        if meta.is_dir() {
+            let (b, c) = dir_size(&entry.path());
+            bytes += b;
+            count += c;
+        } else {
+            bytes += meta.len();
+        }
+    }
+    (bytes, count)
+}
+
 /// The final path component as a string, or an error for a path that has none.
 fn file_name(path: &Path) -> io::Result<String> {
     path.file_name()

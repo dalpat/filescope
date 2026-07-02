@@ -1048,35 +1048,138 @@ fn new_folder(app: &Rc<App>) {
     });
 }
 
+/// A proper Properties dialog: an identity header (icon, name, kind) over
+/// grouped rows for size/location, timestamps, and ownership/permissions — the
+/// values selectable for copying. Folder sizes are computed off the UI thread.
 fn show_properties(app: &Rc<App>) {
     let tab = active_tab(app);
     let items = selected(&tab);
     let [(file, info)] = items.as_slice() else {
         return;
     };
+    let file = file.clone();
+
+    // Re-query for the richer attributes the directory listing doesn't carry
+    // (access/created times, owner/group); fall back to the listing's info.
+    let full = file
+        .query_info(
+            "standard::*,time::*,unix::*,owner::*",
+            gio::FileQueryInfoFlags::NONE,
+            gio::Cancellable::NONE,
+        )
+        .ok();
+    let info: &gio::FileInfo = full.as_ref().unwrap_or(info);
+
     let name = info.display_name().to_string();
     let is_dir = info.file_type() == gio::FileType::Directory;
     let kind = if is_dir {
         "Folder".to_string()
     } else {
-        info.content_type().map(|ct| gio::content_type_get_description(&ct).to_string()).unwrap_or_else(|| "File".to_string())
+        info.content_type()
+            .map(|ct| gio::content_type_get_description(&ct).to_string())
+            .unwrap_or_else(|| "File".to_string())
     };
-    let size = if is_dir {
-        file.path().and_then(|p| std::fs::read_dir(p).ok()).map(|rd| format!("{} items", rd.count())).unwrap_or_default()
+    let location = file
+        .parent()
+        .and_then(|p| p.path())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    // Identity header.
+    let image = gtk::Image::builder().pixel_size(48).build();
+    if let Some(icon) = info.icon() {
+        image.set_from_gicon(&icon);
+    }
+    let title = gtk::Label::builder()
+        .label(&name)
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .build();
+    title.add_css_class("title-2");
+    let subtitle = gtk::Label::builder().label(&kind).build();
+    subtitle.add_css_class("dim-label");
+    let head = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
+    head.set_halign(gtk::Align::Center);
+    head.append(&image);
+    head.append(&title);
+    head.append(&subtitle);
+
+    // General.
+    let general = adw::PreferencesGroup::new();
+    general.add(&prop_row("Type", &kind));
+    let size_row = prop_row("Size", "");
+    general.add(&size_row);
+    general.add(&prop_row("Location", &location));
+    if is_dir {
+        size_row.set_subtitle("Calculating…");
+        if let Some(path) = file.path() {
+            let size_row = size_row.clone();
+            glib::spawn_future_local(async move {
+                let (bytes, count) =
+                    gio::spawn_blocking(move || fileops::dir_size(&path)).await.unwrap_or((0, 0));
+                size_row.set_subtitle(&format!(
+                    "{} — {count} item{}",
+                    format::human_size(bytes),
+                    plural(count as usize)
+                ));
+            });
+        }
     } else {
-        format::human_size(info.size().max(0) as u64)
-    };
-    let location = file.parent().and_then(|p| p.path()).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-    let modified = info.modification_date_time().map(|dt| format::modified(&dt)).unwrap_or_default();
-    let perms = permission_string(info.attribute_uint32("unix::mode"));
-    let body = format!(
-        "Type:\t{kind}\nSize:\t{size}\nLocation:\t{location}\nModified:\t{modified}\nPermissions:\t{perms}"
-    );
-    let dialog = adw::AlertDialog::new(Some(&name), Some(&body));
-    dialog.add_responses(&[("close", "Close")]);
-    dialog.set_default_response(Some("close"));
-    dialog.set_close_response("close");
+        let bytes = info.size().max(0) as u64;
+        size_row.set_subtitle(&format!("{} ({bytes} bytes)", format::human_size(bytes)));
+    }
+
+    // Timestamps.
+    let time = adw::PreferencesGroup::new();
+    time.set_title("Timestamps");
+    if let Some(dt) = info.modification_date_time() {
+        time.add(&prop_row("Modified", &format::modified(&dt)));
+    }
+    for (label, attr) in [("Accessed", "time::access"), ("Created", "time::created")] {
+        let secs = info.attribute_uint64(attr);
+        if secs > 0 {
+            if let Ok(dt) = glib::DateTime::from_unix_local(secs as i64) {
+                time.add(&prop_row(label, &format::modified(&dt)));
+            }
+        }
+    }
+
+    // Ownership & permissions.
+    let perms = adw::PreferencesGroup::new();
+    perms.set_title("Permissions");
+    if let Some(owner) = info.attribute_string("owner::user") {
+        perms.add(&prop_row("Owner", &owner));
+    }
+    if let Some(group) = info.attribute_string("owner::group") {
+        perms.add(&prop_row("Group", &group));
+    }
+    perms.add(&prop_row("Access", &permission_string(info.attribute_uint32("unix::mode"))));
+
+    let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(18).build();
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    content.append(&head);
+    content.append(&general);
+    content.append(&time);
+    content.append(&perms);
+    let scroller = gtk::ScrolledWindow::builder().vexpand(true).child(&content).build();
+
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&adw::HeaderBar::new());
+    view.set_content(Some(&scroller));
+    let dialog =
+        adw::Dialog::builder().title("Properties").content_width(460).content_height(620).build();
+    dialog.set_child(Some(&view));
     dialog.present(Some(&app.window));
+}
+
+/// One labelled, copy-selectable row in the Properties dialog.
+fn prop_row(title: &str, value: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title(title).subtitle(value).build();
+    row.set_subtitle_selectable(true);
+    row
 }
 
 fn bookmark_current(app: &Rc<App>) {
