@@ -52,6 +52,8 @@ struct Tab {
     column_view: gtk::ColumnView,
     breadcrumb: gtk::Box,
     computer_box: gtk::Box,
+    search_bar: gtk::SearchBar,
+    search_entry: gtk::SearchEntry,
     back: RefCell<Vec<gio::File>>,
     fwd: RefCell<Vec<gio::File>>,
 }
@@ -278,14 +280,23 @@ fn new_tab(app: &Rc<App>, dir: gio::File, select: bool) {
         gtk::DirectoryList::builder().attributes(ATTRS).io_priority(glib::Priority::DEFAULT).build();
 
     let show_hidden = app.show_hidden.clone();
+    // The live search term (lowercased), shared with the filter. Empty ⇒ no
+    // search filtering.
+    let search_term = Rc::new(RefCell::new(String::new()));
     let filter = {
         let show_hidden = show_hidden.clone();
+        let search_term = search_term.clone();
         gtk::CustomFilter::new(move |obj| {
-            if show_hidden.get() {
-                return true;
-            }
             let info = obj.downcast_ref::<gio::FileInfo>().unwrap();
-            !info.is_hidden() && !info.name().to_string_lossy().starts_with('.')
+            // Hidden files, unless the user opted to show them.
+            if !show_hidden.get()
+                && (info.is_hidden() || info.name().to_string_lossy().starts_with('.'))
+            {
+                return false;
+            }
+            // Name search (case-insensitive substring).
+            let term = search_term.borrow();
+            term.is_empty() || info.display_name().to_lowercase().contains(term.as_str())
         })
     };
     let filtered = gtk::FilterListModel::new(Some(dir_list.clone()), Some(filter.clone()));
@@ -335,8 +346,37 @@ fn new_tab(app: &Rc<App>, dir: gio::File, select: bool) {
         .child(&breadcrumb)
         .build();
 
+    // Per-tab search bar (hidden until Ctrl+F). Typing filters the current folder
+    // by name via the shared `search_term`.
+    let search_entry = gtk::SearchEntry::builder().placeholder_text("Search this folder").build();
+    let search_bar = gtk::SearchBar::builder().build();
+    search_bar.set_child(Some(&search_entry));
+    search_bar.connect_entry(&search_entry);
+    {
+        let search_term = search_term.clone();
+        let filter = filter.clone();
+        search_entry.connect_search_changed(move |e| {
+            *search_term.borrow_mut() = e.text().to_lowercase();
+            filter.changed(gtk::FilterChange::Different);
+        });
+    }
+    {
+        // Closing the search bar clears the term so the full folder returns.
+        let search_term = search_term.clone();
+        let filter = filter.clone();
+        let entry = search_entry.clone();
+        search_bar.connect_search_mode_enabled_notify(move |bar| {
+            if !bar.is_search_mode() {
+                entry.set_text("");
+                search_term.borrow_mut().clear();
+                filter.changed(gtk::FilterChange::Different);
+            }
+        });
+    }
+
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&crumb_scroller);
+    content.append(&search_bar);
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content.append(&view_stack);
 
@@ -350,6 +390,8 @@ fn new_tab(app: &Rc<App>, dir: gio::File, select: bool) {
         column_view: column_view.clone(),
         breadcrumb,
         computer_box,
+        search_bar: search_bar.clone(),
+        search_entry: search_entry.clone(),
         back: RefCell::new(Vec::new()),
         fwd: RefCell::new(Vec::new()),
     });
@@ -438,6 +480,8 @@ fn go_up(app: &Rc<App>, tab: &Rc<Tab>) {
 
 /// Point `tab` at `file`, leaving any "This PC" view, and refresh chrome.
 fn set_dir(app: &Rc<App>, tab: &Rc<Tab>, file: &gio::File) {
+    // A new folder starts unfiltered — close any open search from the last one.
+    tab.search_bar.set_search_mode(false);
     tab.dir_list.set_file(Some(file));
     tab.view_stack.set_visible_child_name(if app.is_list.get() { "list" } else { "grid" });
     rebuild_breadcrumb(app, tab, file);
@@ -722,6 +766,14 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     action!("close-tab", |s: &Rc<App>| { let t = active_tab(s); if let Some(p) = t.page.borrow().as_ref() { s.tab_view.close_page(p); } });
     action!("select-all", |s: &Rc<App>| { active_tab(s).selection.select_all(); });
     action!("refresh", |s: &Rc<App>| { refresh(&active_tab(s)); });
+    action!("find", |s: &Rc<App>| {
+        let t = active_tab(s);
+        let show = !t.search_bar.is_search_mode();
+        t.search_bar.set_search_mode(show);
+        if show {
+            t.search_entry.grab_focus();
+        }
+    });
     action!("properties", show_properties);
     action!("bookmark", bookmark_current);
     action!("zoom-in", |s: &Rc<App>| zoom(s, ZOOM_STEP));
@@ -791,6 +843,7 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
         ("close-tab", &["<ctrl>w"]),
         ("select-all", &["<ctrl>a"]),
         ("refresh", &["<ctrl>r", "F5"]),
+        ("find", &["<ctrl>f"]),
         ("toggle-hidden", &["<ctrl>h"]),
         ("bookmark", &["<ctrl>d"]),
         ("zoom-in", &["<ctrl>plus", "<ctrl>equal"]),
@@ -1448,6 +1501,7 @@ fn primary_menu() -> gio::Menu {
     a.append(Some("Bookmark This Folder"), Some("win.bookmark"));
     menu.append_section(None, &a);
     let b = gio::Menu::new();
+    b.append(Some("Search…"), Some("win.find"));
     b.append(Some("Show Hidden Files"), Some("win.toggle-hidden"));
     b.append(Some("Zoom In"), Some("win.zoom-in"));
     b.append(Some("Zoom Out"), Some("win.zoom-out"));
