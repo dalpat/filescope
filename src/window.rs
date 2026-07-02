@@ -74,6 +74,11 @@ struct App {
     show_hidden: Rc<Cell<bool>>,
     bookmarks: RefCell<Vec<PathBuf>>,
     preview: RefCell<Option<adw::Window>>,
+    /// Shared sort: which column (0 = name, 1 = size, 2 = modified) and whether
+    /// descending. Applied to the active tab (both grid and list share one sort
+    /// model), and seeded into new tabs.
+    sort_key: Cell<u8>,
+    sort_desc: Cell<bool>,
 }
 
 pub fn build(app: &adw::Application, initial: Option<String>) {
@@ -89,6 +94,10 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
     let view_toggle =
         gtk::ToggleButton::builder().icon_name("view-list-symbolic").tooltip_text("List view").build();
     view_toggle.add_css_class("flat");
+    let sort_btn =
+        gtk::MenuButton::builder().icon_name("view-sort-ascending-symbolic").tooltip_text("Sort by").build();
+    sort_btn.add_css_class("flat");
+    sort_btn.set_menu_model(Some(&sort_menu()));
     let zoom_out = flat_icon("zoom-out-symbolic", "Zoom out (Ctrl+-)");
     let zoom_in = flat_icon("zoom-in-symbolic", "Zoom in (Ctrl++)");
     let menu_btn = gtk::MenuButton::builder().icon_name("open-menu-symbolic").build();
@@ -101,6 +110,7 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
     header.pack_start(&up_btn);
     header.pack_start(&new_tab_btn);
     header.pack_end(&menu_btn);
+    header.pack_end(&sort_btn);
     header.pack_end(&view_toggle);
     header.pack_end(&zoom_in);
     header.pack_end(&zoom_out);
@@ -169,6 +179,8 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
         show_hidden: Rc::new(Cell::new(false)),
         bookmarks: RefCell::new(bookmarks::load()),
         preview: RefCell::new(None),
+        sort_key: Cell::new(0),
+        sort_desc: Cell::new(false),
     });
 
     install_actions(app, &state);
@@ -293,8 +305,13 @@ fn new_tab(app: &Rc<App>, dir: gio::File, select: bool) {
     if let Some(sorter) = column_view.sorter() {
         sort_model.set_sorter(Some(&sorter));
     }
-    if let Some(first) = column_view.columns().item(0).and_downcast::<gtk::ColumnViewColumn>() {
-        column_view.sort_by_column(Some(&first), gtk::SortType::Ascending);
+    // Seed this tab with the shared sort selection (defaults to Name ascending).
+    if let Some(col) =
+        column_view.columns().item(app.sort_key.get() as u32).and_downcast::<gtk::ColumnViewColumn>()
+    {
+        let dir =
+            if app.sort_desc.get() { gtk::SortType::Descending } else { gtk::SortType::Ascending };
+        column_view.sort_by_column(Some(&col), dir);
     }
     let list_scroller = gtk::ScrolledWindow::builder().vexpand(true).child(&column_view).build();
 
@@ -588,6 +605,8 @@ fn zoom(app: &Rc<App>, delta: i32) {
                 sm.set_sorter(Some(&sorter));
             }
         }
+        // Rebuilding the columns clears the active sort column; restore it.
+        apply_sort_to(app, tab);
     }
 }
 
@@ -645,6 +664,36 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
         });
     }
     state.window.add_action(&toggle);
+
+    // "Sort by" — a radio over the three columns plus a descending toggle. Both
+    // drive the active tab's shared sort model, so grid and list reorder together.
+    let sort = gio::SimpleAction::new_stateful("sort", Some(glib::VariantTy::STRING), &"name".to_variant());
+    {
+        let s = state.clone();
+        sort.connect_activate(move |act, param| {
+            let Some(key) = param.and_then(|p| p.get::<String>()) else { return };
+            act.set_state(&key.to_variant());
+            s.sort_key.set(match key.as_str() {
+                "size" => 1,
+                "modified" => 2,
+                _ => 0,
+            });
+            apply_sort(&s);
+        });
+    }
+    state.window.add_action(&sort);
+
+    let sort_desc = gio::SimpleAction::new_stateful("sort-descending", None, &false.to_variant());
+    {
+        let s = state.clone();
+        sort_desc.connect_activate(move |act, _| {
+            let now = !act.state().and_then(|v| v.get::<bool>()).unwrap_or(false);
+            act.set_state(&now.to_variant());
+            s.sort_desc.set(now);
+            apply_sort(&s);
+        });
+    }
+    state.window.add_action(&sort_desc);
 
     for (name, accels) in [
         ("back", &["<alt>Left"][..]),
@@ -1176,6 +1225,38 @@ fn context_menu() -> gio::Menu {
     d.append(Some("Properties"), Some("win.properties"));
     menu.append_section(None, &d);
     menu
+}
+
+fn sort_menu() -> gio::Menu {
+    let menu = gio::Menu::new();
+    let by = gio::Menu::new();
+    by.append(Some("Name"), Some("win.sort::name"));
+    by.append(Some("Size"), Some("win.sort::size"));
+    by.append(Some("Modified"), Some("win.sort::modified"));
+    menu.append_section(Some("Sort by"), &by);
+    let dir = gio::Menu::new();
+    dir.append(Some("Descending"), Some("win.sort-descending"));
+    menu.append_section(None, &dir);
+    menu
+}
+
+/// Apply the shared sort selection to the active tab.
+fn apply_sort(app: &Rc<App>) {
+    let tab = active_tab(app);
+    apply_sort_to(app, &tab);
+}
+
+/// Point `tab`'s column view at the currently selected sort column and direction.
+/// Because the column view's sorter backs the tab's sort model, this reorders
+/// both the grid and the list at once.
+fn apply_sort_to(app: &Rc<App>, tab: &Rc<Tab>) {
+    let idx = app.sort_key.get() as u32;
+    let Some(col) = tab.column_view.columns().item(idx).and_downcast::<gtk::ColumnViewColumn>()
+    else {
+        return;
+    };
+    let dir = if app.sort_desc.get() { gtk::SortType::Descending } else { gtk::SortType::Ascending };
+    tab.column_view.sort_by_column(Some(&col), dir);
 }
 
 fn primary_menu() -> gio::Menu {
