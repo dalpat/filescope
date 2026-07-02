@@ -513,8 +513,8 @@ fn show_computer(app: &Rc<App>, tab: &Rc<Tab>) {
         .homogeneous(true)
         .build();
 
-    for (label, icon, file) in drives() {
-        flow.insert(&drive_card(app, tab, &label, &icon, file), -1);
+    for item in drives() {
+        flow.insert(&drive_card(app, tab, &item), -1);
     }
     box_.append(&flow);
 
@@ -525,10 +525,22 @@ fn show_computer(app: &Rc<App>, tab: &Rc<Tab>) {
     update_chrome(app);
 }
 
-/// The drives to show: the filesystem root plus every mounted volume.
-fn drives() -> Vec<(String, gio::Icon, gio::File)> {
-    let mut out: Vec<(String, gio::Icon, gio::File)> = Vec::new();
-    out.push(("Filesystem".to_string(), fallback_icon(), gio::File::for_path("/")));
+/// A drive tile's backing data: either a mounted location we can open directly,
+/// or a connected-but-unmounted volume we mount on click.
+enum DriveItem {
+    Mounted { name: String, icon: gio::Icon, file: gio::File },
+    Unmounted { name: String, icon: gio::Icon, volume: gio::Volume },
+}
+
+/// The drives to show: the filesystem root, every mounted volume, and every
+/// connected volume that isn't mounted yet (USB sticks, other partitions, …).
+fn drives() -> Vec<DriveItem> {
+    let mut out: Vec<DriveItem> = Vec::new();
+    out.push(DriveItem::Mounted {
+        name: "Filesystem".to_string(),
+        icon: fallback_icon(),
+        file: gio::File::for_path("/"),
+    });
 
     let monitor = gio::VolumeMonitor::get();
     for mount in monitor.mounts() {
@@ -537,7 +549,19 @@ fn drives() -> Vec<(String, gio::Icon, gio::File)> {
         if file.path().as_deref() == Some(std::path::Path::new("/")) {
             continue;
         }
-        out.push((mount.name().to_string(), mount.icon(), file));
+        out.push(DriveItem::Mounted { name: mount.name().to_string(), icon: mount.icon(), file });
+    }
+    // Connected volumes with no mount yet — shown so the user can see and mount
+    // them from here rather than hunting in another app.
+    for volume in monitor.volumes() {
+        if volume.get_mount().is_some() {
+            continue; // already surfaced via its mount above
+        }
+        out.push(DriveItem::Unmounted {
+            name: volume.name().to_string(),
+            icon: volume.icon(),
+            volume,
+        });
     }
     out
 }
@@ -546,8 +570,15 @@ fn fallback_icon() -> gio::Icon {
     gio::Icon::for_string("drive-harddisk-symbolic").expect("built-in icon name is valid")
 }
 
-/// One drive tile: name, capacity bar, and "X free of Y".
-fn drive_card(app: &Rc<App>, tab: &Rc<Tab>, label: &str, icon: &gio::Icon, file: gio::File) -> gtk::Widget {
+/// One drive tile. A mounted drive shows its capacity ("X free of Y") and opens
+/// on click; an unmounted volume shows a "Not mounted" hint and mounts (then
+/// opens) on click.
+fn drive_card(app: &Rc<App>, tab: &Rc<Tab>, item: &DriveItem) -> gtk::Widget {
+    let (label, icon) = match item {
+        DriveItem::Mounted { name, icon, .. } => (name.as_str(), icon),
+        DriveItem::Unmounted { name, icon, .. } => (name.as_str(), icon),
+    };
+
     let image = gtk::Image::from_gicon(icon);
     image.set_pixel_size(32);
     let name = gtk::Label::builder().label(label).xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
@@ -562,13 +593,25 @@ fn drive_card(app: &Rc<App>, tab: &Rc<Tab>, label: &str, icon: &gio::Icon, file:
     caption.add_css_class("dim-label");
     caption.add_css_class("caption");
 
-    if let Ok(info) = file.query_filesystem_info("filesystem::*", gio::Cancellable::NONE) {
-        let size = info.attribute_uint64("filesystem::size");
-        let free = info.attribute_uint64("filesystem::free");
-        if size > 0 {
-            let used = size.saturating_sub(free);
-            bar.set_fraction(used as f64 / size as f64);
-            caption.set_label(&format!("{} free of {}", format::human_size(free), format::human_size(size)));
+    match item {
+        DriveItem::Mounted { file, .. } => {
+            if let Ok(info) = file.query_filesystem_info("filesystem::*", gio::Cancellable::NONE) {
+                let size = info.attribute_uint64("filesystem::size");
+                let free = info.attribute_uint64("filesystem::free");
+                if size > 0 {
+                    let used = size.saturating_sub(free);
+                    bar.set_fraction(used as f64 / size as f64);
+                    caption.set_label(&format!(
+                        "{} free of {}",
+                        format::human_size(free),
+                        format::human_size(size)
+                    ));
+                }
+            }
+        }
+        DriveItem::Unmounted { .. } => {
+            bar.set_visible(false);
+            caption.set_label("Not mounted — click to mount");
         }
     }
 
@@ -584,9 +627,44 @@ fn drive_card(app: &Rc<App>, tab: &Rc<Tab>, label: &str, icon: &gio::Icon, file:
     {
         let app = app.clone();
         let tab = tab.clone();
-        button.connect_clicked(move |_| navigate(&app, &tab, file.clone()));
+        match item {
+            DriveItem::Mounted { file, .. } => {
+                let file = file.clone();
+                button.connect_clicked(move |_| navigate(&app, &tab, file.clone()));
+            }
+            DriveItem::Unmounted { volume, .. } => {
+                let volume = volume.clone();
+                button.connect_clicked(move |_| mount_and_open(&app, &tab, &volume));
+            }
+        }
     }
     button.upcast()
+}
+
+/// Mount `volume`, then open it in `tab`. Runs asynchronously; the platform
+/// shows a prompt (for passwords etc.) when the volume needs one.
+fn mount_and_open(app: &Rc<App>, tab: &Rc<Tab>, volume: &gio::Volume) {
+    let op = gio::MountOperation::new();
+    let app = app.clone();
+    let tab = tab.clone();
+    let volume = volume.clone();
+    volume.clone().mount(
+        gio::MountMountFlags::NONE,
+        Some(&op),
+        gio::Cancellable::NONE,
+        move |res| match res {
+            Ok(()) => match volume.get_mount() {
+                Some(mount) => navigate(&app, &tab, mount.default_location()),
+                None => toast(&app, "Mounted, but couldn't locate the drive"),
+            },
+            Err(err) => {
+                // The user dismissing the mount prompt reports FailedHandled.
+                if !err.matches(gio::IOErrorEnum::FailedHandled) {
+                    toast(&app, &format!("Couldn't mount: {err}"));
+                }
+            }
+        },
+    );
 }
 
 // --- Zoom -------------------------------------------------------------------
