@@ -36,11 +36,11 @@ const ZOOM_MIN: i32 = 48;
 const ZOOM_MAX: i32 = 160;
 const ZOOM_STEP: i32 = 16;
 
-#[derive(Default)]
-struct Clip {
-    files: Vec<gio::File>,
-    cut: bool,
-}
+/// Clipboard mime types for file cut/copy: GNOME's copy/cut format (carries the
+/// cut-vs-copy intent and interoperates with Nautilus/Files) and the generic
+/// URI list (understood by most apps).
+const GNOME_COPIED: &str = "x-special/gnome-copied-files";
+const URI_LIST: &str = "text/uri-list";
 
 /// One folder tab: its own listing, views, history, and breadcrumb.
 struct Tab {
@@ -70,7 +70,6 @@ struct App {
     up_btn: gtk::Button,
     status: gtk::Label,
     tabs: RefCell<Vec<Rc<Tab>>>,
-    clipboard: RefCell<Clip>,
     /// Grid icon size in pixels (list scales from it); shared view mode.
     zoom: Cell<i32>,
     is_list: Cell<bool>,
@@ -189,7 +188,6 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
         up_btn: up_btn.clone(),
         status,
         tabs: RefCell::new(Vec::new()),
-        clipboard: RefCell::new(Clip::default()),
         zoom: Cell::new(80),
         is_list: Cell::new(false),
         show_hidden: Rc::new(Cell::new(false)),
@@ -273,6 +271,13 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
                 navigate(&s, &t, gio::File::for_path(unsafe { path.as_ref() }.clone()));
             }
         });
+    }
+
+    // Keep the Paste action's enabled state in step with the system clipboard,
+    // including copies made in other apps.
+    {
+        let s = state.clone();
+        state.window.clipboard().connect_changed(move |_| update_chrome(&s));
     }
 
     // Keep the sidebar's device list live as drives are plugged in, mounted, or
@@ -507,6 +512,13 @@ fn new_tab(app: &Rc<App>, dir: gio::File, select: bool) {
     // Context menu.
     attach_context_menu(app, &grid_view);
     attach_context_menu(app, &column_view);
+
+    // Drag & drop: drag the selection out of either view, and drop files onto
+    // either view to bring them into this tab's folder.
+    attach_drag_source(&tab, &grid_view);
+    attach_drag_source(&tab, &column_view);
+    attach_drop_target(app, &tab, &grid_scroller);
+    attach_drop_target(app, &tab, &list_scroller);
 
     set_dir(app, &tab, &dir);
     if select {
@@ -1197,15 +1209,73 @@ fn launch(app: &Rc<App>, file: &gio::File) {
     });
 }
 
+/// Put the selection on the **system** clipboard (so it pastes into other apps
+/// too), tagged copy or cut.
 fn set_clipboard(app: &Rc<App>, cut: bool) {
     let files: Vec<gio::File> = selected(&active_tab(app)).into_iter().map(|(f, _)| f).collect();
     if files.is_empty() {
         return;
     }
     let n = files.len();
-    *app.clipboard.borrow_mut() = Clip { files, cut };
+    let uris: Vec<String> = files.iter().map(|f| f.uri().to_string()).collect();
+
+    // GNOME copy/cut format: "<action>\n<uri>\n<uri>…".
+    let gnome = format!("{}\n{}", if cut { "cut" } else { "copy" }, uris.join("\n"));
+    let gnome_p = gdk::ContentProvider::for_bytes(GNOME_COPIED, &glib::Bytes::from(gnome.as_bytes()));
+    // Generic URI list, CRLF-separated.
+    let uri_list = format!("{}\r\n", uris.join("\r\n"));
+    let uri_p = gdk::ContentProvider::for_bytes(URI_LIST, &glib::Bytes::from(uri_list.as_bytes()));
+
+    let union = gdk::ContentProvider::new_union(&[gnome_p, uri_p]);
+    let _ = app.window.clipboard().set_content(Some(&union));
     update_chrome(app);
     toast(app, &format!("{} {n} item{}", if cut { "Cut" } else { "Copied" }, plural(n)));
+}
+
+/// Read file URIs (and the cut/copy intent) currently on the clipboard, then
+/// invoke `done`. Reads GNOME's format if present (for the intent), else the URI
+/// list. Everything is async — the clipboard read never blocks the UI.
+fn read_clipboard_files(clipboard: &gdk::Clipboard, done: impl Fn(bool, Vec<PathBuf>) + 'static) {
+    clipboard.read_async(
+        &[GNOME_COPIED, URI_LIST],
+        glib::Priority::DEFAULT,
+        gio::Cancellable::NONE,
+        move |res| {
+            let Ok((stream, mime)) = res else { return };
+            stream.read_bytes_async(
+                1 << 16,
+                glib::Priority::DEFAULT,
+                gio::Cancellable::NONE,
+                move |bytes| {
+                    let Ok(bytes) = bytes else { return };
+                    let text = String::from_utf8_lossy(&bytes);
+                    let (cut, uris) = parse_clipboard(mime.as_str(), &text);
+                    let paths: Vec<PathBuf> =
+                        uris.iter().filter_map(|u| gio::File::for_uri(u).path()).collect();
+                    done(cut, paths);
+                },
+            );
+        },
+    );
+}
+
+/// Parse clipboard text into (is_cut, uris) for the GNOME copy/cut format or a
+/// plain URI list.
+fn parse_clipboard(mime: &str, text: &str) -> (bool, Vec<String>) {
+    if mime == GNOME_COPIED {
+        let mut lines = text.lines();
+        let cut = lines.next().map(|a| a.trim() == "cut").unwrap_or(false);
+        let uris = lines.filter(|l| !l.trim().is_empty()).map(str::to_string).collect();
+        (cut, uris)
+    } else {
+        let uris = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(str::to_string)
+            .collect();
+        (false, uris)
+    }
 }
 
 /// Launch a background copy/move/delete job: spawn the worker thread, show a
@@ -1333,19 +1403,18 @@ fn start_job(app: &Rc<App>, kind: ops::Kind, sources: Vec<PathBuf>, dest: PathBu
 fn paste(app: &Rc<App>) {
     let tab = active_tab(app);
     let Some(dir) = tab.dir_list.file().and_then(|f| f.path()) else { return };
-    let (files, cut) = {
-        let clip = app.clipboard.borrow();
-        (clip.files.clone(), clip.cut)
-    };
-    let sources: Vec<PathBuf> = files.iter().filter_map(|f| f.path()).collect();
-    if sources.is_empty() {
-        return;
-    }
-    if cut {
-        app.clipboard.borrow_mut().files.clear();
-        update_chrome(app);
-    }
-    start_job(app, if cut { ops::Kind::Move } else { ops::Kind::Copy }, sources, dir);
+    let clipboard = app.window.clipboard();
+    let app = app.clone();
+    read_clipboard_files(&clipboard, move |cut, sources| {
+        if sources.is_empty() {
+            return;
+        }
+        start_job(&app, if cut { ops::Kind::Move } else { ops::Kind::Copy }, sources, dir.clone());
+        // A cut is consumed once pasted (matching Nautilus).
+        if cut {
+            let _ = app.window.clipboard().set_content(gdk::ContentProvider::NONE);
+        }
+    });
 }
 
 fn trash_selected(app: &Rc<App>) {
@@ -1668,7 +1737,11 @@ fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
     let count = tab.selection.selection().size();
     let has_sel = count > 0;
     let one = count == 1;
-    let has_clip = !app.clipboard.borrow().files.is_empty();
+    // Paste is available whenever the system clipboard holds file URIs.
+    let has_clip = {
+        let formats = app.window.clipboard().formats();
+        formats.contain_mime_type(GNOME_COPIED) || formats.contain_mime_type(URI_LIST)
+    };
     for (name, enabled) in [
         ("open", has_sel), ("open-with", one), ("preview", one), ("cut", has_sel),
         ("copy", has_sel), ("paste", has_clip), ("rename", one), ("trash", has_sel),
@@ -1938,6 +2011,51 @@ fn attach_context_menu(app: &Rc<App>, widget: &impl IsA<gtk::Widget>) {
     widget.add_controller(gesture);
 }
 
+// --- Drag & drop ------------------------------------------------------------
+
+/// Make a view draggable: dragging exports the current selection as a URI list,
+/// so it can be dropped into another tab, another folder, or another app.
+fn attach_drag_source(tab: &Rc<Tab>, view: &impl IsA<gtk::Widget>) {
+    let source = gtk::DragSource::new();
+    source.set_actions(gdk::DragAction::COPY);
+    let tab = tab.clone();
+    source.connect_prepare(move |_, _, _| {
+        let files: Vec<gio::File> = selected(&tab).into_iter().map(|(f, _)| f).collect();
+        if files.is_empty() {
+            return None;
+        }
+        let uris: Vec<String> = files.iter().map(|f| f.uri().to_string()).collect();
+        let bytes = glib::Bytes::from(format!("{}\r\n", uris.join("\r\n")).as_bytes());
+        Some(gdk::ContentProvider::for_bytes(URI_LIST, &bytes))
+    });
+    view.add_controller(source);
+}
+
+/// Accept files dropped onto a view, copying them into this tab's folder.
+fn attach_drop_target(app: &Rc<App>, tab: &Rc<Tab>, widget: &impl IsA<gtk::Widget>) {
+    let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+    let app = app.clone();
+    let tab = tab.clone();
+    target.connect_drop(move |_, value, _, _| {
+        let Ok(list) = value.get::<gdk::FileList>() else {
+            return false;
+        };
+        let sources: Vec<PathBuf> = list.files().iter().filter_map(|f| f.path()).collect();
+        let Some(dest) = tab.dir_list.file().and_then(|f| f.path()) else {
+            return false;
+        };
+        // Ignore items already living in this folder (a drop onto their own view).
+        let sources: Vec<PathBuf> =
+            sources.into_iter().filter(|p| p.parent() != Some(dest.as_path())).collect();
+        if sources.is_empty() {
+            return false;
+        }
+        start_job(&app, ops::Kind::Copy, sources, dest);
+        true
+    });
+    widget.add_controller(target);
+}
+
 // --- Views ------------------------------------------------------------------
 
 /// Rebuild `column_view`'s columns with the given leading-icon size.
@@ -2188,4 +2306,31 @@ fn permission_string(mode: u32) -> String {
     ]
     .iter()
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GNOME_COPIED, URI_LIST, parse_clipboard};
+
+    #[test]
+    fn parses_gnome_copy_and_cut() {
+        // GNOME format: first line is the action, then one URI per line.
+        assert_eq!(
+            parse_clipboard(GNOME_COPIED, "copy\nfile:///a\nfile:///b"),
+            (false, vec!["file:///a".to_string(), "file:///b".to_string()])
+        );
+        assert_eq!(
+            parse_clipboard(GNOME_COPIED, "cut\nfile:///x"),
+            (true, vec!["file:///x".to_string()])
+        );
+    }
+
+    #[test]
+    fn parses_uri_list_skipping_comments() {
+        // A plain URI list is always a copy; comment and blank lines are ignored.
+        assert_eq!(
+            parse_clipboard(URI_LIST, "# comment\r\nfile:///a\r\n\r\nfile:///b\r\n"),
+            (false, vec!["file:///a".to_string(), "file:///b".to_string()])
+        );
+    }
 }
