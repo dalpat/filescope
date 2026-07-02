@@ -55,9 +55,11 @@ Built with **Rust + GTK4 + libadwaita**.
   live **progress bar** and **Cancel**, so the window never freezes on a big
   transfer. Name clashes raise a **conflict dialog** (Replace / Skip / Keep Both,
   with “apply to all”).
-- **Drag & drop** — drag a selection into another folder, another tab, or another
-  app; drop files onto a view to bring them in. Works with other apps via
-  `text/uri-list`.
+- **Drag & drop** — drag a selection onto a **folder to drop it inside** (the
+  folder highlights as you hover), onto empty space for the current folder, or
+  into another tab or app. Like Nautilus, it **moves within the same filesystem
+  and copies across** — hold **Ctrl** to force copy or **Shift** to force move.
+  Interoperates with other apps via `text/uri-list`.
 - **System clipboard** — Copy / Cut / Paste use the real desktop clipboard
   (`x-special/gnome-copied-files` + `text/uri-list`), so you can copy in
   filescope and paste in Files/Nautilus (and vice-versa).

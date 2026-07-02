@@ -4,7 +4,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -19,6 +19,7 @@ const CSS: &str = "
 .fs-grid > child { border-radius: 12px; padding: 8px; margin: 2px; transition: background 120ms; }
 .fs-grid > child:hover { background: alpha(@window_fg_color, 0.06); }
 .fs-grid > child:selected { background: alpha(@accent_bg_color, 0.22); }
+.fs-drop { background: alpha(@accent_bg_color, 0.35); border-radius: 8px; outline: 2px solid @accent_color; outline-offset: -2px; }
 .fs-name { margin-top: 4px; }
 columnview > listview > row { border-radius: 8px; }
 .crumbs button { padding: 3px 8px; min-height: 0; }
@@ -513,12 +514,12 @@ fn new_tab(app: &Rc<App>, dir: gio::File, select: bool) {
     attach_context_menu(app, &grid_view);
     attach_context_menu(app, &column_view);
 
-    // Drag & drop: drag the selection out of either view, and drop files onto
-    // either view to bring them into this tab's folder.
+    // Drag & drop: drag the selection out of either view, and drop files onto a
+    // folder (into it) or empty space (into the current folder), Nautilus-style.
     attach_drag_source(&tab, &grid_view);
     attach_drag_source(&tab, &column_view);
-    attach_drop_target(app, &tab, &grid_scroller);
-    attach_drop_target(app, &tab, &list_scroller);
+    attach_drop_target(app, &tab, &grid_view);
+    attach_drop_target(app, &tab, &column_view);
 
     set_dir(app, &tab, &dir);
     if select {
@@ -2014,10 +2015,11 @@ fn attach_context_menu(app: &Rc<App>, widget: &impl IsA<gtk::Widget>) {
 // --- Drag & drop ------------------------------------------------------------
 
 /// Make a view draggable: dragging exports the current selection as a URI list,
-/// so it can be dropped into another tab, another folder, or another app.
+/// so it can be dropped into another tab, another folder, or another app. Both
+/// copy and move are offered (Ctrl forces copy, Shift forces move).
 fn attach_drag_source(tab: &Rc<Tab>, view: &impl IsA<gtk::Widget>) {
     let source = gtk::DragSource::new();
-    source.set_actions(gdk::DragAction::COPY);
+    source.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE);
     let tab = tab.clone();
     source.connect_prepare(move |_, _, _| {
         let files: Vec<gio::File> = selected(&tab).into_iter().map(|(f, _)| f).collect();
@@ -2031,29 +2033,146 @@ fn attach_drag_source(tab: &Rc<Tab>, view: &impl IsA<gtk::Widget>) {
     view.add_controller(source);
 }
 
-/// Accept files dropped onto a view, copying them into this tab's folder.
-fn attach_drop_target(app: &Rc<App>, tab: &Rc<Tab>, widget: &impl IsA<gtk::Widget>) {
-    let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
-    let app = app.clone();
-    let tab = tab.clone();
-    target.connect_drop(move |_, value, _, _| {
-        let Ok(list) = value.get::<gdk::FileList>() else {
-            return false;
-        };
-        let sources: Vec<PathBuf> = list.files().iter().filter_map(|f| f.path()).collect();
-        let Some(dest) = tab.dir_list.file().and_then(|f| f.path()) else {
-            return false;
-        };
-        // Ignore items already living in this folder (a drop onto their own view).
-        let sources: Vec<PathBuf> =
-            sources.into_iter().filter(|p| p.parent() != Some(dest.as_path())).collect();
-        if sources.is_empty() {
-            return false;
+/// Accept files dropped onto a view. A drop onto a folder goes *into* that folder;
+/// a drop on empty space goes into the current folder. The action follows the
+/// drag (move within the same filesystem by default, copy across; Ctrl/Shift
+/// override), and the folder under the pointer highlights while hovering.
+fn attach_drop_target(app: &Rc<App>, tab: &Rc<Tab>, view: &impl IsA<gtk::Widget>) {
+    let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY | gdk::DragAction::MOVE);
+    let highlighted: Rc<RefCell<Option<gtk::Widget>>> = Rc::new(RefCell::new(None));
+
+    {
+        let view = view.clone();
+        let hl = highlighted.clone();
+        target.connect_motion(move |_, x, y| {
+            set_drop_highlight(&view, x, y, &hl);
+            gdk::DragAction::COPY | gdk::DragAction::MOVE
+        });
+    }
+    {
+        let hl = highlighted.clone();
+        target.connect_leave(move |_| clear_drop_highlight(&hl));
+    }
+    {
+        let app = app.clone();
+        let tab = tab.clone();
+        let view = view.clone();
+        target.connect_drop(move |target, value, x, y| {
+            clear_drop_highlight(&highlighted);
+            let Ok(list) = value.get::<gdk::FileList>() else {
+                return false;
+            };
+            let sources: Vec<PathBuf> = list.files().iter().filter_map(|f| f.path()).collect();
+            let Some(current) = tab.dir_list.file().and_then(|f| f.path()) else {
+                return false;
+            };
+            // Into the folder under the pointer, or the current folder otherwise.
+            let dest = match folder_name_at(&view, x, y) {
+                Some(name) => current.join(name),
+                None => current,
+            };
+            // Skip no-op / invalid targets: an item already in `dest`, or a folder
+            // dropped into itself or one of its descendants.
+            let sources: Vec<PathBuf> = sources
+                .into_iter()
+                .filter(|s| s.parent() != Some(dest.as_path()) && *s != dest && !dest.starts_with(s))
+                .collect();
+            if sources.is_empty() {
+                return false;
+            }
+            let offered = target.current_drop().map(|d| d.actions()).unwrap_or(gdk::DragAction::COPY);
+            let kind = drop_kind(offered, &sources, &dest);
+            start_job(&app, kind, sources, dest);
+            true
+        });
+    }
+    view.add_controller(target);
+}
+
+/// Choose move vs copy for a drop the way Nautilus does: honour an explicit
+/// modifier (Ctrl → copy, Shift → move, seen as a single-action offer), else move
+/// when everything is on the destination's filesystem and copy when it crosses.
+fn drop_kind(offered: gdk::DragAction, sources: &[PathBuf], dest: &Path) -> ops::Kind {
+    let can_copy = offered.contains(gdk::DragAction::COPY);
+    let can_move = offered.contains(gdk::DragAction::MOVE);
+    if can_move && !can_copy {
+        return ops::Kind::Move;
+    }
+    if can_copy && !can_move {
+        return ops::Kind::Copy;
+    }
+    if same_filesystem(sources, dest) { ops::Kind::Move } else { ops::Kind::Copy }
+}
+
+/// Whether every source is on the same filesystem as `dest`.
+fn same_filesystem(sources: &[PathBuf], dest: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(dest_dev) = std::fs::metadata(dest).map(|m| m.dev()) else {
+        return false;
+    };
+    sources
+        .iter()
+        .all(|s| std::fs::symlink_metadata(s).map(|m| m.dev() == dest_dev).unwrap_or(false))
+}
+
+/// The name of the folder cell under `(x, y)` in `view`, if any.
+fn folder_name_at(view: &impl IsA<gtk::Widget>, x: f64, y: f64) -> Option<String> {
+    let mut widget = view.pick(x, y, gtk::PickFlags::DEFAULT)?;
+    loop {
+        if let Some(name) = unsafe { widget.data::<String>("fs-dir-name") } {
+            let name = unsafe { name.as_ref() };
+            if !name.is_empty() {
+                return Some(name.clone());
+            }
         }
-        start_job(&app, ops::Kind::Copy, sources, dest);
-        true
-    });
-    widget.add_controller(target);
+        widget = widget.parent()?;
+    }
+}
+
+/// Highlight the folder cell under `(x, y)`, un-highlighting any previous one.
+fn set_drop_highlight(view: &impl IsA<gtk::Widget>, x: f64, y: f64, hl: &Rc<RefCell<Option<gtk::Widget>>>) {
+    let cell = folder_cell_at(view, x, y);
+    let mut current = hl.borrow_mut();
+    if current.as_ref() == cell.as_ref() {
+        return;
+    }
+    if let Some(prev) = current.take() {
+        prev.remove_css_class("fs-drop");
+    }
+    if let Some(cell) = &cell {
+        cell.add_css_class("fs-drop");
+    }
+    *current = cell;
+}
+
+fn clear_drop_highlight(hl: &Rc<RefCell<Option<gtk::Widget>>>) {
+    if let Some(prev) = hl.borrow_mut().take() {
+        prev.remove_css_class("fs-drop");
+    }
+}
+
+/// Tag a cell with the folder name it drops into (empty for non-folders, so a
+/// recycled cell never keeps a stale target).
+fn mark_drop_folder(cell: &impl IsA<gtk::Widget>, info: &gio::FileInfo) {
+    let name = if info.file_type() == gio::FileType::Directory {
+        info.name().to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
+    unsafe { cell.set_data("fs-dir-name", name) };
+}
+
+/// The folder cell widget under `(x, y)`, walking up from the picked descendant.
+fn folder_cell_at(view: &impl IsA<gtk::Widget>, x: f64, y: f64) -> Option<gtk::Widget> {
+    let mut widget = view.pick(x, y, gtk::PickFlags::DEFAULT)?;
+    loop {
+        if let Some(name) = unsafe { widget.data::<String>("fs-dir-name") }
+            && !unsafe { name.as_ref() }.is_empty()
+        {
+            return Some(widget);
+        }
+        widget = widget.parent()?;
+    }
 }
 
 // --- Views ------------------------------------------------------------------
@@ -2094,6 +2213,7 @@ fn name_column(icon_size: i32) -> gtk::ColumnViewColumn {
         label.set_label(&info.display_name());
         // The name column ellipsizes; show the full name on hover.
         row.set_tooltip_text(Some(&info.display_name()));
+        mark_drop_folder(&row, &info);
     });
     let col =
         gtk::ColumnViewColumn::builder().title("Name").factory(&factory).expand(true).resizable(true).build();
@@ -2190,6 +2310,7 @@ fn grid_factory(size: i32) -> gtk::SignalListItemFactory {
         // Names are wrapped/ellipsized in the grid, so surface the full name on
         // hover.
         cell.set_tooltip_text(Some(&info.display_name()));
+        mark_drop_folder(&cell, &info);
     });
     factory
 }
@@ -2332,5 +2453,28 @@ mod tests {
             parse_clipboard(URI_LIST, "# comment\r\nfile:///a\r\n\r\nfile:///b\r\n"),
             (false, vec!["file:///a".to_string(), "file:///b".to_string()])
         );
+    }
+
+    #[test]
+    fn drop_kind_honours_modifier_then_filesystem() {
+        use super::drop_kind;
+        use crate::ops::Kind;
+        use gtk::gdk::DragAction;
+
+        // A drag next to a real dir on the same filesystem.
+        let tmp = std::env::temp_dir().join(format!("filescope-drop-{}", std::process::id()));
+        let dest = tmp.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let src = tmp.join("f");
+        std::fs::write(&src, b"x").unwrap();
+        let sources = [src];
+
+        // An explicit single action wins regardless of filesystem.
+        assert_eq!(drop_kind(DragAction::MOVE, &sources, &dest), Kind::Move);
+        assert_eq!(drop_kind(DragAction::COPY, &sources, &dest), Kind::Copy);
+        // No modifier (both offered) + same filesystem → move, like Nautilus.
+        assert_eq!(drop_kind(DragAction::COPY | DragAction::MOVE, &sources, &dest), Kind::Move);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

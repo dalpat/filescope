@@ -14,7 +14,7 @@ use async_channel::Sender;
 use crate::fileops;
 
 /// Which operation a job performs.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Copy,
     Move,
