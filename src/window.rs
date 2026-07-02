@@ -286,6 +286,54 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
             show_computer(&state, &tab);
         }
     }
+
+    maybe_capture(app, &state);
+}
+
+/// Dev/docs hook: if `FILESCOPE_SHOT` is set, render the window to that PNG in
+/// process once it has settled, then quit — for generating README screenshots on
+/// systems where the compositor blocks normal grabs. `FILESCOPE_SHOT_VIEW`
+/// (`grid` | `list` | `computer`) selects which view to capture. No effect on
+/// normal runs.
+fn maybe_capture(app: &adw::Application, state: &Rc<App>) {
+    let Ok(path) = std::env::var("FILESCOPE_SHOT") else {
+        return;
+    };
+    if let Ok(view) = std::env::var("FILESCOPE_SHOT_VIEW") {
+        let tab = active_tab(state);
+        match view.as_str() {
+            "list" => {
+                state.is_list.set(true);
+                tab.view_stack.set_visible_child_name("list");
+            }
+            "grid" => {
+                state.is_list.set(false);
+                tab.view_stack.set_visible_child_name("grid");
+            }
+            "computer" => show_computer(state, &tab),
+            _ => {}
+        }
+    }
+
+    let window = state.window.clone();
+    let app = app.clone();
+    // Give the listing and async thumbnails a moment to render before grabbing.
+    glib::timeout_add_local_once(std::time::Duration::from_millis(1800), move || {
+        let (w, h) = (window.width().max(1), window.height().max(1));
+        let paintable = gtk::WidgetPaintable::new(Some(&window));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(&snapshot, w as f64, h as f64);
+        if let (Some(node), Some(renderer)) =
+            (snapshot.to_node(), window.native().and_then(|n| n.renderer()))
+        {
+            let texture = renderer.render_texture(&node, None);
+            match texture.save_to_png(&path) {
+                Ok(()) => eprintln!("saved screenshot to {path}"),
+                Err(err) => eprintln!("screenshot failed: {err}"),
+            }
+        }
+        app.quit();
+    });
 }
 
 // --- Tabs -------------------------------------------------------------------
@@ -596,6 +644,12 @@ enum DriveItem {
 /// The drives to show: the filesystem root, every mounted volume, and every
 /// connected volume that isn't mounted yet (USB sticks, other partitions, …).
 fn drives() -> Vec<DriveItem> {
+    // Docs/screenshot mode: show synthetic drives instead of the machine's real
+    // volumes, so generated screenshots never expose real drive labels.
+    if std::env::var_os("FILESCOPE_DEMO").is_some() {
+        return demo_drives();
+    }
+
     let mut out: Vec<DriveItem> = Vec::new();
     out.push(DriveItem::Mounted {
         name: "Filesystem".to_string(),
@@ -635,6 +689,33 @@ fn drives() -> Vec<DriveItem> {
 
 fn fallback_icon() -> gio::Icon {
     gio::Icon::for_string("drive-harddisk-symbolic").expect("built-in icon name is valid")
+}
+
+/// Synthetic drives for screenshots (see `FILESCOPE_DEMO`). All point at the
+/// demo folder so clicking works, but carry made-up names — no real volumes.
+fn demo_drives() -> Vec<DriveItem> {
+    let icon = |n: &str| gio::Icon::for_string(n).unwrap_or_else(|_| fallback_icon());
+    let demo = std::env::var("FILESCOPE_SHOT_DIR").unwrap_or_else(|_| "/".to_string());
+    vec![
+        DriveItem::Mounted {
+            name: "Filesystem".to_string(),
+            icon: fallback_icon(),
+            file: gio::File::for_path("/"),
+            mount: None,
+        },
+        DriveItem::Mounted {
+            name: "Local Disk".to_string(),
+            icon: icon("drive-harddisk-symbolic"),
+            file: gio::File::for_path(&demo),
+            mount: None,
+        },
+        DriveItem::Mounted {
+            name: "USB Drive".to_string(),
+            icon: icon("drive-removable-media-symbolic"),
+            file: gio::File::for_path(&demo),
+            mount: None,
+        },
+    ]
 }
 
 /// One drive tile. A mounted drive shows its capacity ("X free of Y") and opens

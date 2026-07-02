@@ -9,6 +9,22 @@ Built with **Rust + GTK4 + libadwaita**.
 
 ![status](https://img.shields.io/badge/status-alpha-orange)
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/grid.png" width="860"
+       alt="filescope icon grid with image thumbnails, and a places / bookmarks / devices sidebar">
+</p>
+<p align="center"><em>Icon grid with live image thumbnails, and a places / bookmarks / devices sidebar.</em></p>
+
+<p align="center">
+  <img src="docs/screenshots/list.png" width="860"
+       alt="filescope detailed list view with sortable Name / Size / Modified columns">
+</p>
+<p align="center"><em>Sortable detailed list view — Name / Size / Modified, folders first.</em></p>
+
+> Screenshots use a synthetic demo folder — no real files.
+
 ## What it does
 
 - **Places + bookmarks + devices sidebar** — Home and your XDG folders, a
@@ -104,6 +120,18 @@ folder.
 
 ```sh
 cargo test
+```
+
+### Capturing a screenshot
+
+Set `FILESCOPE_SHOT` to render the window to a PNG in-process and exit — handy on
+systems where the compositor blocks normal screenshots. `FILESCOPE_SHOT_VIEW`
+(`grid` | `list` | `computer`) picks the view, and `FILESCOPE_DEMO=1` swaps in
+synthetic drives so nothing real is captured:
+
+```sh
+FILESCOPE_SHOT=/tmp/grid.png FILESCOPE_SHOT_VIEW=grid FILESCOPE_DEMO=1 \
+  cargo run -- /path/to/a/demo/folder
 ```
 
 ## License
