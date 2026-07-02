@@ -636,8 +636,16 @@ fn show_computer(app: &Rc<App>, tab: &Rc<Tab>) {
 /// or a connected-but-unmounted volume we mount on click.
 enum DriveItem {
     /// A mounted location. `mount` is `Some` for a real volume (so it can be
-    /// unmounted) and `None` for the always-present filesystem root.
-    Mounted { name: String, icon: gio::Icon, file: gio::File, mount: Option<gio::Mount> },
+    /// unmounted) and `None` for the always-present filesystem root. `usage` is
+    /// `Some((used, total))` only for synthetic demo drives; real drives leave it
+    /// `None` and their capacity is queried live.
+    Mounted {
+        name: String,
+        icon: gio::Icon,
+        file: gio::File,
+        mount: Option<gio::Mount>,
+        usage: Option<(u64, u64)>,
+    },
     Unmounted { name: String, icon: gio::Icon, volume: gio::Volume },
 }
 
@@ -656,6 +664,7 @@ fn drives() -> Vec<DriveItem> {
         icon: fallback_icon(),
         file: gio::File::for_path("/"),
         mount: None,
+        usage: None,
     });
 
     let monitor = gio::VolumeMonitor::get();
@@ -670,6 +679,7 @@ fn drives() -> Vec<DriveItem> {
             icon: mount.icon(),
             file,
             mount: Some(mount),
+            usage: None,
         });
     }
     // Connected volumes with no mount yet — shown so the user can see and mount
@@ -696,24 +706,28 @@ fn fallback_icon() -> gio::Icon {
 fn demo_drives() -> Vec<DriveItem> {
     let icon = |n: &str| gio::Icon::for_string(n).unwrap_or_else(|_| fallback_icon());
     let demo = std::env::var("FILESCOPE_SHOT_DIR").unwrap_or_else(|_| "/".to_string());
+    let gb = 1_000_000_000u64;
     vec![
         DriveItem::Mounted {
             name: "Filesystem".to_string(),
             icon: fallback_icon(),
             file: gio::File::for_path("/"),
             mount: None,
+            usage: Some((512 * gb, 1000 * gb)),
         },
         DriveItem::Mounted {
             name: "Local Disk".to_string(),
             icon: icon("drive-harddisk-symbolic"),
             file: gio::File::for_path(&demo),
             mount: None,
+            usage: Some((340 * gb, 500 * gb)),
         },
         DriveItem::Mounted {
             name: "USB Drive".to_string(),
             icon: icon("drive-removable-media-symbolic"),
             file: gio::File::for_path(&demo),
             mount: None,
+            usage: Some((13 * gb, 64 * gb)),
         },
     ]
 }
@@ -742,19 +756,23 @@ fn drive_card(app: &Rc<App>, tab: &Rc<Tab>, item: &DriveItem) -> gtk::Widget {
     caption.add_css_class("caption");
 
     match item {
-        DriveItem::Mounted { file, .. } => {
-            if let Ok(info) = file.query_filesystem_info("filesystem::*", gio::Cancellable::NONE) {
+        DriveItem::Mounted { file, usage, .. } => {
+            // Demo drives carry canned figures; real drives are queried live.
+            let capacity = usage.or_else(|| {
+                let info = file.query_filesystem_info("filesystem::*", gio::Cancellable::NONE).ok()?;
                 let size = info.attribute_uint64("filesystem::size");
                 let free = info.attribute_uint64("filesystem::free");
-                if size > 0 {
-                    let used = size.saturating_sub(free);
-                    bar.set_fraction(used as f64 / size as f64);
-                    caption.set_label(&format!(
-                        "{} free of {}",
-                        format::human_size(free),
-                        format::human_size(size)
-                    ));
-                }
+                (size > 0).then_some((size.saturating_sub(free), size))
+            });
+            if let Some((used, size)) = capacity
+                && size > 0
+            {
+                bar.set_fraction(used as f64 / size as f64);
+                caption.set_label(&format!(
+                    "{} free of {}",
+                    format::human_size(size - used),
+                    format::human_size(size)
+                ));
             }
         }
         DriveItem::Unmounted { .. } => {

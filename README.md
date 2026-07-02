@@ -23,7 +23,13 @@ Built with **Rust + GTK4 + libadwaita**.
 </p>
 <p align="center"><em>Sortable detailed list view — Name / Size / Modified, folders first.</em></p>
 
-> Screenshots use a synthetic demo folder — no real files.
+<p align="center">
+  <img src="docs/screenshots/thispc.png" width="860"
+       alt="filescope This PC view: drives shown as cards with capacity bars and free space">
+</p>
+<p align="center"><em>“This PC” — every drive as a card with a capacity bar and free space, the way Windows Explorer does it (and most Linux file managers don't).</em></p>
+
+> Screenshots use a synthetic demo folder and synthetic drives — no real files or volumes.
 
 ## What it does
 
