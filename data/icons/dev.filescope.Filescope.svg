@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <!-- filescope app icon: an open folder (a file manager) with a magnifier
+       "scope" lens over it — files + scope. -->
+  <defs>
+    <linearGradient id="folder" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#62a0ea"/>
+      <stop offset="1" stop-color="#3584e4"/>
+    </linearGradient>
+    <linearGradient id="folderBack" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#99c1f1"/>
+      <stop offset="1" stop-color="#62a0ea"/>
+    </linearGradient>
+    <linearGradient id="lens" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#deddda" stop-opacity="0.9"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Folder back tab -->
+  <path d="M20 34c0-4 3-7 7-7h20l8 9h46c4 0 7 3 7 7v10H20z"
+        fill="url(#folderBack)"/>
+  <!-- Folder front body -->
+  <path d="M16 50c0-4 3-7 7-7h82c4 0 7 3 7 7l-8 46c-.6 3.4-3.6 6-7 6H24c-3.4 0-6.4-2.6-7-6z"
+        fill="url(#folder)"/>
+
+  <!-- Magnifier "scope": lens + handle -->
+  <g transform="translate(2 2)">
+    <circle cx="78" cy="72" r="20" fill="url(#lens)" stroke="#1c4b82" stroke-width="5"/>
+    <circle cx="78" cy="72" r="20" fill="#3584e4" fill-opacity="0.12"/>
+    <line x1="93" y1="87" x2="106" y2="100" stroke="#1c4b82" stroke-width="9" stroke-linecap="round"/>
+    <!-- lens highlight -->
+    <path d="M69 64a13 13 0 0 1 9-5" fill="none" stroke="#ffffff" stroke-width="4"
+          stroke-linecap="round" stroke-opacity="0.9"/>
+  </g>
+</svg>

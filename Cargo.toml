@@ -1,8 +1,9 @@
 [package]
 name = "filescope"
-description = "A simple, fast, native file manager for Linux"
+description = "A fast, nice-looking file manager for Linux"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
 
 [[bin]]
 name = "filescope"
@@ -11,3 +12,5 @@ path = "src/main.rs"
 [dependencies]
 gtk = { version = "0.9", package = "gtk4", features = ["v4_16"] }
 adw = { version = "0.7", package = "libadwaita", features = ["v1_5"] }
+# For getuid/getgid, so an ntfs-3g mount is owned by the current user.
+libc = "0.2"

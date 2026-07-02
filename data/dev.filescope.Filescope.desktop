@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=filescope
+GenericName=File Manager
+Comment=A fast, nice-looking file manager for Linux
+# install.sh rewrites this to the absolute path of the installed binary.
+Exec=filescope %f
+Icon=dev.filescope.Filescope
+Terminal=false
+Categories=System;FileTools;FileManager;
+Keywords=files;file;manager;explorer;browser;folders;disk;drive;
+MimeType=inode/directory;
+StartupNotify=true
+StartupWMClass=dev.filescope.Filescope

@@ -1,0 +1,95 @@
+name: Release
+
+# Tag a version (e.g. `git tag v0.1.0 && git push origin v0.1.0`) to build a
+# prebuilt binary and publish it as a GitHub Release. Pre-release tags (those
+# containing a hyphen, e.g. -alpha / -beta / -rc) are marked as prereleases
+# automatically.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build & publish (x86_64 linux)
+    runs-on: ubuntu-latest
+    # filescope needs GTK 4.16+ / libadwaita 1.5+. Build inside the current
+    # Ubuntu release container, which has the newer runtime.
+    container: ubuntu:rolling
+    steps:
+      - name: Install GTK4 + libadwaita (build-time only)
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgtk-4-dev libadwaita-1-dev \
+            curl ca-certificates git
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package release tarball
+        id: pkg
+        run: |
+          set -eu
+          ver="${GITHUB_REF_NAME}"
+          name="filescope-${ver}-x86_64-linux"
+          stage="dist/${name}"
+          mkdir -p "${stage}"
+          cp target/release/filescope                     "${stage}/"
+          cp data/dev.filescope.Filescope.desktop         "${stage}/"
+          cp data/icons/dev.filescope.Filescope.svg       "${stage}/"
+          cp packaging/install.sh                         "${stage}/install.sh"
+          cp LICENSE README.md                            "${stage}/"
+          chmod +x "${stage}/filescope" "${stage}/install.sh"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          {
+            echo "tarball=dist/${name}.tar.gz"
+            echo "checksum=dist/${name}.tar.gz.sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        run: |
+          cat > dist/NOTES.md <<'EOF'
+          A release of **filescope** — a fast, nice-looking file manager for Linux
+          (GTK4 + libadwaita).
+
+          ### Install — no build tools or `-dev` packages needed
+
+          **Requirements:** x86_64 Linux with a recent GNOME desktop
+          (GTK 4.16+ / libadwaita 1.5+ runtime, e.g. GNOME 46+). These ship with
+          the desktop; you do **not** need to install anything to compile.
+
+          ```sh
+          tar -xzf filescope-*-x86_64-linux.tar.gz
+          cd filescope-*-x86_64-linux
+          ./install.sh          # installs to ~/.local, no root
+          ```
+
+          Then search **filescope** in the Activities Overview, or run `filescope`.
+          Prefer not to install? Just run `./filescope` from the extracted folder.
+
+          Uninstall any time: `./install.sh --uninstall`.
+
+          Verify the download: `sha256sum -c filescope-*-x86_64-linux.tar.gz.sha256`.
+          EOF
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: filescope ${{ github.ref_name }}
+          body_path: dist/NOTES.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.checksum }}

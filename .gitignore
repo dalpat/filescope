@@ -1,1 +1,5 @@
 /target
+/dist
+# Machine-local pkg-config path for this dev box's user-local GTK -dev prefix;
+# CI and normal builds use the system libraries, so this must not ship.
+/.cargo

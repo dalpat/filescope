@@ -251,10 +251,26 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
             let t = active_tab(&s);
             if unsafe { row.data::<bool>("computer") }.is_some() {
                 show_computer(&s, &t);
+            } else if let Some(volume) = unsafe { row.data::<gio::Volume>("volume") } {
+                mount_and_open(&s, &t, unsafe { volume.as_ref() });
             } else if let Some(path) = unsafe { row.data::<PathBuf>("path") } {
                 navigate(&s, &t, gio::File::for_path(unsafe { path.as_ref() }.clone()));
             }
         });
+    }
+
+    // Keep the sidebar's device list live as drives are plugged in, mounted, or
+    // removed. The handlers are owned by the (process-lifetime) monitor singleton.
+    {
+        let monitor = gio::VolumeMonitor::get();
+        let s = state.clone();
+        monitor.connect_mount_added(move |_, _| populate_sidebar(&s));
+        let s = state.clone();
+        monitor.connect_mount_removed(move |_, _| populate_sidebar(&s));
+        let s = state.clone();
+        monitor.connect_volume_added(move |_, _| populate_sidebar(&s));
+        let s = state.clone();
+        monitor.connect_volume_removed(move |_, _| populate_sidebar(&s));
     }
 
     window.present();
@@ -436,12 +452,11 @@ fn new_tab(app: &Rc<App>, dir: gio::File, select: bool) {
 
 /// The currently active tab (there is always at least one).
 fn active_tab(app: &Rc<App>) -> Rc<Tab> {
-    if let Some(page) = app.tab_view.selected_page() {
-        if let Some(t) =
+    if let Some(page) = app.tab_view.selected_page()
+        && let Some(t) =
             app.tabs.borrow().iter().find(|t| t.page.borrow().as_ref() == Some(&page)).cloned()
-        {
-            return t;
-        }
+    {
+        return t;
     }
     app.tabs.borrow()[0].clone()
 }
@@ -572,7 +587,9 @@ fn show_computer(app: &Rc<App>, tab: &Rc<Tab>) {
 /// A drive tile's backing data: either a mounted location we can open directly,
 /// or a connected-but-unmounted volume we mount on click.
 enum DriveItem {
-    Mounted { name: String, icon: gio::Icon, file: gio::File },
+    /// A mounted location. `mount` is `Some` for a real volume (so it can be
+    /// unmounted) and `None` for the always-present filesystem root.
+    Mounted { name: String, icon: gio::Icon, file: gio::File, mount: Option<gio::Mount> },
     Unmounted { name: String, icon: gio::Icon, volume: gio::Volume },
 }
 
@@ -584,6 +601,7 @@ fn drives() -> Vec<DriveItem> {
         name: "Filesystem".to_string(),
         icon: fallback_icon(),
         file: gio::File::for_path("/"),
+        mount: None,
     });
 
     let monitor = gio::VolumeMonitor::get();
@@ -593,7 +611,12 @@ fn drives() -> Vec<DriveItem> {
         if file.path().as_deref() == Some(std::path::Path::new("/")) {
             continue;
         }
-        out.push(DriveItem::Mounted { name: mount.name().to_string(), icon: mount.icon(), file });
+        out.push(DriveItem::Mounted {
+            name: mount.name().to_string(),
+            icon: mount.icon(),
+            file,
+            mount: Some(mount),
+        });
     }
     // Connected volumes with no mount yet — shown so the user can see and mount
     // them from here rather than hunting in another app.
@@ -685,6 +708,41 @@ fn drive_card(app: &Rc<App>, tab: &Rc<Tab>, item: &DriveItem) -> gtk::Widget {
     button.upcast()
 }
 
+/// Unmount `mount`. If a tab is currently inside it, send that tab Home first so
+/// it isn't left showing a directory that's about to disappear. Runs async.
+fn unmount(app: &Rc<App>, mount: &gio::Mount) {
+    // Any tab sitting inside this mount gets sent Home before it vanishes.
+    if let Some(root) = mount.default_location().path() {
+        for tab in app.tabs.borrow().iter() {
+            if tab.dir_list.file().and_then(|f| f.path()).is_some_and(|p| p.starts_with(&root)) {
+                let tab = tab.clone();
+                let app = app.clone();
+                navigate(&app, &tab, gio::File::for_path(glib::home_dir()));
+            }
+        }
+    }
+
+    let op = gio::MountOperation::new();
+    let name = mount.name().to_string();
+    let app = app.clone();
+    mount.unmount_with_operation(
+        gio::MountUnmountFlags::NONE,
+        Some(&op),
+        gio::Cancellable::NONE,
+        move |res| match res {
+            Ok(()) => {
+                populate_sidebar(&app);
+                toast(&app, &format!("Unmounted {name}"));
+            }
+            Err(err) => {
+                if !err.matches(gio::IOErrorEnum::FailedHandled) {
+                    toast(&app, &format!("Couldn't unmount {name}: {err}"));
+                }
+            }
+        },
+    );
+}
+
 /// Mount `volume`, then open it in `tab`. Runs asynchronously; the platform
 /// shows a prompt (for passwords etc.) when the volume needs one.
 fn mount_and_open(app: &Rc<App>, tab: &Rc<Tab>, volume: &gio::Volume) {
@@ -697,18 +755,89 @@ fn mount_and_open(app: &Rc<App>, tab: &Rc<Tab>, volume: &gio::Volume) {
         Some(&op),
         gio::Cancellable::NONE,
         move |res| match res {
-            Ok(()) => match volume.get_mount() {
-                Some(mount) => navigate(&app, &tab, mount.default_location()),
-                None => toast(&app, "Mounted, but couldn't locate the drive"),
-            },
+            Ok(()) => {
+                populate_sidebar(&app);
+                match volume.get_mount() {
+                    Some(mount) => navigate(&app, &tab, mount.default_location()),
+                    None => toast(&app, "Mounted, but couldn't locate the drive"),
+                }
+            }
             Err(err) => {
                 // The user dismissing the mount prompt reports FailedHandled.
-                if !err.matches(gio::IOErrorEnum::FailedHandled) {
-                    toast(&app, &format!("Couldn't mount: {err}"));
+                if err.matches(gio::IOErrorEnum::FailedHandled) {
+                    return;
                 }
+                // GIO couldn't mount it (commonly an NTFS volume on a system
+                // without gvfs/udisks NTFS support) — fall back to ntfs-3g.
+                ntfs3g_fallback(&app, &tab, &volume, &err);
             }
         },
     );
+}
+
+/// Mount `volume` with ntfs-3g directly, then open it. Used when GIO's own mount
+/// fails — chiefly for NTFS partitions. Prefers `pkexec` so no terminal is
+/// needed; the mount is owned by the current user (uid/gid options) and mounted
+/// under a user-writable point in the runtime dir. Runs asynchronously.
+fn ntfs3g_fallback(app: &Rc<App>, tab: &Rc<Tab>, volume: &gio::Volume, err: &glib::Error) {
+    let Some(device) = volume.identifier("unix-device") else {
+        toast(app, &format!("Couldn't mount: {err}"));
+        return;
+    };
+    if !has_binary("ntfs-3g") {
+        toast(app, "This drive needs NTFS support — install the ntfs-3g package.");
+        return;
+    }
+
+    // A user-owned mount point: <runtime>/filescope-mounts/<sanitized name>.
+    let safe: String = volume
+        .name()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let mut mount_point = glib::user_runtime_dir();
+    mount_point.push("filescope-mounts");
+    mount_point.push(if safe.is_empty() { "drive".to_string() } else { safe });
+    if let Err(e) = std::fs::create_dir_all(&mount_point) {
+        toast(app, &format!("Couldn't prepare a mount point: {e}"));
+        return;
+    }
+
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let options = format!("uid={uid},gid={gid},umask=022");
+
+    // pkexec raises a graphical auth prompt; without it, try ntfs-3g directly
+    // (works when it is configured to let the user mount).
+    let mut argv: Vec<std::ffi::OsString> = Vec::new();
+    if has_binary("pkexec") {
+        argv.push("pkexec".into());
+    }
+    argv.push("ntfs-3g".into());
+    argv.push("-o".into());
+    argv.push(options.into());
+    argv.push(device.as_str().into());
+    argv.push(mount_point.clone().into_os_string());
+    let argv_refs: Vec<&std::ffi::OsStr> = argv.iter().map(|s| s.as_os_str()).collect();
+
+    match gio::Subprocess::newv(&argv_refs, gio::SubprocessFlags::NONE) {
+        Ok(process) => {
+            let app = app.clone();
+            let tab = tab.clone();
+            process.wait_check_async(gio::Cancellable::NONE, move |res| match res {
+                Ok(()) => navigate(&app, &tab, gio::File::for_path(&mount_point)),
+                Err(e) => toast(&app, &format!("ntfs-3g couldn't mount the drive: {e}")),
+            });
+        }
+        Err(e) => toast(app, &format!("Couldn't run ntfs-3g: {e}")),
+    }
+}
+
+/// Whether `name` is an executable found on `PATH`.
+fn has_binary(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
 }
 
 // --- Zoom -------------------------------------------------------------------
@@ -722,10 +851,10 @@ fn zoom(app: &Rc<App>, delta: i32) {
     for tab in app.tabs.borrow().iter() {
         tab.grid_view.set_factory(Some(&grid_factory(new)));
         fill_columns(&tab.column_view, list_icon(new));
-        if let Some(sorter) = tab.column_view.sorter() {
-            if let Some(sm) = tab.selection.model().and_downcast::<gtk::SortListModel>() {
-                sm.set_sorter(Some(&sorter));
-            }
+        if let Some(sorter) = tab.column_view.sorter()
+            && let Some(sm) = tab.selection.model().and_downcast::<gtk::SortListModel>()
+        {
+            sm.set_sorter(Some(&sorter));
         }
         // Rebuilding the columns clears the active sort column; restore it.
         apply_sort_to(app, tab);
@@ -882,11 +1011,11 @@ fn activate(app: &Rc<App>, tab: &Rc<Tab>, position: u32) {
 fn open_selected(app: &Rc<App>) {
     let tab = active_tab(app);
     let items = selected(&tab);
-    if let [(file, info)] = items.as_slice() {
-        if info.file_type() == gio::FileType::Directory {
-            navigate(app, &tab, file.clone());
-            return;
-        }
+    if let [(file, info)] = items.as_slice()
+        && info.file_type() == gio::FileType::Directory
+    {
+        navigate(app, &tab, file.clone());
+        return;
     }
     for (file, info) in items {
         if info.file_type() != gio::FileType::Directory {
@@ -928,18 +1057,18 @@ fn toggle_preview(app: &Rc<App>) {
     }
     let tab = active_tab(app);
     let items = selected(&tab);
-    if let [(file, info)] = items.as_slice() {
-        if info.file_type() != gio::FileType::Directory {
-            let win = preview::show(&app.window, file, info);
-            {
-                let app = app.clone();
-                win.connect_close_request(move |_| {
-                    *app.preview.borrow_mut() = None;
-                    glib::Propagation::Proceed
-                });
-            }
-            *app.preview.borrow_mut() = Some(win);
+    if let [(file, info)] = items.as_slice()
+        && info.file_type() != gio::FileType::Directory
+    {
+        let win = preview::show(&app.window, file, info);
+        {
+            let app = app.clone();
+            win.connect_close_request(move |_| {
+                *app.preview.borrow_mut() = None;
+                glib::Propagation::Proceed
+            });
         }
+        *app.preview.borrow_mut() = Some(win);
     }
 }
 
@@ -1190,10 +1319,10 @@ fn show_properties(app: &Rc<App>) {
     }
     for (label, attr) in [("Accessed", "time::access"), ("Created", "time::created")] {
         let secs = info.attribute_uint64(attr);
-        if secs > 0 {
-            if let Ok(dt) = glib::DateTime::from_unix_local(secs as i64) {
-                time.add(&prop_row(label, &format::modified(&dt)));
-            }
+        if secs > 0
+            && let Ok(dt) = glib::DateTime::from_unix_local(secs as i64)
+        {
+            time.add(&prop_row(label, &format::modified(&dt)));
         }
     }
 
@@ -1364,6 +1493,17 @@ fn populate_sidebar(app: &Rc<App>) {
     // This PC (special row → drives view).
     list.append(&place_row("computer-symbolic", "This PC", None, true));
 
+    // Devices: the filesystem root and each drive/partition, mounted or not.
+    // Mounted ones open on click and carry an eject button; unmounted ones mount
+    // on click.
+    let items = drives();
+    if items.len() > 1 {
+        list.append(&section_header("Devices"));
+        for item in items {
+            list.append(&device_row(app, item));
+        }
+    }
+
     // Bookmarks.
     let marks = app.bookmarks.borrow().clone();
     if !marks.is_empty() {
@@ -1385,8 +1525,7 @@ fn section_header(text: &str) -> gtk::ListBoxRow {
     label.set_margin_top(10);
     label.set_margin_bottom(2);
     label.set_margin_start(12);
-    let row = gtk::ListBoxRow::builder().child(&label).selectable(false).activatable(false).build();
-    row
+    gtk::ListBoxRow::builder().child(&label).selectable(false).activatable(false).build()
 }
 
 fn place_row(icon: &str, label: &str, path: Option<PathBuf>, computer: bool) -> gtk::ListBoxRow {
@@ -1405,6 +1544,56 @@ fn place_row(icon: &str, label: &str, path: Option<PathBuf>, computer: bool) -> 
     }
     if computer {
         unsafe { row.set_data("computer", true) };
+    }
+    row
+}
+
+/// A sidebar device row. Mounted → opens on click, with an eject button that
+/// unmounts. Unmounted → mounts (then opens) on click.
+fn device_row(app: &Rc<App>, item: DriveItem) -> gtk::ListBoxRow {
+    let (label, icon) = match &item {
+        DriveItem::Mounted { name, icon, .. } => (name.clone(), icon.clone()),
+        DriveItem::Unmounted { name, icon, .. } => (name.clone(), icon.clone()),
+    };
+    let image = gtk::Image::from_gicon(&icon);
+    let text = gtk::Label::builder()
+        .label(&label)
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).build();
+    row_box.set_margin_top(6);
+    row_box.set_margin_bottom(6);
+    row_box.set_margin_start(6);
+    row_box.set_margin_end(6);
+    row_box.append(&image);
+    row_box.append(&text);
+
+    let row = gtk::ListBoxRow::builder().child(&row_box).build();
+    match item {
+        DriveItem::Mounted { file, mount, .. } => {
+            if let Some(path) = file.path() {
+                unsafe { row.set_data("path", path) };
+            }
+            // Real volumes get an eject/unmount button; the root does not.
+            if let Some(mount) = mount {
+                text.set_tooltip_text(None);
+                let eject = gtk::Button::builder()
+                    .icon_name("media-eject-symbolic")
+                    .tooltip_text("Unmount")
+                    .build();
+                eject.add_css_class("flat");
+                eject.add_css_class("bookmark-remove");
+                let app = app.clone();
+                eject.connect_clicked(move |_| unmount(&app, &mount));
+                row_box.append(&eject);
+            }
+        }
+        DriveItem::Unmounted { volume, .. } => {
+            text.add_css_class("dim-label");
+            unsafe { row.set_data("volume", volume) };
+        }
     }
     row
 }

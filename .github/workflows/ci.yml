@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build & test (GTK)
+    runs-on: ubuntu-latest
+    # filescope needs GTK 4.16+ / libadwaita 1.5+. The hosted ubuntu-24.04 image
+    # ships an older GTK, so build inside the current Ubuntu release container,
+    # which tracks the latest runtime (and whose apt repos stay live).
+    container: ubuntu:rolling
+    steps:
+      - name: Install GTK4 + libadwaita
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgtk-4-dev libadwaita-1-dev \
+            curl ca-certificates git
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
