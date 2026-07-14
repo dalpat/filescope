@@ -1221,22 +1221,28 @@ fn open_terminal(app: &Rc<App>) {
     }
 }
 
-/// Spawn a terminal emulator with its working directory set to `dir`. Honours
-/// `$TERMINAL` first, then tries the common emulators, returning whether one
-/// launched.
+/// Spawn a terminal emulator opening `dir`. Honours `$TERMINAL` first, then tries
+/// the common emulators, returning whether one launched.
+///
+/// The directory is passed via each terminal's own flag rather than relying on
+/// the spawned process's working directory: modern terminals (ptyxis, GNOME
+/// Console, gnome-terminal) are single-instance/D-Bus-activated, so a bare
+/// re-launch just raises the running instance and ignores the inherited cwd —
+/// the flag is what makes them open a new window in the right folder.
 fn open_terminal_at(dir: &Path) -> bool {
-    let mut candidates: Vec<String> = Vec::new();
+    // Specific terminals (with correct flags) are tried before the generic
+    // `x-terminal-emulator`, which may itself resolve to one of them.
+    let mut bins: Vec<String> = Vec::new();
     if let Ok(term) = std::env::var("TERMINAL")
         && !term.is_empty()
     {
-        candidates.push(term);
+        bins.push(term);
     }
-    candidates.extend(
+    bins.extend(
         [
-            "x-terminal-emulator", // Debian/Ubuntu's configured default
-            "kgx",                 // GNOME Console
-            "gnome-terminal",
             "ptyxis",
+            "kgx", // GNOME Console
+            "gnome-terminal",
             "konsole",
             "xfce4-terminal",
             "tilix",
@@ -1245,13 +1251,35 @@ fn open_terminal_at(dir: &Path) -> bool {
             "wezterm",
             "foot",
             "xterm",
+            "x-terminal-emulator",
         ]
         .into_iter()
         .map(str::to_string),
     );
-    candidates
-        .into_iter()
-        .any(|term| std::process::Command::new(&term).current_dir(dir).spawn().is_ok())
+    bins.into_iter().any(|bin| {
+        std::process::Command::new(&bin)
+            .args(terminal_args(&bin, dir.as_os_str()))
+            .current_dir(dir)
+            .spawn()
+            .is_ok()
+    })
+}
+
+/// The arguments that make `bin` open a new window in `dir`. Unknown terminals
+/// get none and fall back to the inherited working directory.
+fn terminal_args(bin: &str, dir: &std::ffi::OsStr) -> Vec<std::ffi::OsString> {
+    let name = Path::new(bin).file_name().and_then(|s| s.to_str()).unwrap_or(bin);
+    let d = dir.to_os_string();
+    match name {
+        // ptyxis needs an explicit new window; -d supplies its directory.
+        "ptyxis" => vec!["--new-window".into(), "-d".into(), d],
+        "konsole" => vec!["--workdir".into(), d],
+        "kitty" => vec!["--directory".into(), d],
+        "wezterm" => vec!["start".into(), "--cwd".into(), d],
+        "gnome-terminal" | "kgx" | "gnome-console" | "xfce4-terminal" | "tilix" | "alacritty"
+        | "foot" => vec!["--working-directory".into(), d],
+        _ => Vec::new(),
+    }
 }
 
 /// Put the selection on the **system** clipboard (so it pastes into other apps
