@@ -60,9 +60,20 @@ jobs:
 
       - name: Write release notes
         run: |
-          cat > dist/NOTES.md <<'EOF'
-          A release of **filescope** — a fast, nice-looking file manager for Linux
-          (GTK4 + libadwaita).
+          set -eu
+          mkdir -p dist
+          # Pull this version's section out of CHANGELOG.md ("## [x.y.z]" up to the
+          # next "## ["), falling back to a one-liner if it isn't found.
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="$ver" '
+            $0 ~ ("^## \\[" v "\\]") { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > dist/NOTES.md || true
+          if [ ! -s dist/NOTES.md ]; then
+            echo "A release of **filescope** — a fast, nice-looking file manager for Linux." > dist/NOTES.md
+          fi
+          cat >> dist/NOTES.md <<'EOF'
 
           ### Install — no build tools or `-dev` packages needed
 
