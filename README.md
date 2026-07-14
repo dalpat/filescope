@@ -49,8 +49,8 @@ Built with **Rust + GTK4 + libadwaita**.
   volumes fall back to **ntfs-3g** automatically when the system mount can't
   handle them. Eject/unmount from the sidebar.
 - **File operations** — copy, cut, paste, rename, new folder, move-to-Trash,
-  permanent delete, properties, open, and open-with — from the toolbar,
-  right-click menu, or keyboard.
+  permanent delete, properties, open, open-with, and **Open Terminal Here**
+  (`Ctrl+.`) — from the toolbar, right-click menu, or keyboard.
 - **Background operations** — copy / move / delete run on a worker thread with a
   live **progress bar** and **Cancel**, so the window never freezes on a big
   transfer. Name clashes raise a **conflict dialog** (Replace / Skip / Keep Both,
@@ -81,6 +81,7 @@ Built with **Rust + GTK4 + libadwaita**.
 | `Ctrl+A` | Select all |
 | `Ctrl+H` | Show hidden files |
 | `Ctrl+D` | Bookmark this folder |
+| `Ctrl+.` | Open terminal in this folder |
 | `Ctrl++` / `Ctrl+-` | Zoom in / out |
 | `Ctrl+L` | Edit path |
 | `F5` / `Ctrl+R` | Refresh |

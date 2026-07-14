@@ -1032,6 +1032,7 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
         }
     });
     action!("properties", show_properties);
+    action!("open-terminal", open_terminal);
     action!("bookmark", bookmark_current);
     action!("zoom-in", |s: &Rc<App>| zoom(s, ZOOM_STEP));
     action!("zoom-out", |s: &Rc<App>| zoom(s, -ZOOM_STEP));
@@ -1103,6 +1104,7 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
         ("find", &["<ctrl>f"]),
         ("toggle-hidden", &["<ctrl>h"]),
         ("bookmark", &["<ctrl>d"]),
+        ("open-terminal", &["<ctrl>period"]),
         ("zoom-in", &["<ctrl>plus", "<ctrl>equal"]),
         ("zoom-out", &["<ctrl>minus"]),
     ] {
@@ -1208,6 +1210,48 @@ fn launch(app: &Rc<App>, file: &gio::File) {
             toast(&app, &format!("Couldn't open: {err}"));
         }
     });
+}
+
+/// Open a terminal in the active tab's folder (Ctrl+.). Only meaningful for a
+/// real on-disk directory (not the "This PC" view).
+fn open_terminal(app: &Rc<App>) {
+    let Some(dir) = active_tab(app).dir_list.file().and_then(|f| f.path()) else { return };
+    if !open_terminal_at(&dir) {
+        toast(app, "No terminal emulator found");
+    }
+}
+
+/// Spawn a terminal emulator with its working directory set to `dir`. Honours
+/// `$TERMINAL` first, then tries the common emulators, returning whether one
+/// launched.
+fn open_terminal_at(dir: &Path) -> bool {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(term) = std::env::var("TERMINAL")
+        && !term.is_empty()
+    {
+        candidates.push(term);
+    }
+    candidates.extend(
+        [
+            "x-terminal-emulator", // Debian/Ubuntu's configured default
+            "kgx",                 // GNOME Console
+            "gnome-terminal",
+            "ptyxis",
+            "konsole",
+            "xfce4-terminal",
+            "tilix",
+            "kitty",
+            "alacritty",
+            "wezterm",
+            "foot",
+            "xterm",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    candidates
+        .into_iter()
+        .any(|term| std::process::Command::new(&term).current_dir(dir).spawn().is_ok())
 }
 
 /// Put the selection on the **system** clipboard (so it pastes into other apps
@@ -1935,6 +1979,7 @@ fn context_menu() -> gio::Menu {
     menu.append_section(None, &c);
     let d = gio::Menu::new();
     d.append(Some("New Folder…"), Some("win.new-folder"));
+    d.append(Some("Open Terminal Here (Ctrl+.)"), Some("win.open-terminal"));
     d.append(Some("Bookmark This Folder"), Some("win.bookmark"));
     d.append(Some("Select All"), Some("win.select-all"));
     d.append(Some("Properties"), Some("win.properties"));
@@ -1979,6 +2024,7 @@ fn primary_menu() -> gio::Menu {
     let a = gio::Menu::new();
     a.append(Some("New Tab"), Some("win.new-tab"));
     a.append(Some("New Folder…"), Some("win.new-folder"));
+    a.append(Some("Open Terminal Here"), Some("win.open-terminal"));
     a.append(Some("Bookmark This Folder"), Some("win.bookmark"));
     menu.append_section(None, &a);
     let b = gio::Menu::new();
