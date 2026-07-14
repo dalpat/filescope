@@ -246,9 +246,7 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
             b.set_icon_name(if list { "view-grid-symbolic" } else { "view-list-symbolic" });
             b.set_tooltip_text(Some(if list { "Grid view" } else { "List view" }));
             for t in s.tabs.borrow().iter() {
-                if t.view_stack.visible_child_name().as_deref() != Some("computer") {
-                    t.view_stack.set_visible_child_name(if list { "list" } else { "grid" });
-                }
+                refresh_view_mode(&s, t, false);
             }
         });
     }
@@ -415,10 +413,18 @@ fn new_tab(app: &Rc<App>, dir: gio::File, select: bool) {
     let computer_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     let computer_scroller = gtk::ScrolledWindow::builder().vexpand(true).child(&computer_box).build();
 
+    // Shown in place of the grid/list when the folder has no visible items.
+    let empty_page = adw::StatusPage::builder()
+        .icon_name("folder-symbolic")
+        .title("This Folder Is Empty")
+        .description("Drop files here, or paste to add some.")
+        .build();
+
     let view_stack = gtk::Stack::new();
     view_stack.add_named(&grid_scroller, Some("grid"));
     view_stack.add_named(&list_scroller, Some("list"));
     view_stack.add_named(&computer_scroller, Some("computer"));
+    view_stack.add_named(&empty_page, Some("empty"));
 
     let breadcrumb = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
     breadcrumb.add_css_class("crumbs");
@@ -508,7 +514,18 @@ fn new_tab(app: &Rc<App>, dir: gio::File, select: bool) {
     }
     {
         let app = app.clone();
-        selection.connect_items_changed(move |_, _, _, _| update_chrome(&app));
+        let tab = tab.clone();
+        selection.connect_items_changed(move |_, _, _, _| {
+            update_chrome(&app);
+            refresh_view_mode(&app, &tab, false);
+        });
+    }
+    // The listing loads asynchronously; re-evaluate the empty state once it does.
+    {
+        let app = app.clone();
+        let tab = tab.clone();
+        let dir_list = tab.dir_list.clone();
+        dir_list.connect_loading_notify(move |_| refresh_view_mode(&app, &tab, false));
     }
     // Context menu.
     attach_context_menu(app, &grid_view);
@@ -575,7 +592,8 @@ fn set_dir(app: &Rc<App>, tab: &Rc<Tab>, file: &gio::File) {
     // A new folder starts unfiltered — close any open search from the last one.
     tab.search_bar.set_search_mode(false);
     tab.dir_list.set_file(Some(file));
-    tab.view_stack.set_visible_child_name(if app.is_list.get() { "list" } else { "grid" });
+    // Force out of any "This PC" view into the directory (empty/grid/list).
+    refresh_view_mode(app, tab, true);
     rebuild_breadcrumb(app, tab, file);
     if let Some(page) = tab.page.borrow().as_ref() {
         let title =
@@ -583,6 +601,25 @@ fn set_dir(app: &Rc<App>, tab: &Rc<Tab>, file: &gio::File) {
         page.set_title(&title);
     }
     update_chrome(app);
+}
+
+/// Show the right page for a tab's directory: the "empty" placeholder when the
+/// folder has finished loading with no visible items, otherwise the grid or list
+/// per the current view mode. With `force` false this leaves a "This PC" view
+/// alone, so background updates don't yank the user out of it.
+fn refresh_view_mode(app: &Rc<App>, tab: &Rc<Tab>, force: bool) {
+    if !force && tab.view_stack.visible_child_name().as_deref() == Some("computer") {
+        return;
+    }
+    let empty = !tab.dir_list.is_loading() && tab.selection.n_items() == 0;
+    let name = if empty {
+        "empty"
+    } else if app.is_list.get() {
+        "list"
+    } else {
+        "grid"
+    };
+    tab.view_stack.set_visible_child_name(name);
 }
 
 fn refresh(tab: &Rc<Tab>) {
