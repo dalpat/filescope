@@ -27,7 +27,7 @@ pub fn unique_destination(dir: &Path, name: &str) -> PathBuf {
 
 /// Split a filename into (stem, extension-including-dot). A leading dot (dotfile)
 /// is treated as part of the stem, not an extension.
-fn split_name(name: &str) -> (&str, &str) {
+pub fn split_name(name: &str) -> (&str, &str) {
     match name.rfind('.') {
         Some(i) if i > 0 => (&name[..i], &name[i..]),
         _ => (name, ""),

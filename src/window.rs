@@ -1863,7 +1863,17 @@ fn delete_selected(app: &Rc<App>) {
     });
 }
 
+/// Rename the selection: in place on the item itself, falling back to a dialog
+/// when the row isn't on screen to host the editor.
 fn rename_selected(app: &Rc<App>) {
+    let tab = active_tab(app);
+    if start_inline_rename(app, &tab) {
+        return;
+    }
+    rename_with_dialog(app);
+}
+
+fn rename_with_dialog(app: &Rc<App>) {
     let tab = active_tab(app);
     let items = selected(&tab);
     let [(file, info)] = items.as_slice() else {
@@ -2611,6 +2621,170 @@ fn folder_cell_at(view: &impl IsA<gtk::Widget>, x: f64, y: f64) -> Option<gtk::W
     }
 }
 
+// --- Inline rename ----------------------------------------------------------
+
+/// Wrap a cell's name label in a stack that can flip to an entry for renaming
+/// the item in place.
+fn name_stack(label: &gtk::Label) -> gtk::Stack {
+    let entry = gtk::Entry::builder().xalign(0.0).width_chars(6).build();
+    entry.add_css_class("fs-rename");
+    let stack = gtk::Stack::new();
+    stack.set_hexpand(true);
+    stack.add_named(label, Some("view"));
+    stack.add_named(&entry, Some("edit"));
+    stack
+}
+
+/// Per-bind setup for a cell's name stack: tag the cell with its row position (so
+/// a rename can find this widget) and make sure a recycled cell isn't left in
+/// edit mode. Returns the label to fill in.
+fn bind_name_stack(cell: &gtk::Box, position: u32) -> gtk::Label {
+    unsafe { cell.set_data("fs-position", position) };
+    let stack = find_name_stack(cell.upcast_ref::<gtk::Widget>()).expect("cell has a name stack");
+    stack.set_visible_child_name("view");
+    stack.child_by_name("view").and_downcast::<gtk::Label>().expect("name stack holds a label")
+}
+
+/// Depth-first search for the name stack inside a cell.
+fn find_name_stack(widget: &gtk::Widget) -> Option<gtk::Stack> {
+    let mut child = widget.first_child();
+    while let Some(w) = child {
+        if let Ok(stack) = w.clone().downcast::<gtk::Stack>() {
+            return Some(stack);
+        }
+        if let Some(found) = find_name_stack(&w) {
+            return Some(found);
+        }
+        child = w.next_sibling();
+    }
+    None
+}
+
+/// The cell widget currently showing row `position`, if it is realized.
+fn cell_at_position(widget: &gtk::Widget, position: u32) -> Option<gtk::Widget> {
+    let mut child = widget.first_child();
+    while let Some(w) = child {
+        if let Some(p) = unsafe { w.data::<u32>("fs-position") }
+            && unsafe { *p.as_ref() } == position
+        {
+            return Some(w);
+        }
+        if let Some(found) = cell_at_position(&w, position) {
+            return Some(found);
+        }
+        child = w.next_sibling();
+    }
+    None
+}
+
+/// Start renaming the selected item in place. Returns false when the row isn't
+/// realized (e.g. scrolled out of view), so the caller can fall back to a dialog.
+fn start_inline_rename(app: &Rc<App>, tab: &Rc<Tab>) -> bool {
+    let bitset = tab.selection.selection();
+    if bitset.size() != 1 {
+        return false;
+    }
+    let position = bitset.nth(0);
+    let Some(info) = tab.selection.item(position).and_downcast::<gio::FileInfo>() else {
+        return false;
+    };
+    let Some(dir) = tab.dir_list.file() else { return false };
+    let file = dir.child(info.name());
+    let name = info.display_name().to_string();
+    let is_dir = info.file_type() == gio::FileType::Directory;
+
+    // Only the visible view can host the editor.
+    let view: gtk::Widget = if app.is_list.get() {
+        tab.column_view.clone().upcast()
+    } else {
+        tab.grid_view.clone().upcast()
+    };
+    let Some(cell) = cell_at_position(&view, position) else {
+        return false;
+    };
+    let Some(stack) = find_name_stack(&cell) else { return false };
+    let Some(entry) = stack.child_by_name("edit").and_downcast::<gtk::Entry>() else {
+        return false;
+    };
+
+    entry.set_text(&name);
+    let (start, end) = rename_selection_region(&name, is_dir);
+    stack.set_visible_child_name("edit");
+    entry.grab_focus();
+    entry.select_region(start, end);
+
+    // Wire this edit session, disconnecting when it ends so a recycled cell never
+    // accumulates handlers from previous renames.
+    let handlers: Rc<RefCell<Vec<glib::SignalHandlerId>>> = Rc::new(RefCell::new(Vec::new()));
+    let finish = {
+        let stack = stack.clone();
+        let entry = entry.clone();
+        let handlers = handlers.clone();
+        Rc::new(move || {
+            stack.set_visible_child_name("view");
+            for id in handlers.borrow_mut().drain(..) {
+                entry.disconnect(id);
+            }
+        })
+    };
+
+    // Enter commits.
+    {
+        let app = app.clone();
+        let finish = finish.clone();
+        let file = file.clone();
+        let old = name.clone();
+        let id = entry.connect_activate(move |entry| {
+            let new = entry.text().to_string();
+            finish();
+            commit_inline_rename(&app, &file, &old, &new);
+        });
+        handlers.borrow_mut().push(id);
+    }
+    // Escape cancels; so does clicking away.
+    {
+        let finish = finish.clone();
+        let key = gtk::EventControllerKey::new();
+        key.connect_key_pressed(move |_, k, _, _| {
+            if k == gtk::gdk::Key::Escape {
+                finish();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        entry.add_controller(key);
+    }
+    {
+        let finish = finish.clone();
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_leave(move |_| finish());
+        entry.add_controller(focus);
+    }
+    true
+}
+
+/// Apply an inline rename, recording it for undo.
+fn commit_inline_rename(app: &Rc<App>, file: &gio::File, old: &str, new: &str) {
+    if new.is_empty() || new == old {
+        return; // nothing to do
+    }
+    if new.contains('/') {
+        toast(app, "Invalid name");
+        return;
+    }
+    let renamed = file
+        .path()
+        .ok_or(())
+        .and_then(|from| fileops::rename(&from, new).map(|to| (from, to)).map_err(|_| ()));
+    match renamed {
+        Ok((from, to)) => {
+            push_undo(app, undo::Action::Rename { from, to });
+            refresh(&active_tab(app));
+        }
+        Err(()) => toast(app, "Couldn't rename"),
+    }
+}
+
 // --- Views ------------------------------------------------------------------
 
 /// Rebuild `column_view`'s columns with the given leading-icon size.
@@ -2632,7 +2806,7 @@ fn name_column(icon_size: i32) -> gtk::ColumnViewColumn {
             gtk::Label::builder().xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
         let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(10).build();
         row.append(&image);
-        row.append(&label);
+        row.append(&name_stack(&label));
         item.set_child(Some(&row));
     });
     factory.connect_bind(move |_, item| {
@@ -2640,7 +2814,7 @@ fn name_column(icon_size: i32) -> gtk::ColumnViewColumn {
         let info = item.item().and_downcast::<gio::FileInfo>().unwrap();
         let row = item.child().and_downcast::<gtk::Box>().unwrap();
         let image = row.first_child().and_downcast::<gtk::Image>().unwrap();
-        let label = image.next_sibling().and_downcast::<gtk::Label>().unwrap();
+        let label = bind_name_stack(&row, item.position());
         image.set_pixel_size(icon_size);
         set_themed_icon(&image, &info);
         if icon_size >= 32 {
@@ -2730,7 +2904,7 @@ fn grid_factory(size: i32) -> gtk::SignalListItemFactory {
         let cell = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
         cell.set_halign(gtk::Align::Center);
         cell.append(&image);
-        cell.append(&label);
+        cell.append(&name_stack(&label));
         item.set_child(Some(&cell));
     });
     factory.connect_bind(move |_, item| {
@@ -2738,7 +2912,7 @@ fn grid_factory(size: i32) -> gtk::SignalListItemFactory {
         let info = item.item().and_downcast::<gio::FileInfo>().unwrap();
         let cell = item.child().and_downcast::<gtk::Box>().unwrap();
         let image = cell.first_child().and_downcast::<gtk::Image>().unwrap();
-        let label = image.next_sibling().and_downcast::<gtk::Label>().unwrap();
+        let label = bind_name_stack(&cell, item.position());
         image.set_pixel_size(size);
         set_themed_icon(&image, &info);
         set_thumbnail(&image, &info, size);
@@ -2865,9 +3039,41 @@ fn permission_string(mode: u32) -> String {
     .collect()
 }
 
+/// The region of a name an inline rename should pre-select: just the stem for a
+/// file with an extension (so typing replaces the name but keeps ".jpg"), and the
+/// whole thing for folders, dotfiles, and names without an extension.
+fn rename_selection_region(name: &str, is_dir: bool) -> (i32, i32) {
+    if is_dir {
+        return (0, -1);
+    }
+    let (stem, ext) = fileops::split_name(name);
+    if ext.is_empty() { (0, -1) } else { (0, stem.chars().count() as i32) }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{GNOME_COPIED, URI_LIST, parse_clipboard};
+    use super::{GNOME_COPIED, URI_LIST, parse_clipboard, rename_selection_region};
+
+    #[test]
+    fn inline_rename_preselects_the_stem_not_the_extension() {
+        // Typing immediately replaces "photo" but keeps ".jpg".
+        assert_eq!(rename_selection_region("photo.jpg", false), (0, 5));
+        assert_eq!(rename_selection_region("archive.tar.gz", false), (0, 11)); // "archive.tar"
+    }
+
+    #[test]
+    fn inline_rename_selects_everything_when_there_is_no_extension_to_keep() {
+        assert_eq!(rename_selection_region("README", false), (0, -1));
+        assert_eq!(rename_selection_region(".bashrc", false), (0, -1)); // dotfile, not an ext
+        assert_eq!(rename_selection_region("My Folder", true), (0, -1)); // folders: whole name
+        assert_eq!(rename_selection_region("src.old", true), (0, -1)); // even a dotted folder
+    }
+
+    #[test]
+    fn inline_rename_region_counts_characters_not_bytes() {
+        // Selection offsets are in characters; a multi-byte stem must not overrun.
+        assert_eq!(rename_selection_region("résumé.pdf", false), (0, 6));
+    }
 
     #[test]
     fn parses_gnome_copy_and_cut() {

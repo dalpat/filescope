@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Added
+- **Inline rename** — `F2` now edits the name on the item itself (in both grid
+  and list) instead of opening a dialog. The stem is pre-selected so typing
+  replaces the name but keeps the extension; folders and dotfiles select the
+  whole name. Enter commits, Escape cancels, clicking away cancels. Falls back to
+  the dialog if the row isn't on screen to host the editor.
 - **Trash view** — a Trash entry in the sidebar listing everything you've
   deleted, with where it came from and when. **Restore** puts an item back at its
   original path (or beside it, if something has since taken the name — it never

@@ -23,7 +23,16 @@ fn main() -> gtk::glib::ExitCode {
     // Optional: a folder to open at launch, e.g. `filescope ~/Downloads`.
     let initial = std::env::args().nth(1);
 
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    // filescope is single-instance: launching it again raises the running window.
+    // Screenshot mode must be its own process, or it would hijack that instance
+    // (and capture nothing) instead of rendering its own window.
+    let flags = if std::env::var_os("FILESCOPE_SHOT").is_some() {
+        gtk::gio::ApplicationFlags::NON_UNIQUE
+    } else {
+        gtk::gio::ApplicationFlags::empty()
+    };
+
+    let app = adw::Application::builder().application_id(APP_ID).flags(flags).build();
     app.connect_activate(move |app| window::build(app, initial.clone()));
     app.run_with_args::<&str>(&[])
 }

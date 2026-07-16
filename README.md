@@ -83,7 +83,7 @@ Built with **Rust + GTK4 + libadwaita**.
 | `Enter` / double-click | Open |
 | `Space` | Preview (Quick Look) |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / Cut / Paste |
-| `F2` | Rename |
+| `F2` | Rename (in place, on the item) |
 | `Delete` / `Shift+Delete` | Trash / Delete permanently |
 | `Ctrl+Shift+N` | New folder |
 | `Ctrl+T` / `Ctrl+W` | New tab / Close tab |
