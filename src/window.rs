@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use crate::{bookmarks, fileops, format, ops, preview, settings, trash, undo};
+use crate::{archive, bookmarks, fileops, format, ops, preview, settings, trash, undo};
 
 const CSS: &str = "
 .fs-grid { padding: 8px; }
@@ -1282,6 +1282,8 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     action!("undo", undo);
     action!("redo", redo);
     action!("open-terminal", open_terminal);
+    action!("extract", extract_selected);
+    action!("compress", compress_selected);
     action!("bookmark", bookmark_current);
     action!("zoom-in", |s: &Rc<App>| zoom(s, ZOOM_STEP));
     action!("zoom-out", |s: &Rc<App>| zoom(s, -ZOOM_STEP));
@@ -1583,6 +1585,184 @@ fn set_action_state(app: &Rc<App>, name: &str, value: &glib::Variant) {
     {
         action.set_state(value);
     }
+}
+
+/// Run an external tool in the background with a progress row (pulsing, since
+/// these tools don't report progress) and a Cancel button. `done` runs on the
+/// main loop with whether it succeeded.
+fn run_tool(
+    app: &Rc<App>,
+    title: &str,
+    argv: Vec<std::ffi::OsString>,
+    cwd: &Path,
+    done: impl Fn(&Rc<App>, bool) + 'static,
+) {
+    let label = gtk::Label::builder()
+        .xalign(0.0)
+        .label(title)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .build();
+    label.add_css_class("caption");
+    let bar = gtk::ProgressBar::builder().hexpand(true).valign(gtk::Align::Center).build();
+    let stop = gtk::Button::from_icon_name("process-stop-symbolic");
+    stop.add_css_class("flat");
+    stop.set_tooltip_text(Some("Cancel"));
+    let bar_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    bar_row.append(&bar);
+    bar_row.append(&stop);
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    row.append(&label);
+    row.append(&bar_row);
+    app.progress_box.append(&row);
+    app.progress_revealer.set_reveal_child(true);
+
+    // These tools give no progress, so show activity rather than a fake number.
+    let running = Rc::new(Cell::new(true));
+    {
+        let bar = bar.clone();
+        let running = running.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            if !running.get() {
+                return glib::ControlFlow::Break;
+            }
+            bar.pulse();
+            glib::ControlFlow::Continue
+        });
+    }
+
+    let refs: Vec<&std::ffi::OsStr> = argv.iter().map(|s| s.as_os_str()).collect();
+    let launcher = gio::SubprocessLauncher::new(gio::SubprocessFlags::NONE);
+    launcher.set_cwd(cwd);
+    let process = match launcher.spawn(&refs) {
+        Ok(process) => process,
+        Err(err) => {
+            running.set(false);
+            app.progress_box.remove(&row);
+            toast(app, &format!("Couldn't start: {err}"));
+            return;
+        }
+    };
+    {
+        let process = process.clone();
+        stop.connect_clicked(move |_| process.force_exit());
+    }
+
+    let app = app.clone();
+    process.wait_check_async(gio::Cancellable::NONE, move |res| {
+        running.set(false);
+        app.progress_box.remove(&row);
+        if app.progress_box.first_child().is_none() {
+            app.progress_revealer.set_reveal_child(false);
+        }
+        for tab in app.tabs.borrow().iter() {
+            refresh(tab);
+        }
+        done(&app, res.is_ok());
+    });
+}
+
+/// Extract each selected archive into a new folder named after it.
+fn extract_selected(app: &Rc<App>) {
+    let tab = active_tab(app);
+    let Some(dir) = tab.dir_list.file().and_then(|f| f.path()) else { return };
+    for (file, info) in selected(&tab) {
+        let name = info.display_name().to_string();
+        let Some(format) = archive::Format::from_name(&name) else { continue };
+        let Some(path) = file.path() else { continue };
+        if !has_binary(format.tool()) {
+            toast(app, &format!("Extracting this needs “{}” — install it first.", format.tool()));
+            continue;
+        }
+        // Extract into its own folder, so an archive never litters the folder.
+        let dest = fileops::unique_destination(&dir, &archive::base_name(&name));
+        if let Err(err) = std::fs::create_dir(&dest) {
+            toast(app, &format!("Couldn't create a folder to extract into: {err}"));
+            continue;
+        }
+        let into = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        run_tool(
+            app,
+            &format!("Extracting {name}…"),
+            format.extract_argv(&path, &dest),
+            &dir,
+            move |app, ok| {
+                if ok {
+                    toast(app, &format!("Extracted to “{into}”"));
+                } else {
+                    // Nothing usable came out; don't leave an empty folder behind.
+                    toast(app, "Couldn't extract the archive");
+                }
+            },
+        );
+    }
+}
+
+/// Ask for a name and format, then compress the selection into the current folder.
+fn compress_selected(app: &Rc<App>) {
+    let tab = active_tab(app);
+    let Some(dir) = tab.dir_list.file().and_then(|f| f.path()) else { return };
+    let items: Vec<String> =
+        selected(&tab).iter().map(|(_, i)| i.name().to_string_lossy().into_owned()).collect();
+    if items.is_empty() {
+        return;
+    }
+
+    let entry = gtk::Entry::builder()
+        .text(archive::default_archive_name(&items))
+        .activates_default(true)
+        .build();
+    let formats = gtk::DropDown::from_strings(&[".zip", ".tar.gz", ".tar.xz"]);
+    let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    box_.append(&entry);
+    box_.append(&formats);
+
+    let dialog = adw::AlertDialog::new(
+        Some("Compress"),
+        Some(&format!("Create an archive of {} item{}.", items.len(), plural(items.len()))),
+    );
+    dialog.set_extra_child(Some(&box_));
+    dialog.add_responses(&[("cancel", "Cancel"), ("create", "Create")]);
+    dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("create"));
+    dialog.set_close_response("cancel");
+
+    let app = app.clone();
+    dialog.choose(&app.window.clone(), gio::Cancellable::NONE, move |resp| {
+        if resp != "create" {
+            return;
+        }
+        let format = match formats.selected() {
+            1 => archive::Compress::TarGz,
+            2 => archive::Compress::TarXz,
+            _ => archive::Compress::Zip,
+        };
+        let stem = entry.text().to_string();
+        if stem.is_empty() || stem.contains('/') {
+            toast(&app, "Invalid name");
+            return;
+        }
+        if !has_binary(format.tool()) {
+            toast(&app, &format!("This needs “{}” — install it first.", format.tool()));
+            return;
+        }
+        let output = fileops::unique_destination(&dir, &format!("{stem}{}", format.extension()));
+        let name = output.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // Pack relative to the folder, so the archive holds plain names.
+        let relative = PathBuf::from(&name);
+        run_tool(
+            &app,
+            &format!("Compressing to {name}…"),
+            format.argv(&relative, &items),
+            &dir,
+            move |app, ok| {
+                if ok {
+                    toast(app, &format!("Created “{name}”"));
+                } else {
+                    toast(app, "Couldn't create the archive");
+                }
+            },
+        );
+    });
 }
 
 /// Record a new reversible action. Doing something new invalidates the redo side.
@@ -2189,10 +2369,16 @@ fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
         let formats = app.window.clipboard().formats();
         formats.contain_mime_type(GNOME_COPIED) || formats.contain_mime_type(URI_LIST)
     };
+    // "Extract Here" only makes sense when everything selected is an archive.
+    let sel = selected(tab);
+    let all_archives = has_sel
+        && sel.iter().all(|(_, i)| archive::Format::from_name(&i.display_name()).is_some());
+
     for (name, enabled) in [
         ("open", has_sel), ("open-with", one), ("preview", one), ("cut", has_sel),
         ("copy", has_sel), ("paste", has_clip), ("rename", one), ("trash", has_sel),
         ("delete", has_sel), ("properties", one),
+        ("extract", all_archives), ("compress", has_sel),
         ("undo", !app.undo_stack.borrow().is_empty()),
         ("redo", !app.redo_stack.borrow().is_empty()),
     ] {
@@ -2382,6 +2568,10 @@ fn context_menu() -> gio::Menu {
     undo_section.append(Some("Undo"), Some("win.undo"));
     undo_section.append(Some("Redo"), Some("win.redo"));
     menu.append_section(None, &undo_section);
+    let archive_section = gio::Menu::new();
+    archive_section.append(Some("Extract Here"), Some("win.extract"));
+    archive_section.append(Some("Compress…"), Some("win.compress"));
+    menu.append_section(None, &archive_section);
     let c = gio::Menu::new();
     c.append(Some("Rename…"), Some("win.rename"));
     c.append(Some("Move to Trash"), Some("win.trash"));

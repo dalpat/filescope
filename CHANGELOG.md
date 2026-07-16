@@ -12,6 +12,12 @@
   the accelerator table.
 
 ### Added
+- **Archives** — right-click → **Extract Here** unpacks `.zip`, `.tar`(`.gz`/
+  `.bz2`/`.xz`/`.zst`), `.tgz`, `.7z` and `.rar` into a new folder named after the
+  archive (never littering the current one), and **Compress…** packs the
+  selection into a `.zip`, `.tar.gz` or `.tar.xz`. Both run in the background with
+  a progress row and Cancel, and say so plainly if the needed tool
+  (`unzip`/`7z`/`unrar`…) isn't installed.
 - **Inline rename** — `F2` now edits the name on the item itself (in both grid
   and list) instead of opening a dialog. The stem is pre-selected so typing
   replaces the name but keeps the extension; folders and dotfiles select the

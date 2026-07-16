@@ -5,6 +5,7 @@
 // realizes only the rows on screen. Icon and (via libadwaita) light/dark +
 // accent theming follow the user's GNOME settings automatically.
 
+mod archive;
 mod bookmarks;
 mod fileops;
 mod format;

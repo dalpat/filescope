@@ -64,6 +64,9 @@ Built with **Rust + GTK4 + libadwaita**.
   new folder, or an accidental trash (restored from the Trash). Permanent deletes
   aren’t undoable, and neither is a conflict you chose to *Replace* — those are
   the only things filescope won’t promise to bring back.
+- **Archives** — **Extract Here** for `.zip`, `.tar.*`, `.tgz`, `.7z`, `.rar`
+  (into a folder named after the archive), and **Compress…** the selection to
+  `.zip` / `.tar.gz` / `.tar.xz`. Runs in the background with a Cancel button.
 - **Drag & drop** — drag a selection onto a **folder to drop it inside** (the
   folder highlights as you hover), onto empty space for the current folder, or
   into another tab or app. Like Nautilus, it **moves within the same filesystem
