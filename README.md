@@ -55,6 +55,10 @@ Built with **Rust + GTK4 + libadwaita**.
   live **progress bar** and **Cancel**, so the window never freezes on a big
   transfer. Name clashes raise a **conflict dialog** (Replace / Skip / Keep Both,
   with “apply to all”).
+- **Undo / redo** (`Ctrl+Z` / `Ctrl+Shift+Z`) — take back a move, copy, rename,
+  new folder, or an accidental trash (restored from the Trash). Permanent deletes
+  aren’t undoable, and neither is a conflict you chose to *Replace* — those are
+  the only things filescope won’t promise to bring back.
 - **Drag & drop** — drag a selection onto a **folder to drop it inside** (the
   folder highlights as you hover), onto empty space for the current folder, or
   into another tab or app. Like Nautilus, it **moves within the same filesystem
@@ -78,6 +82,7 @@ Built with **Rust + GTK4 + libadwaita**.
 | `Delete` / `Shift+Delete` | Trash / Delete permanently |
 | `Ctrl+Shift+N` | New folder |
 | `Ctrl+T` / `Ctrl+W` | New tab / Close tab |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / Redo |
 | `Ctrl+A` | Select all |
 | `Ctrl+H` | Show hidden files |
 | `Ctrl+D` | Bookmark this folder |

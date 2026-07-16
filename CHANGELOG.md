@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Undo / redo** (`Ctrl+Z` / `Ctrl+Shift+Z`, also in the right-click menu) for
+  moves, copies, renames, new folders, and trashing (restored out of the Trash).
+  The background engine reports the exact paths it acted on, so undo puts things
+  back where they came from rather than guessing. Permanent deletes and entries
+  you chose to *Replace* are deliberately not recorded — they can't be restored.
+
 ## [0.2.0] - 2026-07-14
 
 Big update focused on making file operations robust and drag-and-drop feel

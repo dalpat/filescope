@@ -10,6 +10,7 @@ mod fileops;
 mod format;
 mod ops;
 mod preview;
+mod undo;
 mod window;
 
 use adw::prelude::*;

@@ -30,8 +30,12 @@ pub enum Event {
     /// `name` already exists at the destination — the worker now blocks until
     /// the UI sends back a [`Decision`].
     Conflict { name: String },
-    /// The job has ended (possibly cancelled or with some failures).
-    Finished { ok: u64, failed: u64 },
+    /// The job has ended (possibly cancelled or with some failures). `pairs`
+    /// lists what actually happened as (source, destination) — after conflict
+    /// resolution, so the destination is the real final path — which is what
+    /// lets the UI record a precise undo. Empty for deletes (not undoable) and
+    /// for entries that were skipped or replaced.
+    Finished { ok: u64, failed: u64, pairs: Vec<(PathBuf, PathBuf)> },
 }
 
 /// The UI's answer to a [`Event::Conflict`].
@@ -91,6 +95,8 @@ pub fn run(
 
     let mut prog = Prog { tx: &tx, cancel: &cancel, bytes_done: 0, items_done: 0, current: String::new() };
     let (mut ok, mut failed) = (0u64, 0u64);
+    // What actually happened, for the UI's undo stack.
+    let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
     // Sticky "apply to all" choice.
     let mut sticky: Option<Decision> = None;
 
@@ -111,6 +117,9 @@ pub fn run(
         // Copy / Move: resolve any destination-name conflict.
         let name = prog.current.clone();
         let mut target = dest.join(&name);
+        // A replace destroys whatever was there, so it can't be undone cleanly —
+        // such entries are left out of `pairs`.
+        let mut replaced = false;
         if target.exists() {
             let decision = match &sticky {
                 Some(Decision::ReplaceAll) => Decision::Replace,
@@ -142,10 +151,12 @@ pub fn run(
                 }
                 Decision::Rename => target = fileops::unique_destination(&dest, &name),
                 Decision::Replace => {
+                    replaced = true;
                     let _ = fileops::remove(&target);
                 }
                 Decision::ReplaceAll => {
                     sticky = Some(Decision::ReplaceAll);
+                    replaced = true;
                     let _ = fileops::remove(&target);
                 }
             }
@@ -157,12 +168,17 @@ pub fn run(
             Kind::Delete => unreachable!(),
         };
         match result {
-            Ok(()) => ok += 1,
+            Ok(()) => {
+                ok += 1;
+                if !replaced {
+                    pairs.push((src, target));
+                }
+            }
             Err(_) => failed += 1,
         }
     }
 
-    let _ = tx.send_blocking(Event::Finished { ok, failed });
+    let _ = tx.send_blocking(Event::Finished { ok, failed, pairs });
 }
 
 /// Move one entry: try a rename (instant, same filesystem), else copy + delete.
@@ -291,19 +307,22 @@ mod tests {
 
         let (tx, rx) = async_channel::unbounded();
         let (_dec_tx, dec_rx) = mpsc::channel();
-        run(Kind::Copy, vec![src], dest.clone(), Arc::new(AtomicBool::new(false)), tx, dec_rx);
+        run(Kind::Copy, vec![src.clone()], dest.clone(), Arc::new(AtomicBool::new(false)), tx, dec_rx);
 
         let (mut total, mut finished) = (None, None);
         while let Ok(event) = rx.try_recv() {
             match event {
                 Event::Total { bytes, items } => total = Some((bytes, items)),
-                Event::Finished { ok, failed } => finished = Some((ok, failed)),
+                Event::Finished { ok, failed, pairs } => finished = Some((ok, failed, pairs)),
                 _ => {}
             }
         }
         // src dir + a.txt + sub dir + b.txt = 4 items, 12 bytes total.
         assert_eq!(total, Some((12, 4)));
-        assert_eq!(finished, Some((1, 0)));
+        let (ok, failed, pairs) = finished.expect("the job reports Finished");
+        assert_eq!((ok, failed), (1, 0));
+        // It reports what it actually created, which is what undo replays.
+        assert_eq!(pairs, vec![(src, dest.join("src"))]);
 
         let copied = dest.join("src");
         assert!(copied.join("a.txt").exists());

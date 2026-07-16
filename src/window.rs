@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use crate::{bookmarks, fileops, format, ops, preview};
+use crate::{bookmarks, fileops, format, ops, preview, undo};
 
 const CSS: &str = "
 .fs-grid { padding: 8px; }
@@ -85,6 +85,9 @@ struct App {
     /// Bottom area that reveals a row per in-flight background operation.
     progress_box: gtk::Box,
     progress_revealer: gtk::Revealer,
+    /// Reversible history. Doing something new clears the redo side.
+    undo_stack: RefCell<Vec<undo::Action>>,
+    redo_stack: RefCell<Vec<undo::Action>>,
 }
 
 pub fn build(app: &adw::Application, initial: Option<String>) {
@@ -198,6 +201,8 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
         sort_desc: Cell::new(false),
         progress_box,
         progress_revealer,
+        undo_stack: RefCell::new(Vec::new()),
+        redo_stack: RefCell::new(Vec::new()),
     });
 
     install_actions(app, &state);
@@ -1069,6 +1074,8 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
         }
     });
     action!("properties", show_properties);
+    action!("undo", undo);
+    action!("redo", redo);
     action!("open-terminal", open_terminal);
     action!("bookmark", bookmark_current);
     action!("zoom-in", |s: &Rc<App>| zoom(s, ZOOM_STEP));
@@ -1141,6 +1148,8 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
         ("find", &["<ctrl>f"]),
         ("toggle-hidden", &["<ctrl>h"]),
         ("bookmark", &["<ctrl>d"]),
+        ("undo", &["<ctrl>z"]),
+        ("redo", &["<ctrl><shift>z", "<ctrl>y"]),
         ("open-terminal", &["<ctrl>period"]),
         ("zoom-in", &["<ctrl>plus", "<ctrl>equal"]),
         ("zoom-out", &["<ctrl>minus"]),
@@ -1388,10 +1397,96 @@ fn parse_clipboard(mime: &str, text: &str) -> (bool, Vec<String>) {
     }
 }
 
+/// Record a new reversible action. Doing something new invalidates the redo side.
+fn push_undo(app: &Rc<App>, action: undo::Action) {
+    app.undo_stack.borrow_mut().push(action);
+    app.redo_stack.borrow_mut().clear();
+    update_chrome(app);
+}
+
+/// Reverse the most recent action.
+fn undo(app: &Rc<App>) {
+    let Some(action) = app.undo_stack.borrow_mut().pop() else {
+        toast(app, "Nothing to undo");
+        return;
+    };
+    let what = action.describe();
+    let ok = match &action {
+        // Put each entry back where it came from (newest first).
+        undo::Action::Move { pairs } => {
+            pairs.iter().rev().all(|(from, to)| undo::move_exact(to, from).is_ok())
+        }
+        // The copies are removed; the sources were never touched.
+        undo::Action::Copy { pairs } => {
+            let created: Vec<PathBuf> = pairs.iter().map(|(_, dst)| dst.clone()).collect();
+            start_job(app, ops::Kind::Delete, created, PathBuf::new(), false);
+            true
+        }
+        undo::Action::Rename { from, to } => undo::move_exact(to, from).is_ok(),
+        undo::Action::NewFolder { path } => std::fs::remove_dir(path).is_ok(),
+        undo::Action::Trash { originals } => {
+            originals.iter().all(|p| undo::restore_from_trash(p))
+        }
+    };
+    app.redo_stack.borrow_mut().push(action);
+    refresh_all(app);
+    if ok {
+        toast(app, &format!("Undid {what}"));
+    } else {
+        toast(app, &format!("Couldn't fully undo the {what}"));
+    }
+}
+
+/// Re-apply the most recently undone action.
+fn redo(app: &Rc<App>) {
+    let Some(action) = app.redo_stack.borrow_mut().pop() else {
+        toast(app, "Nothing to redo");
+        return;
+    };
+    let what = action.describe();
+    let ok = match &action {
+        undo::Action::Move { pairs } => {
+            pairs.iter().all(|(from, to)| undo::move_exact(from, to).is_ok())
+        }
+        // Re-copy each source back into the folder it was copied to.
+        undo::Action::Copy { pairs } => {
+            for (src, dst) in pairs {
+                if let Some(dir) = dst.parent() {
+                    start_job(app, ops::Kind::Copy, vec![src.clone()], dir.to_path_buf(), false);
+                }
+            }
+            true
+        }
+        undo::Action::Rename { from, to } => undo::move_exact(from, to).is_ok(),
+        undo::Action::NewFolder { path } => std::fs::create_dir(path).is_ok(),
+        undo::Action::Trash { originals } => originals
+            .iter()
+            .all(|p| gio::File::for_path(p).trash(gio::Cancellable::NONE).is_ok()),
+    };
+    app.undo_stack.borrow_mut().push(action);
+    refresh_all(app);
+    if ok {
+        toast(app, &format!("Redid {what}"));
+    } else {
+        toast(app, &format!("Couldn't fully redo the {what}"));
+    }
+}
+
+/// Reload every tab and refresh the chrome (after an undo/redo touches the disk).
+fn refresh_all(app: &Rc<App>) {
+    for tab in app.tabs.borrow().iter() {
+        refresh(tab);
+    }
+    update_chrome(app);
+}
+
 /// Launch a background copy/move/delete job: spawn the worker thread, show a
 /// progress row, and pump its events on the main loop (updating the bar, popping
 /// conflict dialogs, refreshing when done).
-fn start_job(app: &Rc<App>, kind: ops::Kind, sources: Vec<PathBuf>, dest: PathBuf) {
+///
+/// `record` pushes the result onto the undo stack; undo/redo pass `false` so
+/// their own jobs don't re-enter the history.
+fn start_job(app: &Rc<App>, kind: ops::Kind, sources: Vec<PathBuf>, dest: PathBuf, record: bool) {
     if sources.is_empty() {
         return;
     }
@@ -1486,10 +1581,21 @@ fn start_job(app: &Rc<App>, kind: ops::Kind, sources: Vec<PathBuf>, dest: PathBu
                         let _ = dec_tx.send(decision);
                     });
                 }
-                ops::Event::Finished { ok, failed } => {
+                ops::Event::Finished { ok, failed, pairs } => {
                     app.progress_box.remove(&row);
                     if app.progress_box.first_child().is_none() {
                         app.progress_revealer.set_reveal_child(false);
+                    }
+                    // Record what actually happened so it can be undone.
+                    if record && !pairs.is_empty() {
+                        let action = match kind {
+                            ops::Kind::Copy => Some(undo::Action::Copy { pairs }),
+                            ops::Kind::Move => Some(undo::Action::Move { pairs }),
+                            ops::Kind::Delete => None, // permanent — not undoable
+                        };
+                        if let Some(action) = action {
+                            push_undo(&app, action);
+                        }
                     }
                     for tab in app.tabs.borrow().iter() {
                         refresh(tab);
@@ -1519,7 +1625,7 @@ fn paste(app: &Rc<App>) {
         if sources.is_empty() {
             return;
         }
-        start_job(&app, if cut { ops::Kind::Move } else { ops::Kind::Copy }, sources, dir.clone());
+        start_job(&app, if cut { ops::Kind::Move } else { ops::Kind::Copy }, sources, dir.clone(), true);
         // A cut is consumed once pasted (matching Nautilus).
         if cut {
             let _ = app.window.clipboard().set_content(gdk::ContentProvider::NONE);
@@ -1534,8 +1640,19 @@ fn trash_selected(app: &Rc<App>) {
         return;
     }
     let (mut ok, mut failed) = (0u32, 0u32);
+    let mut trashed: Vec<PathBuf> = Vec::new();
     for (file, _) in &items {
-        if file.trash(gio::Cancellable::NONE).is_ok() { ok += 1 } else { failed += 1 }
+        if file.trash(gio::Cancellable::NONE).is_ok() {
+            ok += 1;
+            if let Some(path) = file.path() {
+                trashed.push(path);
+            }
+        } else {
+            failed += 1
+        }
+    }
+    if !trashed.is_empty() {
+        push_undo(app, undo::Action::Trash { originals: trashed });
     }
     refresh(&tab);
     toast(app, &format!("Moved {ok} item{} to Trash{}", plural(ok as usize),
@@ -1564,7 +1681,7 @@ fn delete_selected(app: &Rc<App>) {
         }
         let sources: Vec<PathBuf> =
             selected(&active_tab(&app)).into_iter().filter_map(|(f, _)| f.path()).collect();
-        start_job(&app, ops::Kind::Delete, sources, PathBuf::new());
+        start_job(&app, ops::Kind::Delete, sources, PathBuf::new(), false);
     });
 }
 
@@ -1593,8 +1710,15 @@ fn rename_selected(app: &Rc<App>) {
             toast(&app, "Invalid name");
             return;
         }
-        match file.path().ok_or(()).and_then(|p| fileops::rename(&p, &name).map_err(|_| ())) {
-            Ok(_) => refresh(&active_tab(&app)),
+        let renamed = file
+            .path()
+            .ok_or(())
+            .and_then(|from| fileops::rename(&from, &name).map(|to| (from, to)).map_err(|_| ()));
+        match renamed {
+            Ok((from, to)) => {
+                push_undo(&app, undo::Action::Rename { from, to });
+                refresh(&active_tab(&app));
+            }
             Err(()) => toast(&app, "Couldn't rename"),
         }
     });
@@ -1621,7 +1745,10 @@ fn new_folder(app: &Rc<App>) {
             return;
         }
         match fileops::make_dir(&dir, &name) {
-            Ok(_) => refresh(&active_tab(&app)),
+            Ok(path) => {
+                push_undo(&app, undo::Action::NewFolder { path });
+                refresh(&active_tab(&app));
+            }
             Err(_) => toast(&app, "Couldn't create folder"),
         }
     });
@@ -1856,6 +1983,8 @@ fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
         ("open", has_sel), ("open-with", one), ("preview", one), ("cut", has_sel),
         ("copy", has_sel), ("paste", has_clip), ("rename", one), ("trash", has_sel),
         ("delete", has_sel), ("properties", one),
+        ("undo", !app.undo_stack.borrow().is_empty()),
+        ("redo", !app.redo_stack.borrow().is_empty()),
     ] {
         if let Some(act) = app.window.lookup_action(name) {
             act.downcast::<gio::SimpleAction>().unwrap().set_enabled(enabled);
@@ -2037,6 +2166,10 @@ fn context_menu() -> gio::Menu {
     b.append(Some("Copy"), Some("win.copy"));
     b.append(Some("Paste"), Some("win.paste"));
     menu.append_section(None, &b);
+    let undo_section = gio::Menu::new();
+    undo_section.append(Some("Undo"), Some("win.undo"));
+    undo_section.append(Some("Redo"), Some("win.redo"));
+    menu.append_section(None, &undo_section);
     let c = gio::Menu::new();
     c.append(Some("Rename…"), Some("win.rename"));
     c.append(Some("Move to Trash"), Some("win.trash"));
@@ -2193,7 +2326,7 @@ fn attach_drop_target(app: &Rc<App>, tab: &Rc<Tab>, view: &impl IsA<gtk::Widget>
             }
             let offered = target.current_drop().map(|d| d.actions()).unwrap_or(gdk::DragAction::COPY);
             let kind = drop_kind(offered, &sources, &dest);
-            start_job(&app, kind, sources, dest);
+            start_job(&app, kind, sources, dest, true);
             true
         });
     }
