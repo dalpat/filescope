@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Space and Backspace couldn't be typed while renaming** (and would have hit
+  search and the path bar too). Space previewed and Backspace navigated up
+  instead of reaching the text field: they were window accelerators, which GTK
+  dispatches *before* the focused widget. Space / Backspace / Delete / Enter are
+  no longer global — they act on the file view only when it has focus, so entries
+  get them first. A test now rejects any bare (unmodified, non-function) key in
+  the accelerator table.
+
 ### Added
 - **Inline rename** — `F2` now edits the name on the item itself (in both grid
   and list) instead of opening a dialog. The stem is pre-selected so typing

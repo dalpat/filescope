@@ -587,6 +587,11 @@ fn new_tab(app: &Rc<App>, dir: gio::File, select: bool) {
     attach_drop_target(app, &tab, &grid_view);
     attach_drop_target(app, &tab, &column_view);
 
+    // Space / Backspace / Delete act on the view, not globally — see
+    // `attach_view_keys` for why they can't be accelerators.
+    attach_view_keys(app, &grid_view);
+    attach_view_keys(app, &column_view);
+
     set_dir(app, &tab, &dir);
     if select {
         app.tab_view.set_selected_page(&page);
@@ -1205,6 +1210,37 @@ fn list_icon(grid_size: i32) -> i32 {
     (grid_size / 4).clamp(16, 40)
 }
 
+/// Keyboard accelerators, as (action, keys).
+///
+/// These are window-wide: GTK dispatches them **before** the focused widget, so a
+/// bare (unmodified) key here would be stolen from every text entry — you could
+/// not type it while renaming, searching, or editing the path. Only function keys
+/// are safe bare; Space / Backspace / Delete / Enter act on the view instead
+/// (see `attach_view_keys`). `no_accelerator_steals_a_typing_key` enforces this.
+const ACCELS: &[(&str, &[&str])] = &[
+    ("back", &["<alt>Left"]),
+    ("forward", &["<alt>Right"]),
+    ("up", &["<alt>Up"]),
+    ("home", &["<alt>Home"]),
+    ("copy", &["<ctrl>c"]),
+    ("cut", &["<ctrl>x"]),
+    ("paste", &["<ctrl>v"]),
+    ("rename", &["F2"]),
+    ("new-folder", &["<ctrl><shift>n"]),
+    ("new-tab", &["<ctrl>t"]),
+    ("close-tab", &["<ctrl>w"]),
+    ("select-all", &["<ctrl>a"]),
+    ("refresh", &["<ctrl>r", "F5"]),
+    ("find", &["<ctrl>f"]),
+    ("toggle-hidden", &["<ctrl>h"]),
+    ("bookmark", &["<ctrl>d"]),
+    ("undo", &["<ctrl>z"]),
+    ("redo", &["<ctrl><shift>z", "<ctrl>y"]),
+    ("open-terminal", &["<ctrl>period"]),
+    ("zoom-in", &["<ctrl>plus", "<ctrl>equal"]),
+    ("zoom-out", &["<ctrl>minus"]),
+];
+
 // --- Actions ----------------------------------------------------------------
 
 fn install_actions(app: &adw::Application, state: &Rc<App>) {
@@ -1296,33 +1332,7 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     }
     state.window.add_action(&sort_desc);
 
-    for (name, accels) in [
-        ("back", &["<alt>Left"][..]),
-        ("forward", &["<alt>Right"]),
-        ("up", &["<alt>Up", "BackSpace"]),
-        ("home", &["<alt>Home"]),
-        ("open", &["Return"]),
-        ("preview", &["space"]),
-        ("copy", &["<ctrl>c"]),
-        ("cut", &["<ctrl>x"]),
-        ("paste", &["<ctrl>v"]),
-        ("rename", &["F2"]),
-        ("trash", &["Delete"]),
-        ("delete", &["<shift>Delete"]),
-        ("new-folder", &["<ctrl><shift>n"]),
-        ("new-tab", &["<ctrl>t"]),
-        ("close-tab", &["<ctrl>w"]),
-        ("select-all", &["<ctrl>a"]),
-        ("refresh", &["<ctrl>r", "F5"]),
-        ("find", &["<ctrl>f"]),
-        ("toggle-hidden", &["<ctrl>h"]),
-        ("bookmark", &["<ctrl>d"]),
-        ("undo", &["<ctrl>z"]),
-        ("redo", &["<ctrl><shift>z", "<ctrl>y"]),
-        ("open-terminal", &["<ctrl>period"]),
-        ("zoom-in", &["<ctrl>plus", "<ctrl>equal"]),
-        ("zoom-out", &["<ctrl>minus"]),
-    ] {
+    for (name, accels) in ACCELS {
         app.set_accels_for_action(&format!("win.{name}"), accels);
     }
 }
@@ -2460,6 +2470,39 @@ fn attach_context_menu(app: &Rc<App>, widget: &impl IsA<gtk::Widget>) {
 
 // --- Drag & drop ------------------------------------------------------------
 
+/// Keys that act on the file view: Space previews, Backspace goes up, Delete
+/// trashes (Shift+Delete deletes).
+///
+/// These are deliberately **not** window accelerators. GTK dispatches accelerators
+/// before the focused widget, so binding bare keys globally would steal them from
+/// any text entry — you couldn't type a space or backspace while renaming or
+/// searching. A controller on the view runs in the bubble phase instead, so a
+/// focused entry consumes the key first and these only fire when the view itself
+/// has focus.
+fn attach_view_keys(app: &Rc<App>, view: &impl IsA<gtk::Widget>) {
+    let key = gtk::EventControllerKey::new();
+    let app = app.clone();
+    key.connect_key_pressed(move |_, keyval, _, state| {
+        match keyval {
+            gtk::gdk::Key::space => toggle_preview(&app),
+            gtk::gdk::Key::BackSpace => {
+                let tab = active_tab(&app);
+                go_up(&app, &tab);
+            }
+            gtk::gdk::Key::Delete | gtk::gdk::Key::KP_Delete => {
+                if state.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                    delete_selected(&app);
+                } else {
+                    trash_selected(&app);
+                }
+            }
+            _ => return glib::Propagation::Proceed,
+        }
+        glib::Propagation::Stop
+    });
+    view.add_controller(key);
+}
+
 /// Make a view draggable: dragging exports the current selection as a URI list,
 /// so it can be dropped into another tab, another folder, or another app. Both
 /// copy and move are offered (Ctrl forces copy, Shift forces move).
@@ -3052,7 +3095,26 @@ fn rename_selection_region(name: &str, is_dir: bool) -> (i32, i32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{GNOME_COPIED, URI_LIST, parse_clipboard, rename_selection_region};
+    use super::{ACCELS, GNOME_COPIED, URI_LIST, parse_clipboard, rename_selection_region};
+
+    #[test]
+    fn no_accelerator_steals_a_typing_key() {
+        // Window accelerators are dispatched before the focused widget, so a bare
+        // key bound here becomes untypable in the rename/search/path entries.
+        // (This caught Space and Backspace being stolen while renaming.)
+        for (action, accels) in ACCELS {
+            for accel in *accels {
+                let has_modifier = accel.contains('<');
+                let function_key = accel.len() >= 2
+                    && accel.starts_with('F')
+                    && accel[1..].chars().all(|c| c.is_ascii_digit());
+                assert!(
+                    has_modifier || function_key,
+                    "win.{action} binds bare `{accel}`: it would be stolen from text entries"
+                );
+            }
+        }
+    }
 
     #[test]
     fn inline_rename_preselects_the_stem_not_the_extension() {
