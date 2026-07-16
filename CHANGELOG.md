@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.0] - 2026-07-16
+
+Trust and polish: nothing you do is a one-way door any more — undo it, or fish it
+back out of the Trash — plus archives, in-place renaming, and a filescope that
+remembers how you left it.
 
 ### Fixed
 - **Space and Backspace couldn't be typed while renaming** (and would have hit
