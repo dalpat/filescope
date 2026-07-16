@@ -10,6 +10,8 @@ mod fileops;
 mod format;
 mod ops;
 mod preview;
+mod settings;
+mod trash;
 mod undo;
 mod window;
 

@@ -3,6 +3,15 @@
 ## [Unreleased]
 
 ### Added
+- **Trash view** — a Trash entry in the sidebar listing everything you've
+  deleted, with where it came from and when. **Restore** puts an item back at its
+  original path (or beside it, if something has since taken the name — it never
+  clobbers), and **Empty Trash** clears it for good. Implemented against the
+  freedesktop trash spec, including percent-decoded original paths.
+- **Preferences persist** — view mode, zoom, sort column/direction, show-hidden,
+  and the window size/maximised state are saved to
+  `~/.config/filescope/settings` and restored on launch. Unknown or malformed
+  entries fall back to defaults rather than losing the file.
 - **Undo / redo** (`Ctrl+Z` / `Ctrl+Shift+Z`, also in the right-click menu) for
   moves, copies, renames, new folders, and trashing (restored out of the Trash).
   The background engine reports the exact paths it acted on, so undo puts things

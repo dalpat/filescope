@@ -34,8 +34,13 @@ Built with **Rust + GTK4 + libadwaita**.
 ## What it does
 
 - **Places + bookmarks + devices sidebar** — Home and your XDG folders, a
-  **This PC** overview, your **bookmarks** (Nautilus-style, Ctrl+D to add), and a
-  live **Devices** list of every drive/partition.
+  **This PC** overview, a **Trash** view, your **bookmarks** (Nautilus-style,
+  Ctrl+D to add), and a live **Devices** list of every drive/partition.
+- **Trash** — browse what you've deleted with where it came from and when,
+  **Restore** any item back to its original place (never clobbering something
+  that took the name back), or **Empty Trash**.
+- **Remembers your setup** — view mode, zoom, sort, show-hidden, and window size
+  are restored next launch.
 - **Tabs** — each tab is an independent folder with its own history and
   breadcrumb (Ctrl+T new, Ctrl+W close).
 - **Grid & list views** with **zoom in/out** (Ctrl +/−) — large icons and real

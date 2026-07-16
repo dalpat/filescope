@@ -74,9 +74,22 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Restore a trashed item back to `original`, by finding the entry in `trash:///`
-/// whose recorded origin matches. Returns whether it was restored.
+/// Restore a trashed item back to `original`. Returns whether it was restored.
+///
+/// The home trash goes through the (tested) [`crate::trash`] module; anything
+/// trashed to another volume's `.Trash-<uid>` falls back to a `trash:///` scan,
+/// which GIO aggregates across every mount.
 pub fn restore_from_trash(original: &Path) -> bool {
+    let root = crate::trash::home_trash();
+    if let Some(entry) = crate::trash::entries_in(&root).into_iter().find(|e| e.original == original)
+    {
+        return crate::trash::restore_in(&root, &entry).is_ok();
+    }
+    restore_via_gio(original)
+}
+
+/// Fallback for items trashed onto another volume.
+fn restore_via_gio(original: &Path) -> bool {
     let trash = gio::File::for_uri("trash:///");
     let Ok(entries) = trash.enumerate_children(
         "standard::name,trash::orig-path",

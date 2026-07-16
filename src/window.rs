@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use crate::{bookmarks, fileops, format, ops, preview, undo};
+use crate::{bookmarks, fileops, format, ops, preview, settings, trash, undo};
 
 const CSS: &str = "
 .fs-grid { padding: 8px; }
@@ -54,6 +54,7 @@ struct Tab {
     column_view: gtk::ColumnView,
     breadcrumb: gtk::Box,
     computer_box: gtk::Box,
+    trash_box: gtk::Box,
     search_bar: gtk::SearchBar,
     search_entry: gtk::SearchEntry,
     back: RefCell<Vec<gio::File>>,
@@ -174,13 +175,19 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
         .build();
     sidebar_toggle.bind_property("active", &split, "show-sidebar").bidirectional().sync_create().build();
 
+    // Preferences from the last session (view, zoom, sort, hidden, geometry).
+    let cfg = settings::load();
+
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("filescope")
-        .default_width(1120)
-        .default_height(740)
+        .default_width(cfg.width)
+        .default_height(cfg.height)
         .content(&split)
         .build();
+    if cfg.maximized {
+        window.maximize();
+    }
 
     let state = Rc::new(App {
         window: window.clone(),
@@ -192,13 +199,13 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
         up_btn: up_btn.clone(),
         status,
         tabs: RefCell::new(Vec::new()),
-        zoom: Cell::new(80),
-        is_list: Cell::new(false),
-        show_hidden: Rc::new(Cell::new(false)),
+        zoom: Cell::new(cfg.zoom),
+        is_list: Cell::new(cfg.is_list),
+        show_hidden: Rc::new(Cell::new(cfg.show_hidden)),
         bookmarks: RefCell::new(bookmarks::load()),
         preview: RefCell::new(None),
-        sort_key: Cell::new(0),
-        sort_desc: Cell::new(false),
+        sort_key: Cell::new(cfg.sort_key),
+        sort_desc: Cell::new(cfg.sort_desc),
         progress_box,
         progress_revealer,
         undo_stack: RefCell::new(Vec::new()),
@@ -207,6 +214,35 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
 
     install_actions(app, &state);
     populate_sidebar(&state);
+
+    // Reflect the loaded preferences in the widgets/actions that display them.
+    view_toggle.set_active(cfg.is_list);
+    set_action_state(&state, "toggle-hidden", &cfg.show_hidden.to_variant());
+    set_action_state(&state, "sort-descending", &cfg.sort_desc.to_variant());
+    let sort_name = match cfg.sort_key {
+        1 => "size",
+        2 => "modified",
+        _ => "name",
+    };
+    set_action_state(&state, "sort", &sort_name.to_variant());
+
+    // Remember preferences for next launch.
+    {
+        let state = state.clone();
+        window.connect_close_request(move |window| {
+            settings::save(&settings::Settings {
+                is_list: state.is_list.get(),
+                zoom: state.zoom.get(),
+                sort_key: state.sort_key.get(),
+                sort_desc: state.sort_desc.get(),
+                show_hidden: state.show_hidden.get(),
+                width: window.default_width(),
+                height: window.default_height(),
+                maximized: window.is_maximized(),
+            });
+            glib::Propagation::Proceed
+        });
+    }
 
     // Chrome follows the active tab.
     {
@@ -269,6 +305,8 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
             let t = active_tab(&s);
             if unsafe { row.data::<bool>("computer") }.is_some() {
                 show_computer(&s, &t);
+            } else if unsafe { row.data::<bool>("trash") }.is_some() {
+                show_trash(&s, &t);
             } else if let Some(volume) = unsafe { row.data::<gio::Volume>("volume") } {
                 mount_and_open(&s, &t, unsafe { volume.as_ref() });
             } else if let Some(path) = unsafe { row.data::<PathBuf>("path") } {
@@ -336,6 +374,7 @@ fn maybe_capture(app: &adw::Application, state: &Rc<App>) {
                 tab.view_stack.set_visible_child_name("grid");
             }
             "computer" => show_computer(state, &tab),
+            "trash" => show_trash(state, &tab),
             _ => {}
         }
     }
@@ -418,6 +457,9 @@ fn new_tab(app: &Rc<App>, dir: gio::File, select: bool) {
     let computer_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     let computer_scroller = gtk::ScrolledWindow::builder().vexpand(true).child(&computer_box).build();
 
+    let trash_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    let trash_scroller = gtk::ScrolledWindow::builder().vexpand(true).child(&trash_box).build();
+
     // Shown in place of the grid/list when the folder has no visible items.
     let empty_page = adw::StatusPage::builder()
         .icon_name("folder-symbolic")
@@ -429,6 +471,7 @@ fn new_tab(app: &Rc<App>, dir: gio::File, select: bool) {
     view_stack.add_named(&grid_scroller, Some("grid"));
     view_stack.add_named(&list_scroller, Some("list"));
     view_stack.add_named(&computer_scroller, Some("computer"));
+    view_stack.add_named(&trash_scroller, Some("trash"));
     view_stack.add_named(&empty_page, Some("empty"));
 
     let breadcrumb = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
@@ -487,6 +530,7 @@ fn new_tab(app: &Rc<App>, dir: gio::File, select: bool) {
         column_view: column_view.clone(),
         breadcrumb,
         computer_box,
+        trash_box,
         search_bar: search_bar.clone(),
         search_entry: search_entry.clone(),
         back: RefCell::new(Vec::new()),
@@ -613,7 +657,10 @@ fn set_dir(app: &Rc<App>, tab: &Rc<Tab>, file: &gio::File) {
 /// per the current view mode. With `force` false this leaves a "This PC" view
 /// alone, so background updates don't yank the user out of it.
 fn refresh_view_mode(app: &Rc<App>, tab: &Rc<Tab>, force: bool) {
-    if !force && tab.view_stack.visible_child_name().as_deref() == Some("computer") {
+    // "This PC" and "Trash" are modes of their own — background updates (a
+    // listing settling, an item count changing) must not yank the user out.
+    let showing = tab.view_stack.visible_child_name();
+    if !force && matches!(showing.as_deref(), Some("computer") | Some("trash")) {
         return;
     }
     let empty = !tab.dir_list.is_loading() && tab.selection.n_items() == 0;
@@ -701,6 +748,128 @@ fn show_computer(app: &Rc<App>, tab: &Rc<Tab>) {
     }
     tab.view_stack.set_visible_child_name("computer");
     update_chrome(app);
+}
+
+// --- Trash ------------------------------------------------------------------
+
+/// Populate and show the Trash view in `tab`: every trashed item with where it
+/// came from, a per-item Restore, and Empty Trash.
+fn show_trash(app: &Rc<App>, tab: &Rc<Tab>) {
+    let box_ = &tab.trash_box;
+    while let Some(child) = box_.first_child() {
+        box_.remove(&child);
+    }
+    box_.set_margin_top(16);
+    box_.set_margin_bottom(16);
+    box_.set_margin_start(16);
+    box_.set_margin_end(16);
+    box_.set_spacing(12);
+
+    let root = trash::home_trash();
+    let entries = trash::entries_in(&root);
+
+    let heading = gtk::Label::builder().label("Trash").xalign(0.0).hexpand(true).build();
+    heading.add_css_class("title-2");
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    head.append(&heading);
+    if !entries.is_empty() {
+        let empty_btn = gtk::Button::with_label("Empty Trash");
+        empty_btn.add_css_class("destructive-action");
+        empty_btn.set_valign(gtk::Align::Center);
+        let app = app.clone();
+        let tab = tab.clone();
+        empty_btn.connect_clicked(move |_| confirm_empty_trash(&app, &tab));
+        head.append(&empty_btn);
+    }
+    box_.append(&head);
+
+    if entries.is_empty() {
+        let page = adw::StatusPage::builder()
+            .icon_name("user-trash-symbolic")
+            .title("Trash Is Empty")
+            .description("Items you delete land here, and can be put back.")
+            .vexpand(true)
+            .build();
+        box_.append(&page);
+    } else {
+        let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
+        list.add_css_class("boxed-list");
+        for entry in entries {
+            list.append(&trash_entry_row(app, tab, &root, entry));
+        }
+        box_.append(&list);
+    }
+
+    if let Some(page) = tab.page.borrow().as_ref() {
+        page.set_title("Trash");
+    }
+    tab.view_stack.set_visible_child_name("trash");
+    update_chrome(app);
+}
+
+/// One row in the Trash view: name, where it came from, and Restore.
+fn trash_entry_row(
+    app: &Rc<App>,
+    tab: &Rc<Tab>,
+    root: &Path,
+    entry: trash::Entry,
+) -> adw::ActionRow {
+    let subtitle = match &entry.deleted {
+        Some(when) => format!("{} · deleted {}", entry.original.display(), when.replace('T', " ")),
+        None => entry.original.display().to_string(),
+    };
+    let row = adw::ActionRow::builder().title(&entry.name).subtitle(&subtitle).build();
+    row.add_prefix(&gtk::Image::from_icon_name("user-trash-symbolic"));
+
+    let restore = gtk::Button::with_label("Restore");
+    restore.set_valign(gtk::Align::Center);
+    {
+        let app = app.clone();
+        let tab = tab.clone();
+        let root = root.to_path_buf();
+        restore.connect_clicked(move |_| match trash::restore_in(&root, &entry) {
+            Ok(path) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                toast(&app, &format!("Restored “{name}”"));
+                refresh_all(&app);
+                show_trash(&app, &tab);
+            }
+            Err(err) => toast(&app, &format!("Couldn't restore: {err}")),
+        });
+    }
+    row.add_suffix(&restore);
+    row
+}
+
+/// Confirm, then permanently empty the Trash.
+fn confirm_empty_trash(app: &Rc<App>, tab: &Rc<Tab>) {
+    let dialog = adw::AlertDialog::new(
+        Some("Empty the Trash?"),
+        Some("Everything in the Trash will be permanently deleted. This cannot be undone."),
+    );
+    dialog.add_responses(&[("cancel", "Cancel"), ("empty", "Empty Trash")]);
+    dialog.set_response_appearance("empty", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let app = app.clone();
+    let tab = tab.clone();
+    dialog.choose(&app.window.clone(), gio::Cancellable::NONE, move |resp| {
+        if resp != "empty" {
+            return;
+        }
+        match trash::empty_in(&trash::home_trash()) {
+            Ok(()) => toast(&app, "Trash emptied"),
+            Err(err) => toast(&app, &format!("Couldn't empty the Trash: {err}")),
+        }
+        show_trash(&app, &tab);
+    });
+}
+
+/// The sidebar's Trash entry.
+fn trash_row() -> gtk::ListBoxRow {
+    let row = place_row("user-trash-symbolic", "Trash", None, false);
+    unsafe { row.set_data("trash", true) };
+    row
 }
 
 /// A drive tile's backing data: either a mounted location we can open directly,
@@ -1397,6 +1566,15 @@ fn parse_clipboard(mime: &str, text: &str) -> (bool, Vec<String>) {
     }
 }
 
+/// Set a stateful window action's state (used to seed the UI from saved settings).
+fn set_action_state(app: &Rc<App>, name: &str, value: &glib::Variant) {
+    if let Some(action) = app.window.lookup_action(name)
+        && let Ok(action) = action.downcast::<gio::SimpleAction>()
+    {
+        action.set_state(value);
+    }
+}
+
 /// Record a new reversible action. Doing something new invalidates the redo side.
 fn push_undo(app: &Rc<App>, action: undo::Action) {
     app.undo_stack.borrow_mut().push(action);
@@ -1932,22 +2110,34 @@ fn update_chrome(app: &Rc<App>) {
     app.up_btn.set_sensitive(tab.dir_list.file().and_then(|f| f.parent()).is_some());
 
     // The window (and, via it, the header) title follows the active tab's
-    // location, so it always names the folder you're in — or "This PC".
-    let in_computer = tab.view_stack.visible_child_name().as_deref() == Some("computer");
-    let win_title = if in_computer {
-        "This PC".to_string()
-    } else {
-        tab.dir_list
+    // location, so it always names the folder you're in — or the special view.
+    let showing = tab.view_stack.visible_child_name();
+    let special = match showing.as_deref() {
+        Some("computer") => Some("This PC"),
+        Some("trash") => Some("Trash"),
+        _ => None,
+    };
+    let win_title = match special {
+        Some(name) => name.to_string(),
+        None => tab
+            .dir_list
             .file()
             .map(|f| f.basename().map(|b| b.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into()))
-            .unwrap_or_else(|| "filescope".into())
+            .unwrap_or_else(|| "filescope".into()),
     };
     app.window.set_title(Some(&win_title));
 
     let total = tab.selection.n_items();
     let sel = selected(&tab);
-    let text = if in_computer {
-        "This PC".to_string()
+    let text = if let Some(name) = special {
+        // The special views have their own contents; the tab's listing isn't it.
+        match name {
+            "Trash" => {
+                let n = trash::entries_in(&trash::home_trash()).len();
+                format!("Trash — {n} item{}", plural(n))
+            }
+            other => other.to_string(),
+        }
     } else if sel.is_empty() {
         format!("{total} item{}", plural(total as usize))
     } else if let [(_, info)] = sel.as_slice() {
@@ -2022,6 +2212,8 @@ fn populate_sidebar(app: &Rc<App>) {
 
     // This PC (special row → drives view).
     list.append(&place_row("computer-symbolic", "This PC", None, true));
+    // Trash — browse what you've deleted, restore it, or empty it.
+    list.append(&trash_row());
 
     // Devices: the filesystem root and each drive/partition, mounted or not.
     // Mounted ones open on click and carry an eject button; unmounted ones mount
