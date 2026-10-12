@@ -48,7 +48,7 @@ jobs:
           cp target/release/filescope                     "${stage}/"
           cp data/dev.filescope.Filescope.desktop         "${stage}/"
           cp data/icons/dev.filescope.Filescope.svg       "${stage}/"
-          cp packaging/install.sh                         "${stage}/install.sh"
+          cp packaging/install-release.sh                "${stage}/install.sh"
           cp LICENSE README.md                            "${stage}/"
           chmod +x "${stage}/filescope" "${stage}/install.sh"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"

@@ -1,6 +1,9 @@
 #!/usr/bin/env sh
 # Install a prebuilt filescope (from a release tarball) for the current user.
 #
+# This file is packaging/install-release.sh in the repo. The release workflow
+# copies it into the tarball as install.sh, which is the command below.
+#
 # No build tools and no -dev packages are required — only the GTK4/libadwaita
 # *runtime*, which ships with modern GNOME (GTK 4.16+ / libadwaita 1.5+).
 #

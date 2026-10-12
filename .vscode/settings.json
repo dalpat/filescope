@@ -1,0 +1,5 @@
+{
+  "rust-analyzer.server.extraEnv": {
+    "PATH": "${env:HOME}/.cargo/bin:${env:PATH}"
+  }
+}
