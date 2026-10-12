@@ -28,6 +28,10 @@ columnview > listview > row { border-radius: 8px; }
 .drive-bar { min-height: 8px; }
 .drive-bar > trough, .drive-bar > trough > progress { min-height: 8px; border-radius: 8px; }
 .bookmark-remove { min-height: 0; min-width: 0; padding: 2px; }
+.bookmark-x { opacity: 0; transition: opacity 120ms; }
+row:hover .bookmark-x,
+.bookmark-x:focus-visible { opacity: 1; }
+.bookmark-drop { background: alpha(@accent_bg_color, 0.22); }
 ";
 
 const ATTRS: &str = "standard::*,time::modified,unix::mode";
@@ -230,6 +234,7 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
     {
         let state = state.clone();
         window.connect_close_request(move |window| {
+            preview::close_sushi(window);
             settings::save(&settings::Settings {
                 is_list: state.is_list.get(),
                 zoom: state.zoom.get(),
@@ -1406,7 +1411,8 @@ fn open_with(app: &Rc<App>) {
     });
 }
 
-/// Space toggles a Quick-Look style preview of the single selected file.
+/// Space toggles a preview of the single selected file. Sushi gets it when
+/// installed; otherwise the in-app window opens.
 fn toggle_preview(app: &Rc<App>) {
     if let Some(win) = app.preview.borrow_mut().take() {
         win.close();
@@ -1414,19 +1420,28 @@ fn toggle_preview(app: &Rc<App>) {
     }
     let tab = active_tab(app);
     let items = selected(&tab);
-    if let [(file, info)] = items.as_slice()
-        && info.file_type() != gio::FileType::Directory
-    {
-        let win = preview::show(&app.window, file, info);
+    let [(file, info)] = items.as_slice() else { return };
+    if info.file_type() == gio::FileType::Directory {
+        return;
+    }
+    let file = file.clone();
+    let fallback = file.clone();
+    let info = info.clone();
+    let app_cb = app.clone();
+    preview::show_sushi(&app.window, &file, move |opened| {
+        if opened || app_cb.preview.borrow().is_some() {
+            return;
+        }
+        let win = preview::show(&app_cb.window, &fallback, &info);
         {
-            let app = app.clone();
+            let app_cb = app_cb.clone();
             win.connect_close_request(move |_| {
-                *app.preview.borrow_mut() = None;
+                *app_cb.preview.borrow_mut() = None;
                 glib::Propagation::Proceed
             });
         }
-        *app.preview.borrow_mut() = Some(win);
-    }
+        *app_cb.preview.borrow_mut() = Some(win);
+    });
 }
 
 fn launch(app: &Rc<App>, file: &gio::File) {
@@ -2532,6 +2547,7 @@ fn bookmark_row(app: &Rc<App>, label: &str, path: PathBuf) -> gtk::ListBoxRow {
     let remove = gtk::Button::builder().icon_name("window-close-symbolic").tooltip_text("Remove bookmark").build();
     remove.add_css_class("flat");
     remove.add_css_class("bookmark-remove");
+    remove.add_css_class("bookmark-x");
     {
         let app = app.clone();
         let path = path.clone();
@@ -2546,8 +2562,66 @@ fn bookmark_row(app: &Rc<App>, label: &str, path: PathBuf) -> gtk::ListBoxRow {
     row_box.append(&text);
     row_box.append(&remove);
     let row = gtk::ListBoxRow::builder().child(&row_box).build();
-    unsafe { row.set_data("path", path) };
+    unsafe { row.set_data("path", path.clone()) };
+    attach_bookmark_reorder(app, &row, path);
     row
+}
+
+/// Drag a bookmark row onto another to reorder the list. The drop lands before
+/// or after the target depending on which half of the row the pointer is in.
+fn attach_bookmark_reorder(app: &Rc<App>, row: &gtk::ListBoxRow, path: PathBuf) {
+    let source = gtk::DragSource::new();
+    source.set_actions(gdk::DragAction::MOVE);
+    let dragged = path.to_string_lossy().into_owned();
+    source.connect_prepare(move |_, _, _| {
+        Some(gdk::ContentProvider::for_value(&dragged.to_value()))
+    });
+    row.add_controller(source);
+
+    let target = gtk::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
+    {
+        let row = row.clone();
+        target.connect_motion(move |_, _, _| {
+            row.add_css_class("bookmark-drop");
+            gdk::DragAction::MOVE
+        });
+    }
+    {
+        let row = row.clone();
+        target.connect_leave(move |_| row.remove_css_class("bookmark-drop"));
+    }
+    {
+        let app = app.clone();
+        let row = row.clone();
+        target.connect_drop(move |_, value, _, y| {
+            row.remove_css_class("bookmark-drop");
+            let Ok(from_s) = value.get::<String>() else { return false };
+            let from = PathBuf::from(from_s);
+            if !app.bookmarks.borrow().iter().any(|p| p == &from) {
+                return false;
+            }
+            let after = y > row.height() as f64 / 2.0;
+            let to = path.clone();
+            let app = app.clone();
+            // Rebuild after this drop returns — the sidebar rows are the drop
+            // widgets, so tearing them down inside the callback is unsafe.
+            glib::idle_add_local_once(move || {
+                let changed = {
+                    let mut marks = app.bookmarks.borrow_mut();
+                    let changed = bookmarks::reorder(&mut marks, &from, &to, after);
+                    if changed {
+                        bookmarks::save(&marks);
+                    }
+                    changed
+                };
+                if changed {
+                    populate_sidebar(&app);
+                }
+            });
+            true
+        });
+    }
+    row.add_controller(target);
 }
 
 // --- Context menu -----------------------------------------------------------
@@ -2666,15 +2740,24 @@ fn attach_context_menu(app: &Rc<App>, widget: &impl IsA<gtk::Widget>) {
 /// These are deliberately **not** window accelerators. GTK dispatches accelerators
 /// before the focused widget, so binding bare keys globally would steal them from
 /// any text entry — you couldn't type a space or backspace while renaming or
-/// searching. A controller on the view runs in the bubble phase instead, so a
-/// focused entry consumes the key first and these only fire when the view itself
-/// has focus.
+/// searching.
+///
+/// The controller runs in the capture phase, before the list item's own binding.
+/// That binding uses bare Space to toggle selection, so a bubble-phase handler
+/// never sees the key. Text entries inside the view (inline rename) are left
+/// alone; modified Space still reaches GTK so Ctrl/Shift+Space can change the
+/// selection.
 fn attach_view_keys(app: &Rc<App>, view: &impl IsA<gtk::Widget>) {
     let key = gtk::EventControllerKey::new();
+    key.set_propagation_phase(gtk::PropagationPhase::Capture);
     let app = app.clone();
-    key.connect_key_pressed(move |_, keyval, _, state| {
+    key.connect_key_pressed(move |controller, keyval, _, state| {
+        let typing = controller.widget().is_some_and(|widget| focus_is_text_input(&widget));
+        if !claims_view_key(keyval, state, typing) {
+            return glib::Propagation::Proceed;
+        }
         match keyval {
-            gtk::gdk::Key::space => toggle_preview(&app),
+            gtk::gdk::Key::space | gtk::gdk::Key::KP_Space => toggle_preview(&app),
             gtk::gdk::Key::BackSpace => {
                 let tab = active_tab(&app);
                 go_up(&app, &tab);
@@ -2691,6 +2774,41 @@ fn attach_view_keys(app: &Rc<App>, view: &impl IsA<gtk::Widget>) {
         glib::Propagation::Stop
     });
     view.add_controller(key);
+}
+
+/// True when keyboard focus is in a text entry inside `widget` (inline rename).
+fn focus_is_text_input(widget: &gtk::Widget) -> bool {
+    let Some(focus) = widget.root().and_then(|root| root.focus()) else {
+        return false;
+    };
+    let mut current = Some(focus);
+    while let Some(w) = current {
+        if w.is::<gtk::Text>() || w.is::<gtk::TextView>() || w.is::<gtk::Entry>() || w.is::<gtk::SearchEntry>() {
+            return true;
+        }
+        current = w.parent();
+    }
+    false
+}
+
+/// Whether the file view should handle this key itself. Bare Space must be
+/// claimed or the row toggles its selection instead of previewing.
+fn claims_view_key(keyval: gdk::Key, state: gdk::ModifierType, typing: bool) -> bool {
+    if typing {
+        return false;
+    }
+    match keyval {
+        gdk::Key::space | gdk::Key::KP_Space => !selection_modified(state),
+        gdk::Key::BackSpace | gdk::Key::Delete | gdk::Key::KP_Delete => true,
+        _ => false,
+    }
+}
+
+fn selection_modified(state: gdk::ModifierType) -> bool {
+    state.contains(gdk::ModifierType::CONTROL_MASK)
+        || state.contains(gdk::ModifierType::SHIFT_MASK)
+        || state.contains(gdk::ModifierType::ALT_MASK)
+        || state.contains(gdk::ModifierType::SUPER_MASK)
 }
 
 /// Make a view draggable: dragging exports the current selection as a URI list,
@@ -3285,7 +3403,22 @@ fn rename_selection_region(name: &str, is_dir: bool) -> (i32, i32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ACCELS, GNOME_COPIED, URI_LIST, parse_clipboard, rename_selection_region};
+    use super::{
+        ACCELS, GNOME_COPIED, URI_LIST, claims_view_key, parse_clipboard, rename_selection_region,
+    };
+
+    #[test]
+    fn bare_space_previews_and_does_not_toggle_selection() {
+        let bare = gtk::gdk::ModifierType::empty();
+        assert!(claims_view_key(gtk::gdk::Key::space, bare, false));
+        assert!(claims_view_key(gtk::gdk::Key::KP_Space, bare, false));
+        // Ctrl/Shift+Space stay with GTK, which uses them to change the selection.
+        assert!(!claims_view_key(gtk::gdk::Key::space, gtk::gdk::ModifierType::CONTROL_MASK, false));
+        assert!(!claims_view_key(gtk::gdk::Key::space, gtk::gdk::ModifierType::SHIFT_MASK, false));
+        // Rename and search must still receive the key.
+        assert!(!claims_view_key(gtk::gdk::Key::space, bare, true));
+        assert!(!claims_view_key(gtk::gdk::Key::BackSpace, bare, true));
+    }
 
     #[test]
     fn no_accelerator_steals_a_typing_key() {

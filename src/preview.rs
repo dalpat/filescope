@@ -1,10 +1,146 @@
-// Quick-look style preview: press Space on a selected item to pop a preview
-// window (image, text, or a metadata card), dismissed with Space or Escape.
+// Quick-look style preview: press Space on a selected item.
+// GNOME Sushi handles it when installed; otherwise a small in-app window
+// (image, text, or a metadata card), dismissed with Space or Escape.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
 
 use crate::format;
+
+const SUSHI_NAME: &str = "org.gnome.NautilusPreviewer";
+const SUSHI_PATH: &str = "/org/gnome/NautilusPreviewer";
+const SUSHI_IFACE: &str = "org.gnome.NautilusPreviewer2";
+const SUSHI_HANDLE_KEY: &str = "sushi-wl-handle";
+
+/// Ask GNOME Sushi to preview `file`. `done(true)` when Sushi accepted the call.
+/// A false result means Sushi is missing or the call failed, so the caller can
+/// fall back to [`show`].
+pub fn show_sushi(window: &adw::ApplicationWindow, file: &gio::File, done: impl FnOnce(bool) + 'static) {
+    let uri = file.uri().to_string();
+    let token = gtk::prelude::WidgetExt::display(window)
+        .app_launch_context()
+        .startup_notify_id(None::<&gio::AppInfo>, &[])
+        .map(|id: glib::GString| id.to_string())
+        .unwrap_or_default();
+    if let Some(raw) = saved_wayland_handle(window) {
+        call_show_file(uri, format!("wayland:{raw}"), token, false, done);
+        return;
+    }
+    let Some(toplevel) = wayland_toplevel(window) else {
+        done(false);
+        return;
+    };
+    // The export callback owns `done`. If export fails immediately, call it here.
+    let done = Rc::new(RefCell::new(Some(done)));
+    let window = window.clone();
+    let started = toplevel.export_handle({
+        let done = done.clone();
+        move |_, result: Result<&str, glib::BoolError>| {
+            let Some(done) = done.borrow_mut().take() else { return };
+            match result {
+                Ok(raw) => {
+                    let raw = raw.to_string();
+                    let handle = format!("wayland:{raw}");
+                    unsafe { window.set_data(SUSHI_HANDLE_KEY, raw) };
+                    call_show_file(uri.clone(), handle, token.clone(), false, done);
+                }
+                Err(_) => done(false),
+            }
+        }
+    });
+    if !started {
+        if let Some(done) = done.borrow_mut().take() {
+            done(false);
+        }
+    }
+}
+
+/// Close Sushi if it is already running. Does not start it.
+pub fn close_sushi(window: &adw::ApplicationWindow) {
+    drop_saved_wayland_handle(window);
+    gio::bus_get(gio::BusType::Session, gio::Cancellable::NONE, |bus| {
+        let Ok(bus) = bus else { return };
+        bus.call(
+            Some(SUSHI_NAME),
+            SUSHI_PATH,
+            SUSHI_IFACE,
+            "Close",
+            None,
+            None,
+            gio::DBusCallFlags::NO_AUTO_START,
+            -1,
+            gio::Cancellable::NONE,
+            |_| {},
+        );
+    });
+}
+
+/// `token` is `Some` for the current `(ssbs)` call and `None` for older Sushi `(ssb)`.
+fn show_file_parameters(uri: &str, handle: &str, close: bool, token: Option<&str>) -> glib::Variant {
+    match token {
+        Some(token) => (uri, handle, close, token).to_variant(),
+        None => (uri, handle, close).to_variant(),
+    }
+}
+
+fn call_show_file(
+    uri: String,
+    handle: String,
+    token: String,
+    legacy: bool,
+    done: impl FnOnce(bool) + 'static,
+) {
+    let params = show_file_parameters(&uri, &handle, true, (!legacy).then_some(token.as_str()));
+    gio::bus_get(gio::BusType::Session, gio::Cancellable::NONE, move |bus| {
+        let bus = match bus {
+            Ok(bus) => bus,
+            Err(_) => {
+                done(false);
+                return;
+            }
+        };
+        bus.call(
+            Some(SUSHI_NAME),
+            SUSHI_PATH,
+            SUSHI_IFACE,
+            "ShowFile",
+            Some(&params),
+            None,
+            gio::DBusCallFlags::NONE,
+            -1,
+            gio::Cancellable::NONE,
+            move |res| match res {
+                Ok(_) => done(true),
+                // Sushi before the activation-token argument rejects `(ssbs)`.
+                Err(err) if !legacy && err.matches(gio::DBusError::InvalidArgs) => {
+                    call_show_file(uri, handle, token, true, done);
+                }
+                Err(_) => done(false),
+            },
+        );
+    });
+}
+
+fn wayland_toplevel(window: &adw::ApplicationWindow) -> Option<gdk_wayland::WaylandToplevel> {
+    gtk::prelude::NativeExt::surface(window)?.downcast().ok()
+}
+
+fn saved_wayland_handle(window: &adw::ApplicationWindow) -> Option<String> {
+    let data = unsafe { window.data::<String>(SUSHI_HANDLE_KEY) }?;
+    Some(unsafe { data.as_ref() }.clone())
+}
+
+fn drop_saved_wayland_handle(window: &adw::ApplicationWindow) {
+    let Some(raw) = (unsafe { window.steal_data::<String>(SUSHI_HANDLE_KEY) }) else {
+        return;
+    };
+    if let Some(toplevel) = wayland_toplevel(window) {
+        toplevel.drop_exported_handle(&raw);
+    }
+}
 
 /// Build and present a preview window for `file`/`info`, transient for `parent`.
 /// Returns the window so the caller can close it (Space toggles the preview).
@@ -128,4 +264,17 @@ fn metadata_card(info: &gio::FileInfo, content_type: &str) -> gtk::Widget {
     card.append(&title);
     card.append(&caption);
     card.upcast()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sushi_show_file_matches_current_and_legacy_signatures() {
+        let current = show_file_parameters("file:///tmp/a", "wayland:1", true, Some("tok"));
+        assert_eq!(current.type_().as_str(), "(ssbs)");
+        let legacy = show_file_parameters("file:///tmp/a", "wayland:1", true, None);
+        assert_eq!(legacy.type_().as_str(), "(ssb)");
+    }
 }

@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 gtk = { version = "0.9", package = "gtk4", features = ["v4_16"] }
 adw = { version = "0.7", package = "libadwaita", features = ["v1_5"] }
+# Wayland window handle so Sushi can parent its preview.
+gdk-wayland = { version = "0.9.6", package = "gdk4-wayland", features = ["v4_16"] }
 # For getuid/getgid, so an ntfs-3g mount is owned by the current user.
 libc = "0.2"
 # Worker-thread → GTK-main-loop channel for the background file-op engine.
