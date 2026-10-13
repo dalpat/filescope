@@ -16,21 +16,57 @@ pub(super) fn list_icon(grid_size: i32) -> i32 {
     (grid_size / 4).clamp(16, 40)
 }
 pub(super) fn attach_context_menu(app: &Rc<super::App>, widget: &impl IsA<gtk::Widget>) {
-    let popover = gtk::PopoverMenu::from_model(Some(&super::context_menu()));
-    popover.set_parent(widget);
-    popover.set_has_arrow(false);
-    popover.set_halign(gtk::Align::Start);
     let gesture = gtk::GestureClick::new();
     gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
     let app = app.clone();
-    let popover = popover.clone();
+    let view = widget.as_ref().clone();
     gesture.connect_pressed(move |g, _, x, y| {
         g.set_state(gtk::EventSequenceState::Claimed);
+        let tab = super::navigation::active_tab(&app);
+        let on_item = if let Some(pos) = position_at(&view, x, y) {
+            // Right-click an unselected row: act on that row, not the previous selection.
+            // Right-click one of several selected rows: keep the whole selection.
+            if !tab.selection.is_selected(pos) {
+                tab.selection.select_item(pos, true);
+            }
+            true
+        } else {
+            false
+        };
         super::update_chrome(&app);
-        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        // Nautilus replaces the previous popover here, and leaves it parented
+        // after it closes. Unparenting on close runs before the row's action.
+        unsafe {
+            if let Some(old) = view.steal_data::<gtk::PopoverMenu>("fs-context-menu") {
+                old.unparent();
+            }
+        }
+        let menu = super::context_menu_for(&app, on_item);
+        let popover = gtk::PopoverMenu::from_model(None::<&gio::Menu>);
+        let focus = view.clone();
+        popover.connect_closed(move |_| {
+            focus.grab_focus();
+        });
+        popover.set_parent(&view);
+        popover.set_has_arrow(false);
+        popover.set_halign(gtk::Align::Start);
+        popover.set_menu_model(Some(&menu));
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 0, 0)));
+        unsafe { view.set_data("fs-context-menu", popover.clone()); }
         popover.popup();
     });
     widget.add_controller(gesture);
+}
+
+/// Model position of the row under `(x, y)`, if the click landed on a file or folder.
+fn position_at(view: &impl IsA<gtk::Widget>, x: f64, y: f64) -> Option<u32> {
+    let mut widget = view.pick(x, y, gtk::PickFlags::DEFAULT)?;
+    loop {
+        if let Some(pos) = unsafe { widget.data::<u32>("fs-position") } {
+            return Some(unsafe { *pos.as_ref() });
+        }
+        widget = widget.parent()?;
+    }
 }
 
 // --- Drag & drop ------------------------------------------------------------
@@ -321,8 +357,12 @@ fn name_stack(label: &gtk::Label) -> gtk::Stack {
 /// Per-bind setup for a cell's name stack: tag the cell with its row position (so
 /// a rename can find this widget) and make sure a recycled cell isn't left in
 /// edit mode. Returns the label to fill in.
+fn tag_position(widget: &impl IsA<gtk::Widget>, position: u32) {
+    unsafe { widget.set_data("fs-position", position) };
+}
+
 fn bind_name_stack(cell: &gtk::Box, position: u32) -> gtk::Label {
-    unsafe { cell.set_data("fs-position", position) };
+    tag_position(cell, position);
     let stack = find_name_stack(cell.upcast_ref::<gtk::Widget>()).expect("cell has a name stack");
     stack.set_visible_child_name("view");
     stack.child_by_name("view").and_downcast::<gtk::Label>().expect("name stack holds a label")
@@ -534,6 +574,7 @@ fn size_column() -> gtk::ColumnViewColumn {
         } else {
             label.set_label(&format::human_size(info.size().max(0) as u64));
         }
+        tag_position(&label, item.position());
         mark_hidden(&label, &info);
     });
     let col = gtk::ColumnViewColumn::builder().title("Size").factory(&factory).resizable(true).build();
@@ -555,6 +596,7 @@ fn modified_column() -> gtk::ColumnViewColumn {
             Some(dt) => label.set_label(&format::modified(&dt)),
             None => label.set_label(""),
         }
+        tag_position(&label, item.position());
         mark_hidden(&label, &info);
     });
     let col =

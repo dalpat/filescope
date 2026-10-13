@@ -723,18 +723,19 @@ fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
     let count = tab.selection.selection().size();
     let has_sel = count > 0;
     let one = count == 1;
-    // Paste is available whenever the system clipboard holds file URIs.
-    let has_clip = {
-        let formats = app.window.clipboard().formats();
-        formats.contain_mime_type(GNOME_COPIED) || formats.contain_mime_type(URI_LIST)
-    };
+    let has_clip = clipboard_has_files(app);
     // "Extract Here" only makes sense when everything selected is an archive.
+    // Open With and Preview only apply to a single file, not a folder.
     let sel = commands::selected(tab);
+    let single_file = matches!(
+        sel.as_slice(),
+        [(_, info)] if info.file_type() != gio::FileType::Directory
+    );
     let all_archives = has_sel
         && sel.iter().all(|(_, i)| archive::Format::from_name(&i.display_name()).is_some());
 
     for (name, enabled) in [
-        ("open", has_sel), ("open-with", one), ("preview", one), ("cut", has_sel),
+        ("open", has_sel), ("open-with", single_file), ("preview", single_file), ("cut", has_sel),
         ("copy", has_sel), ("paste", has_clip), ("rename", one), ("trash", has_sel),
         ("delete", has_sel), ("properties", one),
         ("extract", all_archives), ("compress", has_sel),
@@ -750,39 +751,90 @@ fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
 
 // --- Context menu -----------------------------------------------------------
 
-fn context_menu() -> gio::Menu {
+fn clipboard_has_files(app: &App) -> bool {
+    let formats = app.window.clipboard().formats();
+    formats.contain_mime_type(GNOME_COPIED) || formats.contain_mime_type(URI_LIST)
+}
+
+/// Right-click on a file or folder: only actions for that selection.
+/// Right-click on empty space: only actions for the folder you are in.
+fn context_menu_for(app: &Rc<App>, on_item: bool) -> gio::Menu {
+    let tab = navigation::active_tab(app);
+    let sel = commands::selected(&tab);
+    let one = sel.len() == 1;
+    let single_file = matches!(
+        sel.as_slice(),
+        [(_, info)] if info.file_type() != gio::FileType::Directory
+    );
+    let all_archives = !sel.is_empty()
+        && sel.iter().all(|(_, i)| archive::Format::from_name(&i.display_name()).is_some());
+    let has_clip = clipboard_has_files(app);
+
     let menu = gio::Menu::new();
-    let a = gio::Menu::new();
-    a.append(Some("Open"), Some("win.open"));
-    a.append(Some("Open With…"), Some("win.open-with"));
-    a.append(Some("Preview (Space)"), Some("win.preview"));
-    menu.append_section(None, &a);
-    let b = gio::Menu::new();
-    b.append(Some("Cut"), Some("win.cut"));
-    b.append(Some("Copy"), Some("win.copy"));
-    b.append(Some("Paste"), Some("win.paste"));
-    menu.append_section(None, &b);
-    let undo_section = gio::Menu::new();
-    undo_section.append(Some("Undo"), Some("win.undo"));
-    undo_section.append(Some("Redo"), Some("win.redo"));
-    menu.append_section(None, &undo_section);
-    let archive_section = gio::Menu::new();
-    archive_section.append(Some("Extract Here"), Some("win.extract"));
-    archive_section.append(Some("Compress…"), Some("win.compress"));
-    menu.append_section(None, &archive_section);
-    let c = gio::Menu::new();
-    c.append(Some("Rename…"), Some("win.rename"));
-    c.append(Some("Move to Trash"), Some("win.trash"));
-    c.append(Some("Delete Permanently…"), Some("win.delete"));
-    menu.append_section(None, &c);
-    let d = gio::Menu::new();
-    d.append(Some("New Folder…"), Some("win.new-folder"));
-    d.append(Some("Open Terminal Here (Ctrl+.)"), Some("win.open-terminal"));
-    d.append(Some("Bookmark This Folder"), Some("win.bookmark"));
-    d.append(Some("Select All"), Some("win.select-all"));
-    d.append(Some("Properties"), Some("win.properties"));
-    menu.append_section(None, &d);
+    if on_item && !sel.is_empty() {
+        let primary = gio::Menu::new();
+        primary.append(Some("Open"), Some("win.open"));
+        if single_file {
+            primary.append(Some("Open With…"), Some("win.open-with"));
+            // Space previews from the file view. It is not a window accelerator,
+            // so the menu has to say so itself.
+            append_shown_accel(&primary, "Preview", "win.preview", "space");
+        }
+        primary.append(Some("Cut"), Some("win.cut"));
+        primary.append(Some("Copy"), Some("win.copy"));
+        if has_clip {
+            primary.append(Some("Paste"), Some("win.paste"));
+        }
+        menu.append_section(None, &primary);
+
+        let edit = gio::Menu::new();
+        if one {
+            edit.append(Some("Rename…"), Some("win.rename"));
+        }
+        if all_archives {
+            edit.append(Some("Extract Here"), Some("win.extract"));
+        }
+        edit.append(Some("Compress…"), Some("win.compress"));
+        append_shown_accel(&edit, "Move to Trash", "win.trash", "Delete");
+        append_shown_accel(&edit, "Delete Permanently…", "win.delete", "<shift>Delete");
+        if one {
+            edit.append(Some("Properties"), Some("win.properties"));
+        }
+        menu.append_section(None, &edit);
+    } else {
+        let folder = gio::Menu::new();
+        folder.append(Some("New Folder…"), Some("win.new-folder"));
+        if has_clip {
+            folder.append(Some("Paste"), Some("win.paste"));
+        }
+        folder.append(Some("Select All"), Some("win.select-all"));
+        menu.append_section(None, &folder);
+
+        let place = gio::Menu::new();
+        place.append(Some("Open Terminal Here"), Some("win.open-terminal"));
+        place.append(Some("Bookmark This Folder"), Some("win.bookmark"));
+        menu.append_section(None, &place);
+
+        let history = gio::Menu::new();
+        if !app.undo_stack.borrow().is_empty() {
+            history.append(Some("Undo"), Some("win.undo"));
+        }
+        if !app.redo_stack.borrow().is_empty() {
+            history.append(Some("Redo"), Some("win.redo"));
+        }
+        if history.n_items() > 0 {
+            menu.append_section(None, &history);
+        }
+    }
     menu
+}
+
+/// Show a shortcut on a menu row without registering a window accelerator.
+/// Delete and Space are handled by the file view so they are not stolen from text fields.
+fn append_shown_accel(menu: &gio::Menu, label: &str, action: &str, accel: &str) {
+    let item = gio::MenuItem::new(Some(label), Some(action));
+    item.set_attribute_value("accel", Some(&accel.to_variant()));
+    menu.append_item(&item);
 }
 
 fn sort_menu() -> gio::Menu {
