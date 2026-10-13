@@ -48,7 +48,7 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         gtk::ColumnView::builder().model(&selection).show_column_separators(false).build();
     super::view::fill_columns(&column_view, super::view::list_icon(grid_size));
     if let Some(sorter) = column_view.sorter() {
-        sort_model.set_sorter(Some(&sorter));
+        sort_model.set_sorter(Some(&super::view::with_hidden_last(&sorter)));
     }
     // Seed this tab with the shared sort selection (defaults to Name ascending).
     if let Some(col) =

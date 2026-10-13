@@ -249,6 +249,37 @@ fn clear_drop_highlight(hl: &Rc<RefCell<Option<gtk::Widget>>>) {
     }
 }
 
+/// Fade names that start with a dot, matching the hidden-file filter.
+fn mark_hidden(widget: &impl IsA<gtk::Widget>, info: &gio::FileInfo) {
+    if is_hidden_entry(info) {
+        widget.add_css_class("fs-hidden");
+    } else {
+        widget.remove_css_class("fs-hidden");
+    }
+}
+
+fn is_hidden_entry(info: &gio::FileInfo) -> bool {
+    info.is_hidden() || info.name().to_string_lossy().starts_with('.')
+}
+
+/// Keep dotfiles after normal entries. This sorter is applied before the column
+/// sort, so a descending name or size does not pull hidden items back to the top.
+pub(super) fn with_hidden_last(column_sorter: &gtk::Sorter) -> gtk::MultiSorter {
+    let grouped = gtk::CustomSorter::new(|a, b| {
+        let a = a.downcast_ref::<gio::FileInfo>().unwrap();
+        let b = b.downcast_ref::<gio::FileInfo>().unwrap();
+        match (is_hidden_entry(a), is_hidden_entry(b)) {
+            (false, true) => gtk::Ordering::Smaller,
+            (true, false) => gtk::Ordering::Larger,
+            _ => gtk::Ordering::Equal,
+        }
+    });
+    let multi = gtk::MultiSorter::new();
+    multi.append(grouped);
+    multi.append(column_sorter.clone());
+    multi
+}
+
 /// Tag a cell with the folder name it drops into (empty for non-folders, so a
 /// recycled cell never keeps a stale target).
 fn mark_drop_folder(cell: &impl IsA<gtk::Widget>, info: &gio::FileInfo) {
@@ -476,6 +507,7 @@ fn name_column(icon_size: i32) -> gtk::ColumnViewColumn {
         // The name column ellipsizes; show the full name on hover.
         row.set_tooltip_text(Some(&info.display_name()));
         mark_drop_folder(&row, &info);
+        mark_hidden(&row, &info);
     });
     let col =
         gtk::ColumnViewColumn::builder().title("Name").factory(&factory).expand(true).resizable(true).build();
@@ -502,6 +534,7 @@ fn size_column() -> gtk::ColumnViewColumn {
         } else {
             label.set_label(&format::human_size(info.size().max(0) as u64));
         }
+        mark_hidden(&label, &info);
     });
     let col = gtk::ColumnViewColumn::builder().title("Size").factory(&factory).resizable(true).build();
     col.set_sorter(Some(&info_sorter(|a, b| a.size().cmp(&b.size()))));
@@ -522,6 +555,7 @@ fn modified_column() -> gtk::ColumnViewColumn {
             Some(dt) => label.set_label(&format::modified(&dt)),
             None => label.set_label(""),
         }
+        mark_hidden(&label, &info);
     });
     let col =
         gtk::ColumnViewColumn::builder().title("Modified").factory(&factory).resizable(true).build();
@@ -573,6 +607,7 @@ pub(super) fn grid_factory(size: i32) -> gtk::SignalListItemFactory {
         // hover.
         cell.set_tooltip_text(Some(&info.display_name()));
         mark_drop_folder(&cell, &info);
+        mark_hidden(&cell, &info);
     });
     factory
 }

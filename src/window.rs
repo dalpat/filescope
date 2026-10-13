@@ -24,6 +24,7 @@ const CSS: &str = "
 .fs-grid > child:selected { background: alpha(@accent_bg_color, 0.22); }
 .fs-drop { background: alpha(@accent_bg_color, 0.35); border-radius: 8px; outline: 2px solid @accent_color; outline-offset: -2px; }
 .fs-name { margin-top: 4px; }
+.fs-hidden { opacity: 0.45; }
 columnview > listview > row { border-radius: 8px; }
 .crumbs button { padding: 3px 8px; min-height: 0; }
 .crumbs button.current { font-weight: bold; }
@@ -483,7 +484,7 @@ fn zoom(app: &Rc<App>, delta: i32) {
         if let Some(sorter) = tab.column_view.sorter()
             && let Some(sm) = tab.selection.model().and_downcast::<gtk::SortListModel>()
         {
-            sm.set_sorter(Some(&sorter));
+            sm.set_sorter(Some(&view::with_hidden_last(&sorter)));
         }
         // Rebuilding the columns clears the active sort column; restore it.
         apply_sort_to(app, tab);
