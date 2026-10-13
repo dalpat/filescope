@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.5.0] - 2026-10-13
+
+A home page for the computer, and a folder of photos no longer decodes every
+original just to show an icon.
+
+### Added
+- **This PC** — quick access, drives with free space, and recent files. Back
+  from a folder opened there returns to This PC, and the sidebar highlights it.
+- **Rubber-band selection** — drag empty space to select a rectangle of files.
+- **Execute permission** in Properties, for a file that can be a program.
+
+### Changed
+- **Zoom** (Ctrl+wheel, or the header buttons) resizes the icon and the name
+  together, including This PC and Trash. Trash uses the same grid and list as a
+  folder.
+- **Double-click** opens the default app. The chooser appears only when none is
+  set.
+- **Thumbnails** use the small picture already in the thumbnail cache. The
+  original file is left alone, so a photo folder stays idle.
+
 ## [0.4.0] - 2026-10-13
 
 Other apps can open a folder here, Space uses Sushi when it is installed, and
