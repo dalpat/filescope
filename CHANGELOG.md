@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.4.0] - 2026-10-13
+
+Other apps can open a folder here, Space uses Sushi when it is installed, and
+the right-click menu behaves like Files.
+
+### Added
+- **Default file manager** — turn it on from the menu. A second launch opens
+  that folder in a new tab. "Show in folder" from other apps then opens
+  filescope. Turning it off hands folders back to Files.
+- **Sushi preview** — Space opens GNOME Sushi when it is installed, and the
+  built-in preview when it is not.
+- **Reorder bookmarks** — drag a bookmark to a new place. The remove button
+  stays hidden until you hover the row.
+
+### Changed
+- **Hidden files** are faded, and they sort after normal files and folders.
+- **Right-click** selects the item under the pointer. The menu lists only what
+  applies to a file, a folder, or empty space, and a short menu no longer
+  scrolls.
+
 ## [0.3.0] - 2026-07-16
 
 Trust and polish: nothing you do is a one-way door any more — undo it, or fish it
