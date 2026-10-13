@@ -62,7 +62,7 @@ row:hover .bookmark-x,
 .bookmark-drop { background: alpha(@accent_bg_color, 0.22); }
 ";
 
-const ATTRS: &str = "standard::*,time::modified,unix::mode";
+const ATTRS: &str = "standard::*,time::modified,unix::mode,thumbnail::path,thumbnail::is-valid";
 
 /// Zoom bounds for the grid icon size (pixels); list scales at a quarter.
 const ZOOM_MIN: i32 = 48;

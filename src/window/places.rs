@@ -87,7 +87,7 @@ pub(super) fn show_computer(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
             let window = app.window.clone();
             let uri = info.uri().to_string();
             let file = gio::File::for_uri(&uri);
-            let (icon, is_image) = file_face(&file);
+            let (icon, thumb) = file_face(&file);
             let card = shortcut_card(&window, &icon, &info.display_name(), tile_w, icon_px, list, move || {
                 let file = gio::File::for_uri(&uri);
                 if file.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
@@ -102,13 +102,13 @@ pub(super) fn show_computer(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
                 card.set_tooltip_text(Some(&path));
             }
             if let Some(path) = file.path() {
-                if is_image {
-                    unsafe { card.set_data("fs-thumb", path.clone()) };
-                    if let Some(image) = first_image(card.upcast_ref()) {
-                        load_file_thumb(&image, path.clone(), icon_px * window.scale_factor().max(1));
-                    }
-                }
                 hide_if_missing(&card, path);
+            }
+            if let Some(path) = thumb {
+                unsafe { card.set_data("fs-thumb", path.clone()) };
+                if let Some(image) = first_image(card.upcast_ref()) {
+                    load_file_thumb(&image, path, icon_px * window.scale_factor().max(1));
+                }
             }
             insert_tile(&flow, &card, tile_w, list);
         }
@@ -209,10 +209,10 @@ fn file_icon(file: &gio::File) -> gio::Icon {
 }
 
 /// The file's theme icon, and whether it is a picture we can thumbnail.
-fn file_face(file: &gio::File) -> (gio::Icon, bool) {
+fn file_face(file: &gio::File) -> (gio::Icon, Option<PathBuf>) {
     let info = file
         .query_info(
-            "standard::icon,standard::content-type,standard::size",
+            "standard::icon,thumbnail::path,thumbnail::is-valid",
             gio::FileQueryInfoFlags::NONE,
             gio::Cancellable::NONE,
         )
@@ -221,10 +221,8 @@ fn file_face(file: &gio::File) -> (gio::Icon, bool) {
         .as_ref()
         .and_then(|info| info.icon())
         .unwrap_or_else(|| gio::ThemedIcon::new("text-x-generic").upcast());
-    let image = info.as_ref().is_some_and(|info| {
-        info.content_type().is_some_and(|kind| crate::icon::is_photo(&kind, info.size()))
-    });
-    (icon, image)
+    let thumb = info.as_ref().and_then(crate::icon::thumbnail_path);
+    (icon, thumb)
 }
 
 /// Paint `icon` once, as a still texture.
@@ -508,7 +506,7 @@ pub(super) fn show_trash(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
         let scale = app.window.scale_factor().max(1);
         for entry in entries {
             let stored = gio::File::for_path(root.join("files").join(&entry.name));
-            let (icon, is_image) = file_face(&stored);
+            let (icon, thumb) = file_face(&stored);
             let label = entry
                 .original
                 .file_name()
@@ -543,7 +541,7 @@ pub(super) fn show_trash(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
                 }
             });
             card.set_tooltip_text(Some(&tip));
-            if is_image && let Some(path) = stored.path() {
+            if let Some(path) = thumb {
                 unsafe { card.set_data("fs-thumb", path.clone()) };
                 if let Some(image) = first_image(card.upcast_ref()) {
                     load_file_thumb(&image, path, icon_px * scale);

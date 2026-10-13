@@ -11,9 +11,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use gtk::{gdk, gio, glib, prelude::*};
 
-/// Originals above this stay as the theme icon. A 175MB .xcf decoded as a
-/// thumbnail takes a core for a long time and still looks like a generic icon.
-const PHOTO_MAX: i64 = 20 * 1024 * 1024;
 /// shortcut: two decodes at a time, raise if scrolling through photos feels late
 const DECODE_SLOTS: u32 = 2;
 static DECODE_BUSY: AtomicU32 = AtomicU32::new(0);
@@ -71,13 +68,14 @@ fn texture_of(
     Some(texture)
 }
 
-/// A picture we can scale down cheaply. GIMP/SVG files and large originals are not.
-pub(crate) fn is_photo(kind: &str, bytes: i64) -> bool {
-    kind.starts_with("image/")
-        && !kind.contains("svg")
-        && !kind.contains("xcf")
-        && bytes > 0
-        && bytes <= PHOTO_MAX
+/// The small PNG already in `~/.cache/thumbnails`, when GIO says it is current.
+/// The original file is never decoded for a folder icon.
+pub(crate) fn thumbnail_path(info: &gio::FileInfo) -> Option<PathBuf> {
+    if !info.boolean("thumbnail::is-valid") {
+        return None;
+    }
+    let path = info.attribute_byte_string("thumbnail::path")?;
+    Some(PathBuf::from(path.as_str()))
 }
 
 pub(crate) struct Pixels {
@@ -185,22 +183,6 @@ fn store(
         }
         cache.insert((path, size), texture.clone());
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_photo;
-
-    #[test]
-    fn photos_are_the_only_files_we_decode() {
-        assert!(is_photo("image/jpeg", 1000));
-        assert!(is_photo("image/png", 20 * 1024 * 1024));
-        assert!(!is_photo("image/png", 20 * 1024 * 1024 + 1));
-        assert!(!is_photo("image/x-xcf", 1000));
-        assert!(!is_photo("image/svg+xml", 1000));
-        assert!(!is_photo("video/mp4", 1000));
-        assert!(!is_photo("image/jpeg", 0));
-    }
 }
 
 pub(crate) fn image_named(name: &str, size: i32) -> gtk::Image {

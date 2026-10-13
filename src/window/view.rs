@@ -718,8 +718,7 @@ fn set_themed_icon(image: &gtk::Image, info: &gio::FileInfo) {
     }
 }
 
-/// For image files, replace the themed icon with a scaled thumbnail — decoded on
-/// a background thread so a folder full of images never blocks the UI.
+/// Replace the theme icon with the cached thumbnail, when one exists.
 ///
 /// Each request tags the reused `Image` widget with a fresh token; when the
 /// decode returns we only apply it if the widget still carries that token, so a
@@ -728,14 +727,7 @@ fn set_themed_icon(image: &gtk::Image, info: &gio::FileInfo) {
 fn set_thumbnail(image: &gtk::Image, info: &gio::FileInfo, size: i32) {
     static THUMB_GEN: AtomicU64 = AtomicU64::new(0);
 
-    let kind = info.content_type().unwrap_or_default();
-    if !crate::icon::is_photo(&kind, info.size()) {
-        return;
-    }
-    let Some(file) = info.attribute_object("standard::file").and_downcast::<gio::File>() else {
-        return;
-    };
-    let Some(path) = file.path() else { return };
+    let Some(path) = crate::icon::thumbnail_path(info) else { return };
 
     let token = THUMB_GEN.fetch_add(1, AtomicOrdering::Relaxed) + 1;
     unsafe { image.set_data("thumb-token", token) };
