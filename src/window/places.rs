@@ -1,7 +1,7 @@
 // Sidebar: places, bookmarks, devices, This PC, and Trash.
 // The window shell calls in here; file rows live in view.rs.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -11,41 +11,455 @@ use crate::{bookmarks, format, trash};
 
 // --- This PC (drives) -------------------------------------------------------
 
-/// Populate and show the "This PC" drives view in `tab`.
+/// Populate and show the "This PC" page: quick access, drives, and recent files.
 pub(super) fn show_computer(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
     let box_ = &tab.computer_box;
     while let Some(child) = box_.first_child() {
         box_.remove(&child);
     }
-    box_.set_margin_top(16);
-    box_.set_margin_bottom(16);
-    box_.set_margin_start(16);
-    box_.set_margin_end(16);
-    box_.set_spacing(12);
+    box_.set_margin_top(18);
+    box_.set_margin_bottom(24);
+    box_.set_margin_start(22);
+    box_.set_margin_end(22);
+    box_.set_spacing(8);
+    box_.set_vexpand(true);
 
-    let heading = gtk::Label::builder().label("This PC").xalign(0.0).build();
-    heading.add_css_class("title-2");
-    box_.append(&heading);
-
-    let flow = gtk::FlowBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .column_spacing(12)
-        .row_spacing(12)
-        .max_children_per_line(4)
-        .min_children_per_line(1)
-        .homogeneous(true)
-        .build();
-
-    for item in drives() {
-        flow.insert(&drive_card(app, tab, &item), -1);
+    let (icon_px, tile_w, drive_icon, drive_w) = pc_scale(app.zoom.get());
+    let list = app.is_list.get();
+    let places = tile_row(list);
+    for dir in [
+        glib::UserDirectory::Desktop,
+        glib::UserDirectory::Downloads,
+        glib::UserDirectory::Documents,
+        glib::UserDirectory::Pictures,
+        glib::UserDirectory::Music,
+        glib::UserDirectory::Videos,
+    ] {
+        let Some((_, label, path)) = xdg_place(dir) else { continue };
+        let file = gio::File::for_path(&path);
+        let icon = file_icon(&file);
+        let app = app.clone();
+        let tab = tab.clone();
+        let window = app.window.clone();
+        insert_tile(&places, &shortcut_card(&window, &icon, label, tile_w, icon_px, list, move || {
+            super::navigation::navigate(&app, &tab, file.clone());
+        }), tile_w, list);
     }
-    box_.append(&flow);
+    {
+        let trash = gio::File::for_uri("trash:///");
+        let icon = file_icon(&trash);
+        let app = app.clone();
+        let tab = tab.clone();
+        let window = app.window.clone();
+        insert_tile(&places, &shortcut_card(&window, &icon, "Trash", tile_w, icon_px, list, move || {
+            super::navigation::go_trash(&app, &tab);
+        }), tile_w, list);
+    }
+    box_.append(&section("Quick access", &places));
+
+    let drives_flow = tile_row(list);
+    for item in drives() {
+        insert_tile(&drives_flow, &drive_card(app, tab, &item, drive_w, drive_icon, list), drive_w, list);
+    }
+    box_.append(&section("Drives", &drives_flow));
+
+    let recent = files_we_opened();
+    if recent.is_empty() {
+        let empty = gtk::Label::builder()
+            .label("Files you've previously accessed will show up here")
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .vexpand(true)
+            .margin_top(48)
+            .margin_bottom(48)
+            .build();
+        empty.add_css_class("dim-label");
+        let section = section("Recent files", &empty);
+        section.set_vexpand(true);
+        box_.append(&section);
+    } else {
+        let flow = tile_row(list);
+        for info in recent {
+            let app = app.clone();
+            let tab = tab.clone();
+            let window = app.window.clone();
+            let uri = info.uri().to_string();
+            let file = gio::File::for_uri(&uri);
+            let (icon, is_image) = file_face(&file);
+            let card = shortcut_card(&window, &icon, &info.display_name(), tile_w, icon_px, list, move || {
+                let file = gio::File::for_uri(&uri);
+                if file.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
+                    == gio::FileType::Directory
+                {
+                    super::navigation::navigate(&app, &tab, file);
+                } else {
+                    super::commands::launch(&app, &file);
+                }
+            });
+            if let Some(path) = info.uri_display() {
+                card.set_tooltip_text(Some(&path));
+            }
+            if let Some(path) = file.path() {
+                if is_image {
+                    unsafe { card.set_data("fs-thumb", path.clone()) };
+                    if let Some(image) = first_image(card.upcast_ref()) {
+                        load_file_thumb(&image, path.clone(), icon_px * window.scale_factor().max(1));
+                    }
+                }
+                hide_if_missing(&card, path);
+            }
+            insert_tile(&flow, &card, tile_w, list);
+        }
+        box_.append(&section("Recent files", &flow));
+    }
 
     if let Some(page) = tab.page.borrow().as_ref() {
         page.set_title("This PC");
     }
     tab.view_stack.set_visible_child_name("computer");
+    super::navigation::set_path_visible(tab, false);
+    sync_sidebar(app);
     super::update_chrome(app);
+}
+
+/// Cards keep their own size and wrap onto the next line when the window narrows.
+fn tile_row(list: bool) -> gtk::FlowBox {
+    gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .column_spacing(12)
+        .row_spacing(if list { 4 } else { 12 })
+        .max_children_per_line(if list { 1 } else { 16 })
+        .min_children_per_line(1)
+        .homogeneous(false)
+        .hexpand(true)
+        .halign(if list { gtk::Align::Fill } else { gtk::Align::Start })
+        .valign(gtk::Align::Start)
+        .css_classes(["pc-tiles"])
+        .build()
+}
+
+fn insert_tile(flow: &gtk::FlowBox, tile: &impl IsA<gtk::Widget>, width: i32, list: bool) {
+    flow.insert(tile, -1);
+    if let Some(child) = flow.last_child() {
+        if list {
+            child.set_hexpand(true);
+            child.set_halign(gtk::Align::Fill);
+        } else {
+            child.set_size_request(width, -1);
+            child.set_hexpand(false);
+            child.set_halign(gtk::Align::Start);
+        }
+    }
+}
+
+fn section(title: &str, child: &impl IsA<gtk::Widget>) -> gtk::Expander {
+    child.set_margin_top(14);
+    let exp = gtk::Expander::builder().label(title).expanded(true).child(child).hexpand(true).build();
+    exp.add_css_class("pc-section");
+    exp.set_margin_bottom(18);
+    exp
+}
+
+/// Highlight the sidebar row for whatever the active tab is showing.
+pub(super) fn sync_sidebar(app: &Rc<super::App>) {
+    if app.tabs.borrow().is_empty() {
+        return;
+    }
+    let tab = super::navigation::active_tab(app);
+    let showing = tab.view_stack.visible_child_name();
+    let current = tab.dir_list.file().and_then(|file| file.path());
+    let list = &app.sidebar_list;
+    let mut child = list.first_child();
+    let mut matched = None;
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        let Some(row) = widget.downcast_ref::<gtk::ListBoxRow>() else { continue };
+        let hit = match showing.as_deref() {
+            Some("computer") => unsafe { row.data::<bool>("computer") }.is_some(),
+            Some("trash") => unsafe { row.data::<bool>("trash") }.is_some(),
+            _ => current.as_ref().is_some_and(|path| {
+                unsafe { row.data::<PathBuf>("path") }
+                    .is_some_and(|stored| unsafe { stored.as_ref() } == path)
+            }),
+        };
+        if hit {
+            matched = Some(row.clone());
+            break;
+        }
+    }
+    list.select_row(matched.as_ref());
+}
+
+/// Tile sizes for the current zoom. 80 is the size the page was drawn at.
+fn pc_scale(zoom: i32) -> (i32, i32, i32, i32) {
+    let scale = zoom as f32 / 80.0;
+    (
+        (48.0 * scale).round() as i32,
+        (132.0 * scale).round() as i32,
+        (32.0 * scale).round() as i32,
+        (300.0 * scale).round() as i32,
+    )
+}
+
+/// The icon the theme gives this file. GTK picks the size from the image.
+fn file_icon(file: &gio::File) -> gio::Icon {
+    file_face(file).0
+}
+
+/// The file's theme icon, and whether it is a picture we can thumbnail.
+fn file_face(file: &gio::File) -> (gio::Icon, bool) {
+    let info = file
+        .query_info(
+            "standard::icon,standard::content-type,standard::size",
+            gio::FileQueryInfoFlags::NONE,
+            gio::Cancellable::NONE,
+        )
+        .ok();
+    let icon = info
+        .as_ref()
+        .and_then(|info| info.icon())
+        .unwrap_or_else(|| gio::ThemedIcon::new("text-x-generic").upcast());
+    let image = info.as_ref().is_some_and(|info| {
+        info.content_type().is_some_and(|kind| crate::icon::is_photo(&kind, info.size()))
+    });
+    (icon, image)
+}
+
+/// Paint `icon` once, as a still texture.
+///
+/// A live icon paintable redraws every frame (it watches the theme and
+/// recolors), which pegs a core while This PC is open.
+fn theme_image(window: &adw::ApplicationWindow, icon: &gio::Icon, size: i32) -> gtk::Image {
+    let image = gtk::Image::builder().pixel_size(size).halign(gtk::Align::Center).build();
+    paint_icon(&image, window, icon, size);
+    image
+}
+
+/// Theme icons are small files, drawn now. A photo is decoded off the UI thread,
+/// the same way folder thumbnails are, so This PC does not freeze on a big jpeg.
+fn paint_icon(image: &gtk::Image, window: &adw::ApplicationWindow, icon: &gio::Icon, size: i32) {
+    image.set_pixel_size(size);
+    if let Ok(file_icon) = icon.clone().downcast::<gio::FileIcon>()
+        && let Some(path) = file_icon.file().path()
+    {
+        let image = image.clone();
+        let px = size * window.scale_factor().max(1);
+        if let Some(texture) = crate::icon::cached_photo(&path, px) {
+            image.set_paintable(Some(&texture));
+            return;
+        }
+        glib::spawn_future_local(async move {
+            let Some(pixels) = crate::icon::decode_limited(path.clone(), px).await else {
+                return;
+            };
+            let texture = pixels.texture();
+            crate::icon::store_photo(&path, px, &texture);
+            image.set_paintable(Some(&texture));
+        });
+        return;
+    }
+    if let Some(texture) = crate::icon::still_icon(
+        &gtk::prelude::WidgetExt::display(window),
+        window.scale_factor(),
+        icon,
+        size,
+    ) {
+        image.set_paintable(Some(&texture));
+    }
+}
+
+
+fn load_file_thumb(image: &gtk::Image, path: std::path::PathBuf, size: i32) {
+    let image = image.clone();
+    let token = bump_icon(image.upcast_ref());
+    if let Some(texture) = crate::icon::cached_photo(&path, size) {
+        image.set_paintable(Some(&texture));
+        return;
+    }
+    glib::spawn_future_local(async move {
+        let Some(pixels) = crate::icon::decode_limited(path.clone(), size).await else {
+            return;
+        };
+        if !icon_is(image.upcast_ref(), token) {
+            return;
+        }
+        let texture = pixels.texture();
+        crate::icon::store_photo(&path, size, &texture);
+        image.set_paintable(Some(&texture));
+    });
+}
+
+fn bump_icon(widget: &gtk::Widget) -> u64 {
+    static TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let token = TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    unsafe { widget.set_data("icon-token", token) };
+    token
+}
+
+fn icon_is(widget: &gtk::Widget, token: u64) -> bool {
+    unsafe { widget.data::<u64>("icon-token") }
+        .is_some_and(|stored| unsafe { *stored.as_ref() } == token)
+}
+
+/// A shortcut tile. The icon is the one the theme gives this file.
+fn shortcut_card(
+    window: &adw::ApplicationWindow,
+    icon: &gio::Icon,
+    label: &str,
+    width: i32,
+    icon_px: i32,
+    list: bool,
+    open: impl Fn() + 'static,
+) -> gtk::Button {
+    let image = theme_image(window, icon, icon_px);
+    let text = gtk::Label::builder()
+        .label(label)
+        .xalign(if list { 0.0 } else { 0.5 })
+        .justify(if list { gtk::Justification::Left } else { gtk::Justification::Center })
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .halign(if list { gtk::Align::Fill } else { gtk::Align::Center })
+        .hexpand(list)
+        .width_chars(if list { -1 } else { 14 })
+        .max_width_chars(if list { -1 } else { 14 })
+        .build();
+    if !list {
+        text.set_margin_top(8);
+    }
+    let card = gtk::Box::builder()
+        .orientation(if list { gtk::Orientation::Horizontal } else { gtk::Orientation::Vertical })
+        .spacing(if list { 12 } else { 0 })
+        .build();
+    card.append(&image);
+    card.append(&text);
+    let button = gtk::Button::builder()
+        .child(&card)
+        .width_request(if list { -1 } else { width })
+        .hexpand(list)
+        .build();
+    button.add_css_class("flat");
+    button.add_css_class("place-card");
+    button.set_tooltip_text(Some(label));
+    unsafe { button.set_data("fs-gicon", icon.clone()) };
+    button.connect_clicked(move |_| open());
+    button
+}
+
+/// Change tile size in place. Zoom must not rebuild the page.
+pub(super) fn rescale_tiles(app: &Rc<super::App>, root: &impl IsA<gtk::Widget>) {
+    let (icon_px, tile_w, drive_icon, drive_w) = pc_scale(app.zoom.get());
+    rescale_widget(
+        root.upcast_ref(),
+        &app.window,
+        icon_px,
+        tile_w,
+        drive_icon,
+        drive_w,
+        app.is_list.get(),
+    );
+}
+
+fn rescale_widget(
+    widget: &gtk::Widget,
+    window: &adw::ApplicationWindow,
+    icon_px: i32,
+    tile_w: i32,
+    drive_icon: i32,
+    drive_w: i32,
+    list: bool,
+) {
+    if let Some(button) = widget.downcast_ref::<gtk::Button>()
+        && (button.has_css_class("place-card") || button.has_css_class("drive-card"))
+    {
+        let drive = button.has_css_class("drive-card");
+        let width = if drive { drive_w } else { tile_w };
+        let px = if drive { drive_icon } else { icon_px };
+        if list {
+            button.set_hexpand(true);
+            button.set_width_request(-1);
+        } else {
+            button.set_hexpand(false);
+            button.set_width_request(width);
+        }
+        if let Some(parent) = button.parent() {
+            if list {
+                parent.set_hexpand(true);
+                parent.set_halign(gtk::Align::Fill);
+                parent.set_size_request(-1, -1);
+            } else {
+                parent.set_size_request(width, -1);
+            }
+        }
+        if let Some(icon) = unsafe { button.data::<gio::Icon>("fs-gicon") }
+            && let Some(image) = first_image(button.upcast_ref())
+        {
+            paint_icon(&image, window, unsafe { icon.as_ref() }, px);
+            if let Some(path) = unsafe { button.data::<PathBuf>("fs-thumb") } {
+                load_file_thumb(&image, unsafe { path.as_ref().clone() }, px * window.scale_factor().max(1));
+            }
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(next) = child {
+        rescale_widget(&next, window, icon_px, tile_w, drive_icon, drive_w, list);
+        child = next.next_sibling();
+    }
+}
+
+fn first_image(widget: &gtk::Widget) -> Option<gtk::Image> {
+    if let Ok(image) = widget.clone().downcast::<gtk::Image>() {
+        return Some(image);
+    }
+    let mut child = widget.first_child();
+    while let Some(next) = child {
+        if let Some(image) = first_image(&next) {
+            return Some(image);
+        }
+        child = next.next_sibling();
+    }
+    None
+}
+
+/// Files this app has opened, newest first. GTK's recent list is the store.
+/// The page shows a handful, so missing files are only checked near the top.
+fn files_we_opened() -> Vec<gtk::RecentInfo> {
+    let Some(name) = glib::application_name() else { return Vec::new() };
+    let mut items: Vec<_> = gtk::RecentManager::default()
+        .items()
+        .into_iter()
+        .filter(|info| info.has_application(&name) && !info.is_private_hint())
+        .collect();
+    items.sort_by_key(|info| std::cmp::Reverse(info.visited().to_unix()));
+    items.truncate(12);
+    items
+}
+
+/// Drop a recent tile if its file is gone. The check runs off the UI thread
+/// because a missing disk can stall `exists` for a long time.
+fn hide_if_missing(button: &gtk::Button, path: std::path::PathBuf) {
+    let button = button.clone();
+    glib::spawn_future_local(async move {
+        let exists = gio::spawn_blocking(move || path.exists()).await.unwrap_or(false);
+        if !exists {
+            button.set_visible(false);
+        }
+    });
+}
+
+/// Icon, label, and path for one XDG user directory, when the desktop defines it.
+fn xdg_place(dir: glib::UserDirectory) -> Option<(&'static str, &'static str, PathBuf)> {
+    use glib::UserDirectory::*;
+    let (icon, label) = match dir {
+        Desktop => ("user-desktop-symbolic", "Desktop"),
+        Documents => ("folder-documents-symbolic", "Documents"),
+        Downloads => ("folder-download-symbolic", "Downloads"),
+        Music => ("folder-music-symbolic", "Music"),
+        Pictures => ("folder-pictures-symbolic", "Pictures"),
+        Videos => ("folder-videos-symbolic", "Videos"),
+        _ => return None,
+    };
+    glib::user_special_dir(dir).map(|path| (icon, label, path))
 }
 
 // --- Trash ------------------------------------------------------------------
@@ -57,86 +471,96 @@ pub(super) fn show_trash(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
     while let Some(child) = box_.first_child() {
         box_.remove(&child);
     }
-    box_.set_margin_top(16);
-    box_.set_margin_bottom(16);
-    box_.set_margin_start(16);
-    box_.set_margin_end(16);
-    box_.set_spacing(12);
+    box_.set_margin_top(18);
+    box_.set_margin_bottom(24);
+    box_.set_margin_start(22);
+    box_.set_margin_end(22);
+    box_.set_spacing(8);
 
     let root = trash::home_trash();
     let entries = trash::entries_in(&root);
 
-    let heading = gtk::Label::builder().label("Trash").xalign(0.0).hexpand(true).build();
-    heading.add_css_class("title-2");
-    let head = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    head.append(&heading);
-    if !entries.is_empty() {
-        let empty_btn = gtk::Button::with_label("Empty Trash");
-        empty_btn.add_css_class("destructive-action");
-        empty_btn.set_valign(gtk::Align::Center);
-        let app = app.clone();
-        let tab = tab.clone();
-        empty_btn.connect_clicked(move |_| confirm_empty_trash(&app, &tab));
-        head.append(&empty_btn);
-    }
-    box_.append(&head);
-
     if entries.is_empty() {
         let page = adw::StatusPage::builder()
-            .icon_name("user-trash-symbolic")
             .title("Trash Is Empty")
             .description("Items you delete land here, and can be put back.")
             .vexpand(true)
             .build();
+        if let Some(paintable) = crate::icon::status_paintable("user-trash-symbolic", 128) {
+            page.set_paintable(Some(&paintable));
+        }
         box_.append(&page);
     } else {
-        let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
-        list.add_css_class("boxed-list");
+        let (icon_px, tile_w, _, _) = pc_scale(app.zoom.get());
+        let list = app.is_list.get();
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        bar.set_halign(gtk::Align::End);
+        bar.set_margin_bottom(8);
+        let empty_btn = gtk::Button::with_label("Empty Trash");
+        empty_btn.add_css_class("destructive-action");
+        let app_btn = app.clone();
+        let tab_btn = tab.clone();
+        empty_btn.connect_clicked(move |_| confirm_empty_trash(&app_btn, &tab_btn));
+        bar.append(&empty_btn);
+        box_.append(&bar);
+
+        let flow = tile_row(list);
+        let scale = app.window.scale_factor().max(1);
         for entry in entries {
-            list.append(&trash_entry_row(app, tab, &root, entry));
+            let stored = gio::File::for_path(root.join("files").join(&entry.name));
+            let (icon, is_image) = file_face(&stored);
+            let label = entry
+                .original
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.name.clone());
+            let from = entry
+                .original
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.original.display().to_string());
+            let when = entry.deleted.as_deref().and_then(|stamp| stamp.split('T').next()).unwrap_or("");
+            let tip = if when.is_empty() {
+                format!("From {from}. Click to put it back.")
+            } else {
+                format!("From {from} · {when}. Click to put it back.")
+            };
+            let app_tile = app.clone();
+            let tab_tile = tab.clone();
+            let root_tile = root.clone();
+            let entry_tile = entry.clone();
+            let window = app.window.clone();
+            let card = shortcut_card(&window, &icon, &label, tile_w, icon_px, list, move || {
+                match trash::restore_in(&root_tile, &entry_tile) {
+                    Ok(path) => {
+                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        super::toast(&app_tile, &format!("Restored “{name}”"));
+                        super::commands::refresh_all(&app_tile);
+                        show_trash(&app_tile, &tab_tile);
+                    }
+                    Err(err) => super::toast(&app_tile, &format!("Couldn't restore: {err}")),
+                }
+            });
+            card.set_tooltip_text(Some(&tip));
+            if is_image && let Some(path) = stored.path() {
+                unsafe { card.set_data("fs-thumb", path.clone()) };
+                if let Some(image) = first_image(card.upcast_ref()) {
+                    load_file_thumb(&image, path, icon_px * scale);
+                }
+            }
+            insert_tile(&flow, &card, tile_w, list);
         }
-        box_.append(&list);
+        box_.append(&flow);
     }
 
     if let Some(page) = tab.page.borrow().as_ref() {
         page.set_title("Trash");
     }
     tab.view_stack.set_visible_child_name("trash");
+    super::navigation::set_path_visible(tab, false);
+    sync_sidebar(app);
     super::update_chrome(app);
-}
-
-/// One row in the Trash view: name, where it came from, and Restore.
-fn trash_entry_row(
-    app: &Rc<super::App>,
-    tab: &Rc<super::Tab>,
-    root: &Path,
-    entry: trash::Entry,
-) -> adw::ActionRow {
-    let subtitle = match &entry.deleted {
-        Some(when) => format!("{} · deleted {}", entry.original.display(), when.replace('T', " ")),
-        None => entry.original.display().to_string(),
-    };
-    let row = adw::ActionRow::builder().title(&entry.name).subtitle(&subtitle).build();
-    row.add_prefix(&gtk::Image::from_icon_name("user-trash-symbolic"));
-
-    let restore = gtk::Button::with_label("Restore");
-    restore.set_valign(gtk::Align::Center);
-    {
-        let app = app.clone();
-        let tab = tab.clone();
-        let root = root.to_path_buf();
-        restore.connect_clicked(move |_| match trash::restore_in(&root, &entry) {
-            Ok(path) => {
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                super::toast(&app, &format!("Restored “{name}”"));
-                super::commands::refresh_all(&app);
-                show_trash(&app, &tab);
-            }
-            Err(err) => super::toast(&app, &format!("Couldn't restore: {err}")),
-        });
-    }
-    row.add_suffix(&restore);
-    row
 }
 
 /// Confirm, then permanently empty the Trash.
@@ -273,16 +697,21 @@ fn demo_drives() -> Vec<DriveItem> {
 /// One drive tile. A mounted drive shows its capacity ("X free of Y") and opens
 /// on click; an unmounted volume shows a "Not mounted" hint and mounts (then
 /// opens) on click.
-fn drive_card(app: &Rc<super::App>, tab: &Rc<super::Tab>, item: &DriveItem) -> gtk::Widget {
+fn drive_card(
+    app: &Rc<super::App>,
+    tab: &Rc<super::Tab>,
+    item: &DriveItem,
+    width: i32,
+    icon_px: i32,
+    list: bool,
+) -> gtk::Widget {
     let (label, icon) = match item {
         DriveItem::Mounted { name, icon, .. } => (name.as_str(), icon),
         DriveItem::Unmounted { name, icon, .. } => (name.as_str(), icon),
     };
 
-    let image = gtk::Image::from_gicon(icon);
-    image.set_pixel_size(32);
+    let image = theme_image(&app.window, icon, icon_px);
     let name = gtk::Label::builder().label(label).xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
-    name.add_css_class("heading");
     let head = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     head.append(&image);
     head.append(&name);
@@ -320,14 +749,18 @@ fn drive_card(app: &Rc<super::App>, tab: &Rc<super::Tab>, item: &DriveItem) -> g
     }
 
     let card = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).build();
-    card.add_css_class("drive-card");
-    card.add_css_class("card");
     card.append(&head);
     card.append(&bar);
     card.append(&caption);
 
-    let button = gtk::Button::builder().child(&card).build();
+    let button = gtk::Button::builder()
+        .child(&card)
+        .width_request(if list { -1 } else { width })
+        .hexpand(list)
+        .build();
     button.add_css_class("flat");
+    button.add_css_class("drive-card");
+    unsafe { button.set_data("fs-gicon", icon.clone()) };
     {
         let app = app.clone();
         let tab = tab.clone();
@@ -503,18 +936,10 @@ pub(super) fn populate_sidebar(app: &Rc<super::App>) {
 
     // Places.
     use glib::UserDirectory::*;
-    let mut places: Vec<(&str, String, PathBuf)> =
-        vec![("user-home-symbolic", "Home".into(), glib::home_dir())];
-    for (icon, label, dir) in [
-        ("user-desktop-symbolic", "Desktop", Desktop),
-        ("folder-documents-symbolic", "Documents", Documents),
-        ("folder-download-symbolic", "Downloads", Downloads),
-        ("folder-music-symbolic", "Music", Music),
-        ("folder-pictures-symbolic", "Pictures", Pictures),
-        ("folder-videos-symbolic", "Videos", Videos),
-    ] {
-        if let Some(path) = glib::user_special_dir(dir) {
-            places.push((icon, label.into(), path));
+    let mut places = vec![("user-home-symbolic", "Home", glib::home_dir())];
+    for dir in [Desktop, Documents, Downloads, Music, Pictures, Videos] {
+        if let Some(place) = xdg_place(dir) {
+            places.push(place);
         }
     }
     for (icon, label, path) in places {
@@ -549,6 +974,7 @@ pub(super) fn populate_sidebar(app: &Rc<super::App>) {
             list.append(&bookmark_row(app, &name, path));
         }
     }
+    sync_sidebar(app);
 }
 
 fn section_header(text: &str) -> gtk::ListBoxRow {
@@ -562,7 +988,7 @@ fn section_header(text: &str) -> gtk::ListBoxRow {
 }
 
 fn place_row(icon: &str, label: &str, path: Option<PathBuf>, computer: bool) -> gtk::ListBoxRow {
-    let image = gtk::Image::from_icon_name(icon);
+    let image = crate::icon::image_named(icon, 16);
     let text = gtk::Label::builder().label(label).xalign(0.0).hexpand(true).build();
     let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).build();
     row_box.set_margin_top(6);
@@ -588,7 +1014,7 @@ fn device_row(app: &Rc<super::App>, item: DriveItem) -> gtk::ListBoxRow {
         DriveItem::Mounted { name, icon, .. } => (name.clone(), icon.clone()),
         DriveItem::Unmounted { name, icon, .. } => (name.clone(), icon.clone()),
     };
-    let image = gtk::Image::from_gicon(&icon);
+    let image = crate::icon::image_gicon(&icon, 16);
     let text = gtk::Label::builder()
         .label(&label)
         .xalign(0.0)
@@ -612,10 +1038,7 @@ fn device_row(app: &Rc<super::App>, item: DriveItem) -> gtk::ListBoxRow {
             // Real volumes get an eject/unmount button; the root does not.
             if let Some(mount) = mount {
                 text.set_tooltip_text(None);
-                let eject = gtk::Button::builder()
-                    .icon_name("media-eject-symbolic")
-                    .tooltip_text("Unmount")
-                    .build();
+                let eject = crate::icon::flat_button("media-eject-symbolic", "Unmount");
                 eject.add_css_class("flat");
                 eject.add_css_class("bookmark-remove");
                 let app = app.clone();
@@ -632,9 +1055,9 @@ fn device_row(app: &Rc<super::App>, item: DriveItem) -> gtk::ListBoxRow {
 }
 
 fn bookmark_row(app: &Rc<super::App>, label: &str, path: PathBuf) -> gtk::ListBoxRow {
-    let image = gtk::Image::from_icon_name("folder-symbolic");
+    let image = crate::icon::image_named("folder-symbolic", 16);
     let text = gtk::Label::builder().label(label).xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
-    let remove = gtk::Button::builder().icon_name("window-close-symbolic").tooltip_text("Remove bookmark").build();
+    let remove = crate::icon::flat_button("window-close-symbolic", "Remove bookmark");
     remove.add_css_class("flat");
     remove.add_css_class("bookmark-remove");
     remove.add_css_class("bookmark-x");

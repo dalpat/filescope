@@ -25,12 +25,36 @@ const CSS: &str = "
 .fs-drop { background: alpha(@accent_bg_color, 0.35); border-radius: 8px; outline: 2px solid @accent_color; outline-offset: -2px; }
 .fs-name { margin-top: 4px; }
 .fs-hidden { opacity: 0.45; }
-columnview > listview > row { border-radius: 8px; }
+columnview > header > button { padding: 2px 12px 8px; min-height: 0; }
+columnview > listview > row { border-radius: 8px; margin: 1px 8px; }
+columnview > listview > row:hover { background: alpha(@window_fg_color, 0.06); }
+columnview > listview > row:selected,
+columnview > listview > row:selected:hover { background: alpha(@accent_bg_color, 0.22); }
+columnview > listview > row > cell { padding: 3px 10px; }
 .crumbs button { padding: 3px 8px; min-height: 0; }
 .crumbs button.current { font-weight: bold; }
-.drive-card { padding: 14px; border-radius: 12px; }
+button.place-card, button.drive-card {
+  background: @card_bg_color;
+  box-shadow: none;
+  border: 1px solid alpha(@window_fg_color, 0.08);
+  border-radius: 12px;
+  font-weight: normal;
+}
+button.place-card { padding: 16px 10px 12px; }
+button.drive-card { padding: 14px 16px; }
+button.place-card:hover, button.drive-card:hover {
+  background: alpha(@window_fg_color, 0.04);
+  box-shadow: none;
+}
+flowbox.pc-tiles > flowboxchild,
+flowbox.pc-tiles > flowboxchild:hover {
+  background: none;
+  box-shadow: none;
+  padding: 0;
+}
 .drive-bar { min-height: 8px; }
 .drive-bar > trough, .drive-bar > trough > progress { min-height: 8px; border-radius: 8px; }
+expander.pc-section > title { font-size: 13px; font-weight: normal; color: alpha(@window_fg_color, 0.55); padding: 2px 2px 12px; }
 .bookmark-remove { min-height: 0; min-width: 0; padding: 2px; }
 .bookmark-x { opacity: 0; transition: opacity 120ms; }
 row:hover .bookmark-x,
@@ -51,6 +75,13 @@ const ZOOM_STEP: i32 = 16;
 const GNOME_COPIED: &str = "x-special/gnome-copied-files";
 const URI_LIST: &str = "text/uri-list";
 
+/// A step in a tab's back/forward history. This PC is not a folder.
+pub(super) enum Place {
+    Folder(gio::File),
+    Computer,
+    Trash,
+}
+
 /// One folder tab: its own listing, views, history, and breadcrumb.
 struct Tab {
     page: RefCell<Option<adw::TabPage>>,
@@ -65,8 +96,11 @@ struct Tab {
     trash_box: gtk::Box,
     search_bar: gtk::SearchBar,
     search_entry: gtk::SearchEntry,
-    back: RefCell<Vec<gio::File>>,
-    fwd: RefCell<Vec<gio::File>>,
+    back: RefCell<Vec<Place>>,
+    fwd: RefCell<Vec<Place>>,
+    /// Zoom last applied to each folder view. The hidden one stays stale until shown.
+    grid_zoom: Cell<i32>,
+    list_zoom: Cell<i32>,
 }
 
 /// The whole window and its shared state.
@@ -82,6 +116,9 @@ struct App {
     tabs: RefCell<Vec<Rc<Tab>>>,
     /// Grid icon size in pixels (list scales from it); shared view mode.
     zoom: Cell<i32>,
+    /// A zoom is already waiting for the next frame, so more wheel ticks only
+    /// update `zoom` and do not rebuild again.
+    zoom_queued: Cell<bool>,
     is_list: Cell<bool>,
     show_hidden: Rc<Cell<bool>>,
     bookmarks: RefCell<Vec<PathBuf>>,
@@ -169,23 +206,30 @@ fn open_gfile(state: &Rc<App>, file: &gio::File) {
 fn build(app: &adw::Application) {
     install_css();
 
-    let back_btn = flat_icon("go-previous-symbolic", "Back (Alt+Left)");
-    let fwd_btn = flat_icon("go-next-symbolic", "Forward (Alt+Right)");
-    let up_btn = flat_icon("go-up-symbolic", "Up (Alt+Up)");
-    let sidebar_toggle =
-        gtk::ToggleButton::builder().icon_name("sidebar-show-symbolic").active(true).tooltip_text("Toggle sidebar").build();
+    let back_btn = crate::icon::flat_button("go-previous-symbolic", "Back (Alt+Left)");
+    let fwd_btn = crate::icon::flat_button("go-next-symbolic", "Forward (Alt+Right)");
+    let up_btn = crate::icon::flat_button("go-up-symbolic", "Up (Alt+Up)");
+    let sidebar_toggle = gtk::ToggleButton::builder()
+        .child(&crate::icon::image_named("sidebar-show-symbolic", 16))
+        .active(true)
+        .tooltip_text("Toggle sidebar")
+        .build();
     sidebar_toggle.add_css_class("flat");
-    let new_tab_btn = flat_icon("tab-new-symbolic", "New tab (Ctrl+T)");
-    let view_toggle =
-        gtk::ToggleButton::builder().icon_name("view-list-symbolic").tooltip_text("List view").build();
+    let new_tab_btn = crate::icon::flat_button("tab-new-symbolic", "New tab (Ctrl+T)");
+    let view_toggle = gtk::ToggleButton::builder()
+        .child(&crate::icon::image_named("view-list-symbolic", 16))
+        .tooltip_text("List view")
+        .build();
     view_toggle.add_css_class("flat");
-    let sort_btn =
-        gtk::MenuButton::builder().icon_name("view-sort-ascending-symbolic").tooltip_text("Sort by").build();
+    let sort_btn = gtk::MenuButton::builder()
+        .child(&crate::icon::image_named("view-sort-ascending-symbolic", 16))
+        .tooltip_text("Sort by")
+        .build();
     sort_btn.add_css_class("flat");
     sort_btn.set_menu_model(Some(&sort_menu()));
-    let zoom_out = flat_icon("zoom-out-symbolic", "Zoom out (Ctrl+-)");
-    let zoom_in = flat_icon("zoom-in-symbolic", "Zoom in (Ctrl++)");
-    let menu_btn = gtk::MenuButton::builder().icon_name("open-menu-symbolic").build();
+    let zoom_out = crate::icon::flat_button("zoom-out-symbolic", "Zoom out (Ctrl+-)");
+    let zoom_in = crate::icon::flat_button("zoom-in-symbolic", "Zoom in (Ctrl++)");
+    let menu_btn = gtk::MenuButton::builder().child(&crate::icon::image_named("open-menu-symbolic", 16)).build();
     menu_btn.set_menu_model(Some(&primary_menu()));
 
     let header = adw::HeaderBar::new();
@@ -275,6 +319,7 @@ fn build(app: &adw::Application) {
         status,
         tabs: RefCell::new(Vec::new()),
         zoom: Cell::new(cfg.zoom),
+        zoom_queued: Cell::new(false),
         is_list: Cell::new(cfg.is_list),
         show_hidden: Rc::new(Cell::new(cfg.show_hidden)),
         bookmarks: RefCell::new(bookmarks::load()),
@@ -360,10 +405,20 @@ fn build(app: &adw::Application) {
         view_toggle.connect_toggled(move |b| {
             let list = b.is_active();
             s.is_list.set(list);
-            b.set_icon_name(if list { "view-grid-symbolic" } else { "view-list-symbolic" });
+            if let Some(image) = b.child().and_downcast::<gtk::Image>() {
+                crate::icon::set_named(
+                    &image,
+                    if list { "view-grid-symbolic" } else { "view-list-symbolic" },
+                    16,
+                );
+            }
             b.set_tooltip_text(Some(if list { "Grid view" } else { "List view" }));
             for t in s.tabs.borrow().iter() {
-                navigation::refresh_view_mode(&s, t, false);
+                match t.view_stack.visible_child_name().as_deref() {
+                    Some("computer") => places::show_computer(&s, t),
+                    Some("trash") => places::show_trash(&s, t),
+                    _ => navigation::refresh_view_mode(&s, t, false),
+                }
             }
         });
     }
@@ -376,13 +431,31 @@ fn build(app: &adw::Application) {
         zoom_out.connect_clicked(move |_| zoom(&s, -ZOOM_STEP));
     }
     {
+        // Explorer zooms with Ctrl+wheel. Plain scrolling still moves the page.
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let s = state.clone();
+        scroll.connect_scroll(move |controller, _, dy| {
+            if !controller.current_event_state().contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+                return glib::Propagation::Proceed;
+            }
+            if dy < 0.0 {
+                zoom(&s, ZOOM_STEP);
+            } else if dy > 0.0 {
+                zoom(&s, -ZOOM_STEP);
+            }
+            glib::Propagation::Stop
+        });
+        state.window.add_controller(scroll);
+    }
+    {
         let s = state.clone();
         sidebar_list.connect_row_activated(move |_, row| {
             let t = navigation::active_tab(&s);
             if unsafe { row.data::<bool>("computer") }.is_some() {
                 places::show_computer(&s, &t);
             } else if unsafe { row.data::<bool>("trash") }.is_some() {
-                places::show_trash(&s, &t);
+                navigation::go_trash(&s, &t);
             } else if let Some(volume) = unsafe { row.data::<gio::Volume>("volume") } {
                 places::mount_and_open(&s, &t, unsafe { volume.as_ref() });
             } else if let Some(path) = unsafe { row.data::<PathBuf>("path") } {
@@ -478,16 +551,48 @@ fn zoom(app: &Rc<App>, delta: i32) {
         return;
     }
     app.zoom.set(new);
-    for tab in app.tabs.borrow().iter() {
-        tab.grid_view.set_factory(Some(&view::grid_factory(new)));
-        view::fill_columns(&tab.column_view, view::list_icon(new));
-        if let Some(sorter) = tab.column_view.sorter()
-            && let Some(sm) = tab.selection.model().and_downcast::<gtk::SortListModel>()
-        {
-            sm.set_sorter(Some(&view::with_hidden_last(&sorter)));
+    // A wheel flick is many events. Apply the latest size once, on the next frame.
+    if app.zoom_queued.replace(true) {
+        return;
+    }
+    let app = app.clone();
+    glib::idle_add_local_once(move || {
+        app.zoom_queued.set(false);
+        let tabs: Vec<_> = app.tabs.borrow().iter().cloned().collect();
+        for tab in tabs {
+            apply_visible_zoom(&app, &tab);
         }
-        // Rebuilding the columns clears the active sort column; restore it.
-        apply_sort_to(app, tab);
+    });
+}
+
+/// Resize only the view the tab is actually showing.
+fn apply_visible_zoom(app: &Rc<App>, tab: &Rc<Tab>) {
+    let zoom = app.zoom.get();
+    match tab.view_stack.visible_child_name().as_deref() {
+        Some("list") => {
+            if tab.list_zoom.get() == zoom {
+                return;
+            }
+            // Stamp first. Rebuilding the columns notifies the model, which
+            // asks for this zoom again. An unstamped view rebuilds forever.
+            tab.list_zoom.set(zoom);
+            view::fill_columns(tab, &tab.column_view, view::list_icon(zoom));
+            if let Some(sorter) = tab.column_view.sorter()
+                && let Some(sm) = tab.selection.model().and_downcast::<gtk::SortListModel>()
+            {
+                sm.set_sorter(Some(&view::with_hidden_last(&sorter)));
+            }
+            apply_sort_to(app, tab);
+        }
+        Some("computer") => places::rescale_tiles(app, &tab.computer_box),
+        Some("trash") => places::rescale_tiles(app, &tab.trash_box),
+        _ => {
+            if tab.grid_zoom.get() == zoom {
+                return;
+            }
+            tab.grid_zoom.set(zoom);
+            tab.grid_view.set_factory(Some(&view::grid_factory(tab, zoom)));
+        }
     }
 }
 
@@ -904,12 +1009,6 @@ fn install_css() {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     }
-}
-
-fn flat_icon(icon: &str, tooltip: &str) -> gtk::Button {
-    let b = gtk::Button::builder().icon_name(icon).tooltip_text(tooltip).build();
-    b.add_css_class("flat");
-    b
 }
 
 fn toast(app: &Rc<App>, message: &str) {

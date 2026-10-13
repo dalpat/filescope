@@ -11,9 +11,18 @@ use gtk::{gdk, gio, glib};
 
 use crate::{fileops, format, ops, undo};
 
+/// Name size follows the icon, the way a folder zoom does in Explorer.
+fn name_font(icon_px: i32) -> gtk::pango::AttrList {
+    let points = (icon_px as f32 / 6.0).clamp(11.0, 18.0);
+    let desc = gtk::pango::FontDescription::from_string(&format!("{points}pt"));
+    let attrs = gtk::pango::AttrList::new();
+    attrs.insert(gtk::pango::AttrFontDesc::new(&desc));
+    attrs
+}
+
 /// List-view icon size derived from the grid zoom.
 pub(super) fn list_icon(grid_size: i32) -> i32 {
-    (grid_size / 4).clamp(16, 40)
+    (grid_size / 3).clamp(22, 32)
 }
 pub(super) fn attach_context_menu(app: &Rc<super::App>, widget: &impl IsA<gtk::Widget>) {
     let gesture = gtk::GestureClick::new();
@@ -148,11 +157,15 @@ fn selection_modified(state: gdk::ModifierType) -> bool {
         || state.contains(gdk::ModifierType::SUPER_MASK)
 }
 
-/// Make a view draggable: dragging exports the current selection as a URI list,
-/// so it can be dropped into another tab, another folder, or another app. Both
-/// copy and move are offered (Ctrl forces copy, Shift forces move).
-pub(super) fn attach_drag_source(tab: &Rc<super::Tab>, view: &impl IsA<gtk::Widget>) {
+/// Drag a file to move or copy it. The source sits on the item, not the view,
+/// so a drag that starts on empty space is left for the view's rubber band.
+///
+/// GTK also starts that rubber band on an item press, which then steals the
+/// file drag. Turn it off while the pointer is down on an item.
+/// https://gitlab.gnome.org/GNOME/gtk/-/issues/5670
+fn attach_item_drag(tab: &Rc<super::Tab>, view: &gtk::Widget, cell: &impl IsA<gtk::Widget>) {
     let source = gtk::DragSource::new();
+    source.set_propagation_phase(gtk::PropagationPhase::Capture);
     source.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE);
     let tab = tab.clone();
     source.connect_prepare(move |_, _, _| {
@@ -164,7 +177,26 @@ pub(super) fn attach_drag_source(tab: &Rc<super::Tab>, view: &impl IsA<gtk::Widg
         let bytes = glib::Bytes::from(format!("{}\r\n", uris.join("\r\n")).as_bytes());
         Some(gdk::ContentProvider::for_bytes(super::URI_LIST, &bytes))
     });
-    view.add_controller(source);
+    cell.add_controller(source);
+
+    let click = gtk::GestureClick::new();
+    click.set_button(gdk::BUTTON_PRIMARY);
+    click.set_propagation_phase(gtk::PropagationPhase::Bubble);
+    let down = view.clone();
+    click.connect_pressed(move |_, _, _, _| set_rubberband(&down, false));
+    let up = view.clone();
+    click.connect_released(move |_, _, _, _| set_rubberband(&up, true));
+    let stop = view.clone();
+    click.connect_stopped(move |_| set_rubberband(&stop, true));
+    cell.add_controller(click);
+}
+
+fn set_rubberband(view: &gtk::Widget, on: bool) {
+    if let Some(grid) = view.downcast_ref::<gtk::GridView>() {
+        grid.set_enable_rubberband(on);
+    } else if let Some(column) = view.downcast_ref::<gtk::ColumnView>() {
+        column.set_enable_rubberband(on);
+    }
 }
 
 /// Accept files dropped onto a view. A drop onto a folder goes *into* that folder;
@@ -511,25 +543,30 @@ fn commit_inline_rename(app: &Rc<super::App>, file: &gio::File, old: &str, new: 
 // --- Views ------------------------------------------------------------------
 
 /// Rebuild `column_view`'s columns with the given leading-icon size.
-pub(super) fn fill_columns(column_view: &gtk::ColumnView, icon_size: i32) {
+pub(super) fn fill_columns(tab: &Rc<super::Tab>, column_view: &gtk::ColumnView, icon_size: i32) {
     while let Some(col) = column_view.columns().item(0).and_downcast::<gtk::ColumnViewColumn>() {
         column_view.remove_column(&col);
     }
-    column_view.append_column(&name_column(icon_size));
-    column_view.append_column(&size_column());
-    column_view.append_column(&modified_column());
+    column_view.append_column(&name_column(tab, column_view, icon_size));
+    column_view.append_column(&size_column(tab, column_view));
+    column_view.append_column(&modified_column(tab, column_view));
 }
 
-fn name_column(icon_size: i32) -> gtk::ColumnViewColumn {
+fn name_column(tab: &Rc<super::Tab>, view: &gtk::ColumnView, icon_size: i32) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
+    let tab = tab.clone();
+    let view = view.clone().upcast::<gtk::Widget>();
+    factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let image = gtk::Image::new();
         let label =
             gtk::Label::builder().xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        label.set_attributes(Some(&name_font(icon_size)));
         let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(10).build();
+        row.set_valign(gtk::Align::Center);
         row.append(&image);
         row.append(&name_stack(&label));
+        attach_item_drag(&tab, &view, &row);
         item.set_child(Some(&row));
     });
     factory.connect_bind(move |_, item| {
@@ -557,12 +594,15 @@ fn name_column(icon_size: i32) -> gtk::ColumnViewColumn {
     col
 }
 
-fn size_column() -> gtk::ColumnViewColumn {
+fn size_column(tab: &Rc<super::Tab>, view: &gtk::ColumnView) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
+    let tab = tab.clone();
+    let view = view.clone().upcast::<gtk::Widget>();
+    factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let label = gtk::Label::builder().xalign(1.0).build();
         label.add_css_class("numeric");
+        attach_item_drag(&tab, &view, &label);
         item.set_child(Some(&label));
     });
     factory.connect_bind(|_, item| {
@@ -570,23 +610,30 @@ fn size_column() -> gtk::ColumnViewColumn {
         let info = item.item().and_downcast::<gio::FileInfo>().unwrap();
         let label = item.child().and_downcast::<gtk::Label>().unwrap();
         if info.file_type() == gio::FileType::Directory {
-            label.set_label("");
+            label.set_label("—");
+            label.add_css_class("dim-label");
         } else {
             label.set_label(&format::human_size(info.size().max(0) as u64));
+            label.remove_css_class("dim-label");
         }
         tag_position(&label, item.position());
         mark_hidden(&label, &info);
     });
     let col = gtk::ColumnViewColumn::builder().title("Size").factory(&factory).resizable(true).build();
+    col.set_fixed_width(96);
     col.set_sorter(Some(&info_sorter(|a, b| a.size().cmp(&b.size()))));
     col
 }
 
-fn modified_column() -> gtk::ColumnViewColumn {
+fn modified_column(tab: &Rc<super::Tab>, view: &gtk::ColumnView) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
+    let tab = tab.clone();
+    let view = view.clone().upcast::<gtk::Widget>();
+    factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        item.set_child(Some(&gtk::Label::builder().xalign(0.0).build()));
+        let label = gtk::Label::builder().xalign(0.0).build();
+        attach_item_drag(&tab, &view, &label);
+        item.set_child(Some(&label));
     });
     factory.connect_bind(|_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -601,6 +648,7 @@ fn modified_column() -> gtk::ColumnViewColumn {
     });
     let col =
         gtk::ColumnViewColumn::builder().title("Modified").factory(&factory).resizable(true).build();
+    col.set_fixed_width(168);
     col.set_sorter(Some(&info_sorter(|a, b| {
         let key = |i: &gio::FileInfo| i.modification_date_time().map(|d| d.to_unix()).unwrap_or(0);
         key(a).cmp(&key(b))
@@ -608,8 +656,10 @@ fn modified_column() -> gtk::ColumnViewColumn {
     col
 }
 
-pub(super) fn grid_factory(size: i32) -> gtk::SignalListItemFactory {
+pub(super) fn grid_factory(tab: &Rc<super::Tab>, size: i32) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
+    let tab = tab.clone();
+    let view = tab.grid_view.clone().upcast::<gtk::Widget>();
     factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let image = gtk::Image::builder().pixel_size(size).build();
@@ -628,11 +678,13 @@ pub(super) fn grid_factory(size: i32) -> gtk::SignalListItemFactory {
             .max_width_chars((size / 6).max(8))
             .width_chars((size / 8).max(6))
             .build();
+        label.set_attributes(Some(&name_font(size)));
         label.add_css_class("fs-name");
         let cell = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
         cell.set_halign(gtk::Align::Center);
         cell.append(&image);
         cell.append(&name_stack(&label));
+        attach_item_drag(&tab, &view, &cell);
         item.set_child(Some(&cell));
     });
     factory.connect_bind(move |_, item| {
@@ -655,10 +707,14 @@ pub(super) fn grid_factory(size: i32) -> gtk::SignalListItemFactory {
 }
 
 fn set_themed_icon(image: &gtk::Image, info: &gio::FileInfo) {
-    if let Some(icon) = info.icon() {
-        image.set_from_gicon(&icon);
-    } else {
-        image.set_icon_name(Some("text-x-generic"));
+    // A live icon redraws every frame. Photos replace this with a thumbnail;
+    // videos never do, so the still texture has to be set here or a folder of
+    // them keeps a core busy.
+    let Some(icon) = info.icon() else { return };
+    let size = image.pixel_size().max(16);
+    let scale = image.scale_factor().max(1);
+    if let Some(texture) = crate::icon::still_icon(&gtk::prelude::WidgetExt::display(image), scale, &icon, size) {
+        image.set_paintable(Some(&texture));
     }
 }
 
@@ -672,8 +728,8 @@ fn set_themed_icon(image: &gtk::Image, info: &gio::FileInfo) {
 fn set_thumbnail(image: &gtk::Image, info: &gio::FileInfo, size: i32) {
     static THUMB_GEN: AtomicU64 = AtomicU64::new(0);
 
-    let is_image = info.content_type().map(|c| c.starts_with("image/")).unwrap_or(false);
-    if !is_image {
+    let kind = info.content_type().unwrap_or_default();
+    if !crate::icon::is_photo(&kind, info.size()) {
         return;
     }
     let Some(file) = info.attribute_object("standard::file").and_downcast::<gio::File>() else {
@@ -683,11 +739,14 @@ fn set_thumbnail(image: &gtk::Image, info: &gio::FileInfo, size: i32) {
 
     let token = THUMB_GEN.fetch_add(1, AtomicOrdering::Relaxed) + 1;
     unsafe { image.set_data("thumb-token", token) };
+    if let Some(texture) = crate::icon::cached_photo(&path, size) {
+        image.set_paintable(Some(&texture));
+        return;
+    }
 
     let image = image.clone();
     glib::spawn_future_local(async move {
-        let decoded = gio::spawn_blocking(move || decode_thumbnail(&path, size)).await;
-        let Ok(Some((width, height, stride, has_alpha, pixels))) = decoded else {
+        let Some(pixels) = crate::icon::decode_limited(path.clone(), size).await else {
             return;
         };
         // Only apply if this widget is still showing the file we decoded for.
@@ -695,20 +754,10 @@ fn set_thumbnail(image: &gtk::Image, info: &gio::FileInfo, size: i32) {
         if current.map(|p| unsafe { *p.as_ref() }) != Some(token) {
             return;
         }
-        let bytes = glib::Bytes::from_owned(pixels);
-        let format =
-            if has_alpha { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
-        let texture = gdk::MemoryTexture::new(width, height, format, &bytes, stride as usize);
+        let texture = pixels.texture();
+        crate::icon::store_photo(&path, size, &texture);
         image.set_paintable(Some(&texture));
     });
-}
-
-/// Decode and scale an image to raw RGBA(/RGB) bytes off the main thread.
-/// Returns `(width, height, stride, has_alpha, pixels)`.
-fn decode_thumbnail(path: &std::path::Path, size: i32) -> Option<(i32, i32, i32, bool, Vec<u8>)> {
-    let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, size, size, true).ok()?;
-    let pixels = pixbuf.read_pixel_bytes().to_vec();
-    Some((pixbuf.width(), pixbuf.height(), pixbuf.rowstride(), pixbuf.has_alpha(), pixels))
 }
 
 // --- Small helpers ----------------------------------------------------------

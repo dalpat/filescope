@@ -112,11 +112,30 @@ pub(super) fn toggle_preview(app: &Rc<super::App>) {
 }
 
 pub(super) fn launch(app: &Rc<super::App>, file: &gio::File) {
+    // GTK's recent list, tagged with this app, so This PC can show what we opened.
+    gtk::RecentManager::default().add_item(&file.uri());
+    // A default handler opens the file directly. The chooser is only for a type
+    // nothing is registered to handle. FileLauncher asks every time on its own.
+    let content_type = file
+        .query_info("standard::content-type", gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
+        .ok()
+        .and_then(|info| info.content_type().map(|kind| kind.to_string()));
+    if let Some(kind) = content_type.as_deref()
+        && let Some(handler) = gio::AppInfo::default_for_type(kind, false)
+    {
+        if let Err(err) = handler.launch(&[file.clone()], None::<&gio::AppLaunchContext>) {
+            super::toast(app, &format!("Couldn't open: {err}"));
+        }
+        return;
+    }
     let launcher = gtk::FileLauncher::new(Some(file));
+    launcher.set_always_ask(true);
     let app = app.clone();
     launcher.launch(Some(&app.window.clone()), gio::Cancellable::NONE, move |res| {
         if let Err(err) = res {
-            super::toast(&app, &format!("Couldn't open: {err}"));
+            if !err.matches(gtk::DialogError::Dismissed) {
+                super::toast(&app, &format!("Couldn't open: {err}"));
+            }
         }
     });
 }
@@ -286,9 +305,7 @@ pub(super) fn run_tool(
         .build();
     label.add_css_class("caption");
     let bar = gtk::ProgressBar::builder().hexpand(true).valign(gtk::Align::Center).build();
-    let stop = gtk::Button::from_icon_name("process-stop-symbolic");
-    stop.add_css_class("flat");
-    stop.set_tooltip_text(Some("Cancel"));
+    let stop = crate::icon::flat_button("process-stop-symbolic", "Cancel");
     let bar_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     bar_row.append(&bar);
     bar_row.append(&stop);
@@ -555,9 +572,7 @@ pub(super) fn start_job(app: &Rc<super::App>, kind: ops::Kind, sources: Vec<Path
     title.add_css_class("caption");
     title.set_label(&format!("{verb}…"));
     let bar = gtk::ProgressBar::builder().hexpand(true).valign(gtk::Align::Center).build();
-    let stop = gtk::Button::from_icon_name("process-stop-symbolic");
-    stop.add_css_class("flat");
-    stop.set_tooltip_text(Some("Cancel"));
+    let stop = crate::icon::flat_button("process-stop-symbolic", "Cancel");
     {
         let cancel = cancel.clone();
         stop.connect_clicked(move |_| cancel.store(true, AtomicOrdering::Relaxed));
@@ -854,7 +869,10 @@ pub(super) fn show_properties(app: &Rc<super::App>) {
     // Identity header.
     let image = gtk::Image::builder().pixel_size(48).build();
     if let Some(icon) = info.icon() {
-        image.set_from_gicon(&icon);
+        let display = gtk::prelude::WidgetExt::display(&app.window);
+        if let Some(texture) = crate::icon::still_icon(&display, app.window.scale_factor(), &icon, 48) {
+            image.set_paintable(Some(&texture));
+        }
     }
     let title = gtk::Label::builder()
         .label(&name)
@@ -919,7 +937,43 @@ pub(super) fn show_properties(app: &Rc<super::App>) {
     if let Some(group) = info.attribute_string("owner::group") {
         perms.add(&prop_row("Group", &group));
     }
-    perms.add(&prop_row("Access", &super::permission_string(info.attribute_uint32("unix::mode"))));
+    let mode = info.attribute_uint32("unix::mode");
+    let access = prop_row("Access", &super::permission_string(mode));
+    perms.add(&access);
+    if !is_dir && mode != 0 {
+        let row = adw::ActionRow::builder().title("Allow executing file as a program").build();
+        let switch = gtk::Switch::builder()
+            .active(mode & 0o100 != 0)
+            .valign(gtk::Align::Center)
+            .build();
+        row.add_suffix(&switch);
+        row.set_activatable_widget(Some(&switch));
+        let file = file.clone();
+        let app_switch = app.clone();
+        switch.connect_state_set(move |_, on| {
+            let current = file
+                .query_info("unix::mode", gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
+                .map(|info| info.attribute_uint32("unix::mode"))
+                .unwrap_or(mode);
+            let next = if on { current | 0o100 } else { current & !0o100 };
+            match file.set_attribute_uint32(
+                "unix::mode",
+                next,
+                gio::FileQueryInfoFlags::NONE,
+                None::<&gio::Cancellable>,
+            ) {
+                Ok(()) => {
+                    access.set_subtitle(&super::permission_string(next));
+                    glib::Propagation::Proceed
+                }
+                Err(err) => {
+                    super::toast(&app_switch, &format!("Couldn't change permissions: {err}"));
+                    glib::Propagation::Stop
+                }
+            }
+        });
+        perms.add(&row);
+    }
 
     let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(18).build();
     content.set_margin_top(18);

@@ -38,26 +38,16 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     let selection = gtk::MultiSelection::new(Some(sort_model.clone()));
 
     let grid_size = app.zoom.get();
-    let grid_view = gtk::GridView::builder().model(&selection).max_columns(24).build();
-    grid_view.set_factory(Some(&super::view::grid_factory(grid_size)));
+    let grid_view = gtk::GridView::builder().model(&selection).max_columns(24).enable_rubberband(true).build();
     grid_view.add_css_class("fs-grid");
     let grid_scroller =
         gtk::ScrolledWindow::builder().vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).child(&grid_view).build();
 
-    let column_view =
-        gtk::ColumnView::builder().model(&selection).show_column_separators(false).build();
-    super::view::fill_columns(&column_view, super::view::list_icon(grid_size));
-    if let Some(sorter) = column_view.sorter() {
-        sort_model.set_sorter(Some(&super::view::with_hidden_last(&sorter)));
-    }
-    // Seed this tab with the shared sort selection (defaults to Name ascending).
-    if let Some(col) =
-        column_view.columns().item(app.sort_key.get() as u32).and_downcast::<gtk::ColumnViewColumn>()
-    {
-        let dir =
-            if app.sort_desc.get() { gtk::SortType::Descending } else { gtk::SortType::Ascending };
-        column_view.sort_by_column(Some(&col), dir);
-    }
+    let column_view = gtk::ColumnView::builder()
+        .model(&selection)
+        .show_column_separators(false)
+        .enable_rubberband(true)
+        .build();
     let list_scroller = gtk::ScrolledWindow::builder().vexpand(true).child(&column_view).build();
 
     let computer_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
@@ -68,10 +58,12 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
 
     // Shown in place of the grid/list when the folder has no visible items.
     let empty_page = adw::StatusPage::builder()
-        .icon_name("folder-symbolic")
         .title("This Folder Is Empty")
         .description("Drop files here, or paste to add some.")
         .build();
+    if let Some(paintable) = crate::icon::status_paintable("folder-symbolic", 128) {
+        empty_page.set_paintable(Some(&paintable));
+    }
 
     let view_stack = gtk::Stack::new();
     view_stack.add_named(&grid_scroller, Some("grid"));
@@ -141,6 +133,8 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         search_entry: search_entry.clone(),
         back: RefCell::new(Vec::new()),
         fwd: RefCell::new(Vec::new()),
+        grid_zoom: Cell::new(grid_size),
+        list_zoom: Cell::new(grid_size),
     });
 
     // Register the tab before appending: appending the first page auto-selects
@@ -186,10 +180,21 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     super::view::attach_context_menu(app, &grid_view);
     super::view::attach_context_menu(app, &column_view);
 
-    // Drag & drop: drag the selection out of either view, and drop files onto a
-    // folder (into it) or empty space (into the current folder), Nautilus-style.
-    super::view::attach_drag_source(&tab, &grid_view);
-    super::view::attach_drag_source(&tab, &column_view);
+    // Drag starts on an item. Empty space is the rubber band, set on the views above.
+    // Drop still targets the whole view: a folder, or the empty space around it.
+    grid_view.set_factory(Some(&super::view::grid_factory(&tab, grid_size)));
+    super::view::fill_columns(&tab, &column_view, super::view::list_icon(grid_size));
+    if let Some(sorter) = column_view.sorter() {
+        sort_model.set_sorter(Some(&super::view::with_hidden_last(&sorter)));
+    }
+    // Seed this tab with the shared sort selection (defaults to Name ascending).
+    if let Some(col) =
+        column_view.columns().item(app.sort_key.get() as u32).and_downcast::<gtk::ColumnViewColumn>()
+    {
+        let dir =
+            if app.sort_desc.get() { gtk::SortType::Descending } else { gtk::SortType::Ascending };
+        column_view.sort_by_column(Some(&col), dir);
+    }
     super::view::attach_drop_target(app, &tab, &grid_view);
     super::view::attach_drop_target(app, &tab, &column_view);
 
@@ -218,27 +223,73 @@ pub(super) fn active_tab(app: &Rc<super::App>) -> Rc<super::Tab> {
 // --- Navigation -------------------------------------------------------------
 
 pub(super) fn navigate(app: &Rc<super::App>, tab: &Rc<super::Tab>, file: gio::File) {
-    if let Some(current) = tab.dir_list.file() {
-        tab.back.borrow_mut().push(current);
+    if let Some(place) = here(tab) {
+        push_visit(&mut tab.back.borrow_mut(), &mut tab.fwd.borrow_mut(), place);
     }
-    tab.fwd.borrow_mut().clear();
     set_dir(app, tab, &file);
 }
 
-pub(super) fn go_back(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
-    let Some(prev) = tab.back.borrow_mut().pop() else { return };
-    if let Some(current) = tab.dir_list.file() {
-        tab.fwd.borrow_mut().push(current);
+/// Leave the current page for Trash, so Back returns here.
+pub(super) fn go_trash(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
+    if tab.view_stack.visible_child_name().as_deref() != Some("trash")
+        && let Some(place) = here(tab)
+    {
+        push_visit(&mut tab.back.borrow_mut(), &mut tab.fwd.borrow_mut(), place);
     }
-    set_dir(app, tab, &prev);
+    super::places::show_trash(app, tab);
+}
+
+pub(super) fn go_back(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
+    let Some(here) = here(tab) else { return };
+    let Some(prev) = retreat(&mut tab.back.borrow_mut(), &mut tab.fwd.borrow_mut(), here) else {
+        return;
+    };
+    open_place(app, tab, prev);
 }
 
 pub(super) fn go_forward(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
-    let Some(next) = tab.fwd.borrow_mut().pop() else { return };
-    if let Some(current) = tab.dir_list.file() {
-        tab.back.borrow_mut().push(current);
+    let Some(here) = here(tab) else { return };
+    let Some(next) = advance(&mut tab.back.borrow_mut(), &mut tab.fwd.borrow_mut(), here) else {
+        return;
+    };
+    open_place(app, tab, next);
+}
+
+/// Record `here` and drop the forward stack. Opening something new always does this.
+fn push_visit(back: &mut Vec<super::Place>, fwd: &mut Vec<super::Place>, here: super::Place) {
+    back.push(here);
+    fwd.clear();
+}
+
+/// Step back. Returns where to show, and remembers `here` for Forward.
+fn retreat(back: &mut Vec<super::Place>, fwd: &mut Vec<super::Place>, here: super::Place) -> Option<super::Place> {
+    let prev = back.pop()?;
+    fwd.push(here);
+    Some(prev)
+}
+
+/// Step forward. Returns where to show, and remembers `here` for Back.
+fn advance(back: &mut Vec<super::Place>, fwd: &mut Vec<super::Place>, here: super::Place) -> Option<super::Place> {
+    let next = fwd.pop()?;
+    back.push(here);
+    Some(next)
+}
+
+/// Where the tab is showing right now, for the back/forward stack.
+fn here(tab: &super::Tab) -> Option<super::Place> {
+    match tab.view_stack.visible_child_name().as_deref() {
+        Some("computer") => Some(super::Place::Computer),
+        Some("trash") => Some(super::Place::Trash),
+        _ => tab.dir_list.file().map(super::Place::Folder),
     }
-    set_dir(app, tab, &next);
+}
+
+fn open_place(app: &Rc<super::App>, tab: &Rc<super::Tab>, place: super::Place) {
+    match place {
+        super::Place::Computer => super::places::show_computer(app, tab),
+        super::Place::Trash => super::places::show_trash(app, tab),
+        super::Place::Folder(file) => set_dir(app, tab, &file),
+    }
 }
 
 pub(super) fn go_up(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
@@ -252,6 +303,7 @@ pub(super) fn set_dir(app: &Rc<super::App>, tab: &Rc<super::Tab>, file: &gio::Fi
     // A new folder starts unfiltered — close any open search from the last one.
     tab.search_bar.set_search_mode(false);
     tab.dir_list.set_file(Some(file));
+    set_path_visible(tab, true);
     // Force out of any "This PC" view into the directory (empty/grid/list).
     refresh_view_mode(app, tab, true);
     rebuild_breadcrumb(app, tab, file);
@@ -260,6 +312,7 @@ pub(super) fn set_dir(app: &Rc<super::App>, tab: &Rc<super::Tab>, file: &gio::Fi
             file.basename().map(|b| b.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into());
         page.set_title(&title);
     }
+    super::places::sync_sidebar(app);
     super::update_chrome(app);
 }
 
@@ -283,6 +336,17 @@ pub(super) fn refresh_view_mode(app: &Rc<super::App>, tab: &Rc<super::Tab>, forc
         "grid"
     };
     tab.view_stack.set_visible_child_name(name);
+    super::apply_visible_zoom(app, tab);
+}
+
+/// The path bar names a folder. This PC has no path, so it is hidden there.
+pub(super) fn set_path_visible(tab: &super::Tab, on: bool) {
+    if let Some(parent) = tab.breadcrumb.parent() {
+        parent.set_visible(on);
+    }
+    if let Some(sep) = tab.search_bar.next_sibling() {
+        sep.set_visible(on);
+    }
 }
 
 pub(super) fn refresh(tab: &Rc<super::Tab>) {
@@ -374,5 +438,34 @@ pub(super) fn rebuild_breadcrumb(app: &Rc<super::App>, tab: &Rc<super::Tab>, fil
             button.connect_clicked(move |_| navigate(&app, &tab, target.clone()));
         }
         tab.breadcrumb.append(&button);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::Place;
+
+    #[test]
+    fn back_from_a_folder_returns_to_this_pc() {
+        let mut back = Vec::new();
+        let mut fwd = Vec::new();
+        // Open a folder while This PC is showing.
+        super::push_visit(&mut back, &mut fwd, Place::Computer);
+        let back_to = super::retreat(
+            &mut back,
+            &mut fwd,
+            Place::Folder(gtk::gio::File::for_path("/tmp/notes")),
+        );
+        assert!(matches!(back_to, Some(Place::Computer)));
+        assert!(matches!(fwd.last(), Some(Place::Folder(_))));
+    }
+
+    #[test]
+    fn back_from_trash_returns_to_this_pc() {
+        let mut back = Vec::new();
+        let mut fwd = Vec::new();
+        super::push_visit(&mut back, &mut fwd, Place::Computer);
+        let back_to = super::retreat(&mut back, &mut fwd, Place::Trash);
+        assert!(matches!(back_to, Some(Place::Computer)));
     }
 }

@@ -10,6 +10,7 @@ mod bookmarks;
 mod file_manager;
 mod fileops;
 mod format;
+mod icon;
 mod ops;
 mod preview;
 mod settings;
