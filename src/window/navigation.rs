@@ -1,6 +1,6 @@
 // Tabs and folder navigation: history, breadcrumbs, and refreshing a listing.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -289,6 +289,61 @@ pub(super) fn refresh(tab: &Rc<super::Tab>) {
     if let Some(file) = tab.dir_list.file() {
         tab.dir_list.set_file(gio::File::NONE);
         tab.dir_list.set_file(Some(&file));
+    }
+}
+
+/// Select `names` in `tab` once the folder listing has them. `then` runs after
+/// a successful selection, so a properties dialog can read that selection.
+pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn() + 'static) {
+    if names.is_empty() {
+        return;
+    }
+    let names = Rc::new(names.to_vec());
+    let then = Rc::new(then);
+    let done = Rc::new(Cell::new(false));
+    let attempt = Rc::new({
+        let tab = tab.clone();
+        let names = names.clone();
+        let then = then.clone();
+        let done = done.clone();
+        move || {
+            if done.get() {
+                return;
+            }
+            let selection = &tab.selection;
+            let mut found = Vec::new();
+            for i in 0..selection.n_items() {
+                let Some(obj) = selection.item(i) else { continue };
+                let Ok(info) = obj.downcast::<gio::FileInfo>() else { continue };
+                let name = info.name().to_string_lossy().into_owned();
+                if names.iter().any(|wanted| wanted == &name) {
+                    found.push(i);
+                }
+            }
+            let loading = tab.dir_list.is_loading();
+            if found.is_empty() && loading {
+                return;
+            }
+            if loading && found.len() < names.len() {
+                return;
+            }
+            for (n, pos) in found.iter().enumerate() {
+                selection.select_item(*pos, n == 0);
+            }
+            done.set(true);
+            if !found.is_empty() {
+                then();
+            }
+        }
+    });
+    attempt();
+    {
+        let attempt = attempt.clone();
+        tab.selection.connect_items_changed(move |_, _, _, _| attempt());
+    }
+    {
+        let attempt = attempt.clone();
+        tab.dir_list.connect_loading_notify(move |_| attempt());
     }
 }
 

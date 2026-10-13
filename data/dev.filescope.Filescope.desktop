@@ -5,7 +5,7 @@ Name=filescope
 GenericName=File Manager
 Comment=A fast, nice-looking file manager for Linux
 # install.sh rewrites this to the absolute path of the installed binary.
-Exec=filescope %f
+Exec=filescope %U
 Icon=dev.filescope.Filescope
 Terminal=false
 Categories=System;FileTools;FileManager;

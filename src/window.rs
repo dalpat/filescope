@@ -98,7 +98,74 @@ struct App {
     redo_stack: RefCell<Vec<undo::Action>>,
 }
 
-pub fn build(app: &adw::Application, initial: Option<String>) {
+const STATE_KEY: &str = "filescope-state";
+
+fn app_state(app: &adw::Application) -> Option<Rc<App>> {
+    let data = unsafe { app.data::<Rc<App>>(STATE_KEY) }?;
+    Some(unsafe { data.as_ref() }.clone())
+}
+
+/// Open `files` in the running window, creating it if this is the first launch.
+/// An empty list shows This PC. A second launch with a folder adds a tab.
+pub fn open_files(app: &adw::Application, files: &[gio::File]) {
+    let fresh = app_state(app).is_none();
+    if fresh {
+        build(app);
+    }
+    let Some(state) = app_state(app) else { return };
+    if fresh && files.is_empty() {
+        navigation::new_tab(&state, gio::File::for_path(glib::home_dir()), true);
+        places::show_computer(&state, &navigation::active_tab(&state));
+    } else {
+        for file in files {
+            open_gfile(&state, file);
+        }
+    }
+    state.window.present();
+    if fresh {
+        maybe_capture(app, &state);
+    }
+}
+
+/// Open folders from the file-manager bus (`ShowFolders` / `ShowItems`).
+pub fn open_targets(app: &adw::Application, targets: &[crate::file_manager::Target]) {
+    if app_state(app).is_none() {
+        open_files(app, &[]);
+    }
+    let Some(state) = app_state(app) else { return };
+    for target in targets {
+        navigation::new_tab(&state, gio::File::for_path(&target.dir), true);
+        if target.names.is_empty() {
+            continue;
+        }
+        let tab = navigation::active_tab(&state);
+        let props = target.properties && target.names.len() == 1;
+        let state = state.clone();
+        navigation::select_names(&tab, &target.names, move || {
+            if props {
+                commands::show_properties(&state);
+            }
+        });
+    }
+    state.window.present();
+}
+
+fn open_gfile(state: &Rc<App>, file: &gio::File) {
+    let Some(path) = file.path() else { return };
+    if path.is_dir() {
+        navigation::new_tab(state, gio::File::for_path(path), true);
+        return;
+    }
+    let Some(parent) = path.parent() else { return };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if name.is_empty() {
+        return;
+    }
+    navigation::new_tab(state, gio::File::for_path(parent), true);
+    navigation::select_names(&navigation::active_tab(state), &[name], || {});
+}
+
+fn build(app: &adw::Application) {
     install_css();
 
     let back_btn = flat_icon("go-previous-symbolic", "Back (Alt+Left)");
@@ -344,21 +411,7 @@ pub fn build(app: &adw::Application, initial: Option<String>) {
         monitor.connect_volume_removed(move |_, _| places::populate_sidebar(&s));
     }
 
-    window.present();
-
-    // Startup: if a folder was passed on the command line, open it; otherwise
-    // land on "This PC" (the drives overview) rather than Home. The tab is still
-    // seeded at Home so Back/Up have a sensible base to fall to.
-    match initial.map(PathBuf::from).filter(|p| p.is_dir()) {
-        Some(dir) => navigation::new_tab(&state, gio::File::for_path(dir), true),
-        None => {
-            navigation::new_tab(&state, gio::File::for_path(glib::home_dir()), true);
-            let tab = navigation::active_tab(&state);
-            places::show_computer(&state, &tab);
-        }
-    }
-
-    maybe_capture(app, &state);
+    unsafe { app.set_data(STATE_KEY, state.clone()) };
 }
 
 /// Dev/docs hook: if `FILESCOPE_SHOT` is set, render the window to that PNG in
@@ -516,6 +569,32 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     action!("zoom-in", |s: &Rc<App>| zoom(s, ZOOM_STEP));
     action!("zoom-out", |s: &Rc<App>| zoom(s, -ZOOM_STEP));
     action!("about", about);
+
+    let default_fm = gio::SimpleAction::new_stateful(
+        "default-file-manager",
+        None,
+        &crate::file_manager::is_enabled().to_variant(),
+    );
+    {
+        let state = state.clone();
+        let app = app.clone();
+        default_fm.connect_change_state(move |act, value| {
+            let Some(on) = value.and_then(|v| v.get::<bool>()) else { return };
+            match crate::file_manager::set_enabled(on) {
+                Ok(note) => {
+                    act.set_state(&on.to_variant());
+                    if on {
+                        crate::file_manager::own(&app);
+                    } else {
+                        crate::file_manager::release(&app);
+                    }
+                    toast(&state, &note);
+                }
+                Err(err) => toast(&state, &err),
+            }
+        });
+    }
+    state.window.add_action(&default_fm);
 
     let toggle = gio::SimpleAction::new_stateful("toggle-hidden", None, &false.to_variant());
     {
@@ -752,6 +831,9 @@ fn primary_menu() -> gio::Menu {
     b.append(Some("Zoom Out"), Some("win.zoom-out"));
     b.append(Some("Refresh"), Some("win.refresh"));
     menu.append_section(None, &b);
+    let defaults = gio::Menu::new();
+    defaults.append(Some("Default File Manager"), Some("win.default-file-manager"));
+    menu.append_section(None, &defaults);
     let c = gio::Menu::new();
     c.append(Some("About filescope"), Some("win.about"));
     menu.append_section(None, &c);
