@@ -271,14 +271,7 @@ fn paint_icon(image: &gtk::Image, window: &adw::ApplicationWindow, icon: &gio::I
         });
         return;
     }
-    if let Some(texture) = crate::icon::still_icon(
-        &gtk::prelude::WidgetExt::display(window),
-        window.scale_factor(),
-        icon,
-        size,
-    ) {
-        image.set_paintable(Some(&texture));
-    }
+    crate::icon::show(image, &gtk::prelude::WidgetExt::display(window), icon, size, window.scale_factor());
 }
 
 

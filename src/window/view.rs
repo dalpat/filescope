@@ -706,15 +706,11 @@ pub(super) fn grid_factory(tab: &Rc<super::Tab>, size: i32) -> gtk::SignalListIt
 }
 
 fn set_themed_icon(image: &gtk::Image, info: &gio::FileInfo) {
-    // A live icon redraws every frame. Photos replace this with a thumbnail;
-    // videos never do, so the still texture has to be set here or a folder of
-    // them keeps a core busy.
+    // One shared theme paintable per mime. A photo may replace it with a thumbnail.
     let Some(icon) = info.icon() else { return };
     let size = image.pixel_size().max(16);
     let scale = image.scale_factor().max(1);
-    if let Some(texture) = crate::icon::still_icon(&gtk::prelude::WidgetExt::display(image), scale, &icon, size) {
-        image.set_paintable(Some(&texture));
-    }
+    crate::icon::show(image, &gtk::prelude::WidgetExt::display(image), &icon, size, scale);
 }
 
 /// Replace the theme icon with the cached thumbnail, when one exists.

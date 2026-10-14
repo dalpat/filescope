@@ -240,9 +240,8 @@ fn metadata_card(info: &gio::FileInfo, content_type: &str) -> gtk::Widget {
     let icon = gtk::Image::builder().pixel_size(128).build();
     if let Some(gicon) = info.icon()
         && let Some(display) = gtk::gdk::Display::default()
-        && let Some(texture) = crate::icon::still_icon(&display, crate::icon::display_scale(&display), &gicon, 128)
     {
-        icon.set_paintable(Some(&texture));
+        crate::icon::show(&icon, &display, &gicon, 128, crate::icon::display_scale(&display));
     }
     let kind = if content_type.is_empty() {
         "File".to_string()

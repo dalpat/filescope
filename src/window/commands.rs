@@ -870,9 +870,7 @@ pub(super) fn show_properties(app: &Rc<super::App>) {
     let image = gtk::Image::builder().pixel_size(48).build();
     if let Some(icon) = info.icon() {
         let display = gtk::prelude::WidgetExt::display(&app.window);
-        if let Some(texture) = crate::icon::still_icon(&display, app.window.scale_factor(), &icon, 48) {
-            image.set_paintable(Some(&texture));
-        }
+        crate::icon::show(&image, &display, &icon, 48, app.window.scale_factor());
     }
     let title = gtk::Label::builder()
         .label(&name)

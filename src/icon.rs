@@ -1,13 +1,11 @@
-// Draw a theme icon once and keep the pixels.
-//
-// A GtkImage given an icon name or a GIcon holds a live icon paintable. That
-// object redraws whenever the theme is consulted, so a window full of them
-// pins a core. Callers paint the texture and drop the paintable.
+// One theme icon per name, size, and scale. The paintable is GTK's, so a
+// light/dark change can recolor it. A file path is not a theme name.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Once;
 
 use gtk::{gdk, gio, glib, prelude::*};
 
@@ -25,47 +23,171 @@ pub(crate) fn display_scale(display: &gdk::Display) -> i32 {
         .max(1)
 }
 
-pub(crate) fn still_icon(display: &gdk::Display, scale: i32, icon: &gio::Icon, size: i32) -> Option<gdk::Texture> {
-    texture_of(display, scale, icon, size, gtk::IconLookupFlags::FORCE_REGULAR)
-}
-
-pub(crate) fn still_named(display: &gdk::Display, scale: i32, name: &str, size: i32) -> Option<gdk::Texture> {
-    let flags = if name.ends_with("-symbolic") {
+pub(crate) fn still_icon(display: &gdk::Display, scale: i32, icon: &gio::Icon, size: i32) -> Option<gtk::IconPaintable> {
+    watch_theme(display);
+    let scale = scale.max(1);
+    let names = themed_names(icon);
+    let flags = if names.as_ref().is_some_and(|names| wants_symbolic(names)) {
         gtk::IconLookupFlags::FORCE_SYMBOLIC
     } else {
         gtk::IconLookupFlags::FORCE_REGULAR
     };
-    let icon = gio::ThemedIcon::new(name);
-    texture_of(display, scale, icon.upcast_ref(), size, flags)
-}
-
-fn texture_of(
-    display: &gdk::Display,
-    scale: i32,
-    icon: &gio::Icon,
-    size: i32,
-    flags: gtk::IconLookupFlags,
-) -> Option<gdk::Texture> {
-    let scale = scale.max(1);
-    let theme = gtk::IconTheme::for_display(display);
-    let paintable = theme.lookup_by_gicon(icon, size, scale, gtk::TextDirection::Ltr, flags);
-    let path = paintable.file().and_then(|file| file.path())?;
-    let path = if path.ends_with("image-missing.svg") {
-        theme
-            .lookup_by_gicon(icon, size, scale, gtk::TextDirection::Ltr, gtk::IconLookupFlags::empty())
-            .file()
-            .and_then(|file| file.path())
-            .unwrap_or(path)
-    } else {
-        path
-    };
-    let px = size * scale;
-    if let Some(hit) = cached(&ICON_CACHE, &path, px) {
+    let label = names.map(|names| names.join("\n"));
+    if let Some(name) = label.as_deref()
+        && let Some(hit) = THEMED.with(|cache| cache.borrow().lookup(name, size, scale))
+    {
         return Some(hit);
     }
-    let texture = pixbuf_texture(&path, px)?;
-    store(&ICON_CACHE, path, px, &texture);
-    Some(texture)
+    let paintable = lookup_paintable(display, icon, size, scale, flags);
+    if let Some(name) = label.as_deref() {
+        THEMED.with(|cache| cache.borrow_mut().remember(name, size, scale, paintable.clone()));
+    }
+    Some(paintable)
+}
+
+/// Paint `icon` on `image` and keep the image so a theme change can paint it again.
+pub(crate) fn show(image: &gtk::Image, display: &gdk::Display, icon: &gio::Icon, size: i32, scale: i32) {
+    if let Some(paintable) = still_icon(display, scale, icon, size) {
+        image.set_paintable(Some(&paintable));
+    }
+    unsafe {
+        image.set_data(ICON_KEY, icon.clone());
+        image.set_data(SIZE_KEY, size);
+        image.set_data(SCALE_KEY, scale);
+    }
+    SHOWN.with(|shown| {
+        let mut shown = shown.borrow_mut();
+        if shown.iter().any(|row| row.image.upgrade().as_ref() == Some(image)) {
+            return;
+        }
+        let weak = glib::WeakRef::new();
+        weak.set(Some(image));
+        shown.push(Shown { image: weak });
+    });
+}
+
+pub(crate) fn still_named(display: &gdk::Display, scale: i32, name: &str, size: i32) -> Option<gtk::IconPaintable> {
+    let icon = gio::ThemedIcon::new(name);
+    still_icon(display, scale, icon.upcast_ref(), size)
+}
+
+fn lookup_paintable(
+    display: &gdk::Display,
+    icon: &gio::Icon,
+    size: i32,
+    scale: i32,
+    flags: gtk::IconLookupFlags,
+) -> gtk::IconPaintable {
+    let theme = gtk::IconTheme::for_display(display);
+    let paintable = theme.lookup_by_gicon(icon, size, scale, gtk::TextDirection::Ltr, flags);
+    let missing = paintable
+        .file()
+        .and_then(|file| file.path())
+        .is_some_and(|path| path.ends_with("image-missing.svg"));
+    if missing && flags.contains(gtk::IconLookupFlags::FORCE_REGULAR) {
+        theme.lookup_by_gicon(icon, size, scale, gtk::TextDirection::Ltr, gtk::IconLookupFlags::empty())
+    } else {
+        paintable
+    }
+}
+
+/// Symbolic only when the preferred name says so. A mime icon lists a symbolic
+/// fallback after the regular name, and that must not win.
+pub(crate) fn wants_symbolic(names: &[impl AsRef<str>]) -> bool {
+    names.first().is_some_and(|name| name.as_ref().ends_with("-symbolic"))
+}
+
+fn themed_names(icon: &gio::Icon) -> Option<Vec<String>> {
+    let themed = icon.clone().downcast::<gio::ThemedIcon>().ok()?;
+    let names: Vec<String> = themed.names().iter().map(|name| name.to_string()).collect();
+    if names.is_empty() || names.iter().any(|name| name.contains('/')) {
+        None
+    } else {
+        Some(names)
+    }
+}
+
+fn themed_key(name: &str, size: i32, scale: i32) -> Option<(String, i32, i32)> {
+    if name.is_empty() || name.contains('/') {
+        None
+    } else {
+        Some((name.to_string(), size, scale))
+    }
+}
+
+struct IconCache<T> {
+    entries: HashMap<(String, i32, i32), T>,
+}
+
+impl<T: Clone> IconCache<T> {
+    fn new() -> Self {
+        Self { entries: HashMap::new() }
+    }
+
+    fn remember(&mut self, name: &str, size: i32, scale: i32, value: T) -> bool {
+        let Some(key) = themed_key(name, size, scale) else { return false };
+        self.entries.insert(key, value);
+        true
+    }
+
+    fn lookup(&self, name: &str, size: i32, scale: i32) -> Option<T> {
+        let key = themed_key(name, size, scale)?;
+        self.entries.get(&key).cloned()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+const ICON_KEY: &str = "fs-theme-icon";
+const SIZE_KEY: &str = "fs-theme-size";
+const SCALE_KEY: &str = "fs-theme-scale";
+
+struct Shown {
+    image: glib::WeakRef<gtk::Image>,
+}
+
+thread_local! {
+    static THEMED: RefCell<IconCache<gtk::IconPaintable>> = RefCell::new(IconCache::new());
+    static SHOWN: RefCell<Vec<Shown>> = RefCell::new(Vec::new());
+}
+
+fn watch_theme(display: &gdk::Display) {
+    static WATCH: Once = Once::new();
+    WATCH.call_once(|| {
+        let refresh = || refresh_shown();
+        gtk::IconTheme::for_display(display).connect_changed(move |_| refresh());
+        if let Some(settings) = gtk::Settings::default() {
+            settings.connect_gtk_theme_name_notify(move |_| refresh());
+            settings.connect_gtk_icon_theme_name_notify(move |_| refresh());
+            settings.connect_gtk_application_prefer_dark_theme_notify(move |_| refresh());
+        }
+    });
+}
+
+fn refresh_shown() {
+    THEMED.with(|cache| cache.borrow_mut().clear());
+    let alive = SHOWN.with(|shown| {
+        let mut shown = shown.borrow_mut();
+        shown.retain(|row| row.image.upgrade().is_some());
+        shown.iter().filter_map(|row| row.image.upgrade()).collect::<Vec<_>>()
+    });
+    for image in alive {
+        let Some(icon) = (unsafe { image.data::<gio::Icon>(ICON_KEY) }) else { continue };
+        let icon = unsafe { icon.as_ref() }.clone();
+        let size = unsafe { image.data::<i32>(SIZE_KEY) }.map(|p| unsafe { *p.as_ref() }).unwrap_or(16);
+        let scale = unsafe { image.data::<i32>(SCALE_KEY) }.map(|p| unsafe { *p.as_ref() }).unwrap_or(1);
+        let Some(display) = gdk::Display::default() else { continue };
+        if let Some(paintable) = still_icon(&display, scale, &icon, size) {
+            image.set_paintable(Some(&paintable));
+        }
+    }
 }
 
 /// The small PNG already in `~/.cache/thumbnails`, when GIO says it is current.
@@ -115,10 +237,6 @@ fn decode_pixels(path: &Path, size: i32) -> Option<Pixels> {
     })
 }
 
-pub(crate) fn pixbuf_texture(path: &Path, size: i32) -> Option<gdk::Texture> {
-    decode_pixels(path, size).map(Pixels::texture)
-}
-
 pub(crate) fn cached_photo(path: &Path, size: i32) -> Option<gdk::Texture> {
     cached(&PHOTO_CACHE, path, size)
 }
@@ -157,7 +275,6 @@ async fn acquire_slot() -> Slot {
 }
 
 thread_local! {
-    static ICON_CACHE: RefCell<HashMap<(PathBuf, i32), gdk::Texture>> = RefCell::new(HashMap::new());
     static PHOTO_CACHE: RefCell<HashMap<(PathBuf, i32), gdk::Texture>> = RefCell::new(HashMap::new());
 }
 
@@ -185,6 +302,57 @@ fn store(
     });
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{wants_symbolic, IconCache, themed_key};
+
+    #[test]
+    fn same_themed_icon_is_one_cache_entry() {
+        let mut cache = IconCache::new();
+        assert!(cache.remember("video-x-generic", 48, 1, ()));
+        assert!(cache.lookup("video-x-generic", 48, 1).is_some());
+        assert!(cache.lookup("video-x-generic", 48, 1).is_some());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn size_and_scale_are_different_entries() {
+        let mut cache = IconCache::new();
+        assert!(cache.remember("video-x-generic", 48, 1, ()));
+        assert!(cache.remember("video-x-generic", 48, 2, ()));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn theme_change_drops_the_cache() {
+        let mut cache = IconCache::new();
+        cache.remember("video-x-generic", 48, 1, ());
+        cache.clear();
+        assert!(cache.lookup("video-x-generic", 48, 1).is_none());
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn a_file_icon_is_not_a_themed_entry() {
+        let path = "/usr/share/icons/Adwaita/scalable/mimetypes/video-x-generic.svg";
+        assert!(themed_key(path, 48, 1).is_none());
+        let mut cache = IconCache::new();
+        assert!(!cache.remember(path, 48, 1, ()));
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn file_icon_names_are_regular_and_a_symbolic_name_is_not() {
+        assert!(!wants_symbolic(&[
+            "video-mp4",
+            "video-x-generic",
+            "video-mp4-symbolic",
+            "video-x-generic-symbolic",
+        ]));
+        assert!(wants_symbolic(&["folder-symbolic"]));
+    }
+}
+
 pub(crate) fn image_named(name: &str, size: i32) -> gtk::Image {
     let image = gtk::Image::builder().pixel_size(size).build();
     set_named(&image, name, size);
@@ -194,17 +362,14 @@ pub(crate) fn image_named(name: &str, size: i32) -> gtk::Image {
 pub(crate) fn set_named(image: &gtk::Image, name: &str, size: i32) {
     image.set_pixel_size(size);
     let Some(display) = gdk::Display::default() else { return };
-    if let Some(texture) = still_named(&display, display_scale(&display), name, size) {
-        image.set_paintable(Some(&texture));
-    }
+    let icon = gio::ThemedIcon::new(name);
+    show(image, &display, icon.upcast_ref(), size, display_scale(&display));
 }
 
 pub(crate) fn image_gicon(icon: &gio::Icon, size: i32) -> gtk::Image {
     let image = gtk::Image::builder().pixel_size(size).build();
     let Some(display) = gdk::Display::default() else { return image };
-    if let Some(texture) = still_icon(&display, display_scale(&display), icon, size) {
-        image.set_paintable(Some(&texture));
-    }
+    show(&image, &display, icon, size, display_scale(&display));
     image
 }
 
@@ -216,7 +381,7 @@ pub(crate) fn flat_button(name: &str, tooltip: &str) -> gtk::Button {
     button
 }
 
-pub(crate) fn status_paintable(name: &str, size: i32) -> Option<gdk::Texture> {
+pub(crate) fn status_paintable(name: &str, size: i32) -> Option<gtk::IconPaintable> {
     let display = gdk::Display::default()?;
     still_named(&display, display_scale(&display), name, size)
 }
