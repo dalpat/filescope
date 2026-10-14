@@ -1,7 +1,6 @@
 // The folder grid and list: icons, columns, keyboard, drag-and-drop, inline rename.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -725,12 +724,11 @@ fn set_themed_icon(image: &gtk::Image, info: &gio::FileInfo) {
 /// recycled cell (scrolled to a different file) is never overwritten by a stale
 /// thumbnail.
 fn set_thumbnail(image: &gtk::Image, info: &gio::FileInfo, size: i32) {
-    static THUMB_GEN: AtomicU64 = AtomicU64::new(0);
-
-    let Some(path) = crate::icon::thumbnail_path(info) else { return };
-
-    let token = THUMB_GEN.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-    unsafe { image.set_data("thumb-token", token) };
+    let token = crate::thumbnails::arm(image);
+    let Some(path) = crate::icon::thumbnail_path(info) else {
+        crate::thumbnails::schedule(image, info, size, token);
+        return;
+    };
     if let Some(texture) = crate::icon::cached_photo(&path, size) {
         image.set_paintable(Some(&texture));
         return;

@@ -14,6 +14,7 @@ mod icon;
 mod ops;
 mod preview;
 mod settings;
+mod thumbnails;
 mod trash;
 mod undo;
 mod window;

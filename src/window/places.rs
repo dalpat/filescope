@@ -104,10 +104,23 @@ pub(super) fn show_computer(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
             if let Some(path) = file.path() {
                 hide_if_missing(&card, path);
             }
-            if let Some(path) = thumb {
-                unsafe { card.set_data("fs-thumb", path.clone()) };
-                if let Some(image) = first_image(card.upcast_ref()) {
-                    load_file_thumb(&image, path, icon_px * window.scale_factor().max(1));
+            if let Some(image) = first_image(card.upcast_ref()) {
+                let px = icon_px * window.scale_factor().max(1);
+                if let Some(path) = thumb {
+                    unsafe { card.set_data("fs-thumb", path.clone()) };
+                    load_file_thumb(&image, path, px);
+                } else if let Ok(info) = file.query_info(
+                    "standard::*,thumbnail::path,thumbnail::is-valid",
+                    gio::FileQueryInfoFlags::NONE,
+                    gio::Cancellable::NONE,
+                ) {
+                    let output = crate::thumbnails::cache_path(
+                        &glib::user_cache_dir().join("thumbnails"),
+                        &file.uri(),
+                    );
+                    unsafe { card.set_data("fs-thumb", output) };
+                    let token = crate::thumbnails::arm(&image);
+                    crate::thumbnails::schedule(&image, &info, px, token);
                 }
             }
             insert_tile(&flow, &card, tile_w, list);
