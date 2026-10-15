@@ -14,6 +14,7 @@ use crate::{archive, bookmarks, format, preview, settings, trash, undo};
 mod commands;
 mod navigation;
 mod places;
+mod terminal;
 mod view;
 
 
@@ -60,6 +61,12 @@ expander.pc-section > title { font-size: 13px; font-weight: normal; color: alpha
 row:hover .bookmark-x,
 .bookmark-x:focus-visible { opacity: 1; }
 .bookmark-drop { background: alpha(@accent_bg_color, 0.22); }
+.fs-terminal { background: @window_bg_color; }
+.fs-terminal-handle { min-height: 5px; background: alpha(@window_fg_color, 0.10); }
+.fs-terminal-handle:hover { background: @accent_bg_color; }
+.fs-terminal-bar { padding: 0 8px; min-height: 28px; }
+.fs-terminal-bar label { font-size: 12px; color: alpha(@window_fg_color, 0.65); }
+.fs-terminal-bar button { min-height: 0; min-width: 0; padding: 4px; }
 ";
 
 const ATTRS: &str = "standard::*,time::modified,unix::mode,thumbnail::path,thumbnail::is-valid";
@@ -82,6 +89,14 @@ pub(super) enum Place {
     Trash,
 }
 
+/// Where an in-window shell can start. This PC and Trash are not directories.
+pub(super) fn terminal_cwd(place: &Place) -> Option<PathBuf> {
+    match place {
+        Place::Folder(file) => file.path(),
+        Place::Computer | Place::Trash => None,
+    }
+}
+
 /// One folder tab: its own listing, views, history, and breadcrumb.
 struct Tab {
     page: RefCell<Option<adw::TabPage>>,
@@ -101,6 +116,8 @@ struct Tab {
     /// Zoom last applied to each folder view. The hidden one stays stale until shown.
     grid_zoom: Cell<i32>,
     list_zoom: Cell<i32>,
+    /// Bottom shell for this tab. Hidden until the user opens it.
+    terminal: terminal::Pane,
 }
 
 /// The whole window and its shared state.
@@ -621,6 +638,7 @@ const ACCELS: &[(&str, &[&str])] = &[
     ("undo", &["<ctrl>z"]),
     ("redo", &["<ctrl><shift>z", "<ctrl>y"]),
     ("open-terminal", &["<ctrl>period"]),
+    ("terminal-pane", &["<ctrl>grave"]),
     ("zoom-in", &["<ctrl>plus", "<ctrl>equal"]),
     ("zoom-out", &["<ctrl>minus"]),
 ];
@@ -666,6 +684,7 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     action!("undo", commands::undo);
     action!("redo", commands::redo);
     action!("open-terminal", commands::open_terminal);
+    action!("terminal-pane", toggle_terminal_pane);
     action!("extract", commands::extract_selected);
     action!("compress", commands::compress_selected);
     action!("bookmark", places::bookmark_current);
@@ -971,12 +990,19 @@ fn apply_sort_to(app: &Rc<App>, tab: &Rc<Tab>) {
     tab.column_view.sort_by_column(Some(&col), dir);
 }
 
+fn toggle_terminal_pane(app: &Rc<App>) {
+    let tab = navigation::active_tab(app);
+    let cwd = navigation::here(&tab).as_ref().and_then(terminal_cwd);
+    tab.terminal.toggle(cwd.as_deref());
+}
+
 fn primary_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     let a = gio::Menu::new();
     a.append(Some("New Tab"), Some("win.new-tab"));
     a.append(Some("New Folder…"), Some("win.new-folder"));
     a.append(Some("Open Terminal Here"), Some("win.open-terminal"));
+    a.append(Some("Terminal Pane"), Some("win.terminal-pane"));
     a.append(Some("Bookmark This Folder"), Some("win.bookmark"));
     menu.append_section(None, &a);
     let b = gio::Menu::new();
@@ -1032,6 +1058,14 @@ mod tests {
     use super::commands::parse_clipboard;
     use super::{ACCELS, GNOME_COPIED, URI_LIST};
 
+
+    #[test]
+    fn terminal_cwd_is_the_folder_and_absent_on_special_views() {
+        let folder = super::Place::Folder(gtk::gio::File::for_path("/tmp"));
+        assert_eq!(super::terminal_cwd(&folder).as_deref(), Some(std::path::Path::new("/tmp")));
+        assert!(super::terminal_cwd(&super::Place::Computer).is_none());
+        assert!(super::terminal_cwd(&super::Place::Trash).is_none());
+    }
 
     #[test]
     fn no_accelerator_steals_a_typing_key() {

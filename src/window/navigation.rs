@@ -117,6 +117,8 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     content.append(&search_bar);
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content.append(&view_stack);
+    let terminal_pane = super::terminal::Pane::new();
+    content.append(&terminal_pane.widget());
 
     let tab = Rc::new(super::Tab {
         page: RefCell::new(None),
@@ -135,6 +137,7 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         fwd: RefCell::new(Vec::new()),
         grid_zoom: Cell::new(grid_size),
         list_zoom: Cell::new(grid_size),
+        terminal: terminal_pane,
     });
 
     // Register the tab before appending: appending the first page auto-selects
@@ -276,7 +279,7 @@ fn advance(back: &mut Vec<super::Place>, fwd: &mut Vec<super::Place>, here: supe
 }
 
 /// Where the tab is showing right now, for the back/forward stack.
-fn here(tab: &super::Tab) -> Option<super::Place> {
+pub(super) fn here(tab: &super::Tab) -> Option<super::Place> {
     match tab.view_stack.visible_child_name().as_deref() {
         Some("computer") => Some(super::Place::Computer),
         Some("trash") => Some(super::Place::Trash),

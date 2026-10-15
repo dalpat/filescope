@@ -26,7 +26,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential pkg-config libgtk-4-dev libadwaita-1-dev \
+            build-essential pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev \
             curl ca-certificates git
 
       - uses: actions/checkout@v4
