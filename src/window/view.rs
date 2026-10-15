@@ -23,6 +23,63 @@ fn name_font(icon_px: i32) -> gtk::pango::AttrList {
 pub(super) fn list_icon(grid_size: i32) -> i32 {
     (grid_size / 3).clamp(22, 32)
 }
+
+/// What a zoom change does to the visible page. Grid and list resize the icons
+/// already on screen. There is no rebuild.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ZoomWork {
+    None,
+    Resize(i32),
+    Tiles,
+}
+
+/// Character width of a grid name at this icon size. List names do not use it.
+pub(super) fn grid_name_chars(icon_px: i32) -> (i32, i32) {
+    ((icon_px / 8).max(6), (icon_px / 6).max(8))
+}
+
+pub(super) fn zoom_work(showing: Option<&str>, stamped: i32, zoom: i32) -> ZoomWork {
+    match showing {
+        Some("computer") | Some("trash") => ZoomWork::Tiles,
+        Some("list") if stamped != zoom => ZoomWork::Resize(list_icon(zoom)),
+        Some("grid") if stamped != zoom => ZoomWork::Resize(zoom),
+        _ => ZoomWork::None,
+    }
+}
+
+/// Set the icon size and the name font on widgets already built for this view.
+pub(super) fn resize_names(root: &gtk::Widget, icon_px: i32) {
+    let font = name_font(icon_px);
+    resize_widget(root, icon_px, &font);
+}
+
+fn resize_widget(widget: &gtk::Widget, icon_px: i32, font: &gtk::pango::AttrList) {
+    if let Some(image) = widget.downcast_ref::<gtk::Image>() {
+        image.set_pixel_size(icon_px);
+        // Photos already on screen were decoded at the previous size.
+        if icon_px >= 32
+            && let Some(info) = unsafe { image.data::<gio::FileInfo>("fs-file-info") }
+        {
+            let info = unsafe { info.as_ref() }.clone();
+            set_thumbnail(image, &info, icon_px);
+        }
+    }
+    if let Some(label) = widget.downcast_ref::<gtk::Label>()
+        && label.has_css_class("fs-name")
+    {
+        label.set_attributes(Some(font));
+        if label.has_css_class("fs-grid-name") {
+            let (width, max) = grid_name_chars(icon_px);
+            label.set_width_chars(width);
+            label.set_max_width_chars(max);
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(next) = child {
+        resize_widget(&next, icon_px, font);
+        child = next.next_sibling();
+    }
+}
 pub(super) fn attach_context_menu(app: &Rc<super::App>, widget: &impl IsA<gtk::Widget>) {
     let gesture = gtk::GestureClick::new();
     gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
@@ -553,19 +610,21 @@ pub(super) fn fill_columns(tab: &Rc<super::Tab>, column_view: &gtk::ColumnView, 
 
 fn name_column(tab: &Rc<super::Tab>, view: &gtk::ColumnView, icon_size: i32) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
-    let tab = tab.clone();
+    let tab_setup = tab.clone();
+    let tab_bind = tab.clone();
     let view = view.clone().upcast::<gtk::Widget>();
     factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let image = gtk::Image::new();
         let label =
             gtk::Label::builder().xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        label.add_css_class("fs-name");
         label.set_attributes(Some(&name_font(icon_size)));
         let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(10).build();
         row.set_valign(gtk::Align::Center);
         row.append(&image);
         row.append(&name_stack(&label));
-        attach_item_drag(&tab, &view, &row);
+        attach_item_drag(&tab_setup, &view, &row);
         item.set_child(Some(&row));
     });
     factory.connect_bind(move |_, item| {
@@ -574,10 +633,13 @@ fn name_column(tab: &Rc<super::Tab>, view: &gtk::ColumnView, icon_size: i32) -> 
         let row = item.child().and_downcast::<gtk::Box>().unwrap();
         let image = row.first_child().and_downcast::<gtk::Image>().unwrap();
         let label = bind_name_stack(&row, item.position());
-        image.set_pixel_size(icon_size);
+        let icon_px = list_icon(tab_bind.list_zoom.get());
+        image.set_pixel_size(icon_px);
+        label.set_attributes(Some(&name_font(icon_px)));
+        unsafe { image.set_data("fs-file-info", info.clone()) };
         set_themed_icon(&image, &info);
-        if icon_size >= 32 {
-            set_thumbnail(&image, &info, icon_size);
+        if icon_px >= 32 {
+            set_thumbnail(&image, &info, icon_px);
         }
         label.set_label(&info.display_name());
         // The name column ellipsizes; show the full name on hover.
@@ -657,7 +719,8 @@ fn modified_column(tab: &Rc<super::Tab>, view: &gtk::ColumnView) -> gtk::ColumnV
 
 pub(super) fn grid_factory(tab: &Rc<super::Tab>, size: i32) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
-    let tab = tab.clone();
+    let tab_setup = tab.clone();
+    let tab_bind = tab.clone();
     let view = tab.grid_view.clone().upcast::<gtk::Widget>();
     factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -674,16 +737,18 @@ pub(super) fn grid_factory(tab: &Rc<super::Tab>, size: i32) -> gtk::SignalListIt
             .wrap_mode(gtk::pango::WrapMode::WordChar)
             .lines(2)
             .ellipsize(gtk::pango::EllipsizeMode::End)
-            .max_width_chars((size / 6).max(8))
-            .width_chars((size / 8).max(6))
             .build();
+        let (width, max) = grid_name_chars(size);
+        label.set_width_chars(width);
+        label.set_max_width_chars(max);
         label.set_attributes(Some(&name_font(size)));
         label.add_css_class("fs-name");
+        label.add_css_class("fs-grid-name");
         let cell = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
         cell.set_halign(gtk::Align::Center);
         cell.append(&image);
         cell.append(&name_stack(&label));
-        attach_item_drag(&tab, &view, &cell);
+        attach_item_drag(&tab_setup, &view, &cell);
         item.set_child(Some(&cell));
     });
     factory.connect_bind(move |_, item| {
@@ -692,9 +757,15 @@ pub(super) fn grid_factory(tab: &Rc<super::Tab>, size: i32) -> gtk::SignalListIt
         let cell = item.child().and_downcast::<gtk::Box>().unwrap();
         let image = cell.first_child().and_downcast::<gtk::Image>().unwrap();
         let label = bind_name_stack(&cell, item.position());
-        image.set_pixel_size(size);
+        let icon_px = tab_bind.grid_zoom.get();
+        image.set_pixel_size(icon_px);
+        let (width, max) = grid_name_chars(icon_px);
+        label.set_width_chars(width);
+        label.set_max_width_chars(max);
+        label.set_attributes(Some(&name_font(icon_px)));
+        unsafe { image.set_data("fs-file-info", info.clone()) };
         set_themed_icon(&image, &info);
-        set_thumbnail(&image, &info, size);
+        set_thumbnail(&image, &info, icon_px);
         label.set_label(&info.display_name());
         // Names are wrapped/ellipsized in the grid, so surface the full name on
         // hover.
@@ -779,9 +850,36 @@ fn rename_selection_region(name: &str, is_dir: bool) -> (i32, i32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{claims_view_key, drop_kind, rename_selection_region};
+    use super::{
+        claims_view_key, drop_kind, grid_name_chars, list_icon, rename_selection_region, zoom_work, ZoomWork,
+    };
     use crate::ops::Kind;
     use gtk::gdk::DragAction;
+
+    #[test]
+    fn zoom_work_is_resize_not_rebuild() {
+        assert_eq!(zoom_work(Some("grid"), 80, 96), ZoomWork::Resize(96));
+        assert_eq!(zoom_work(Some("list"), 80, 96), ZoomWork::Resize(list_icon(96)));
+        assert_eq!(zoom_work(Some("grid"), 80, 80), ZoomWork::None);
+        assert_eq!(zoom_work(Some("list"), 80, 80), ZoomWork::None);
+        assert_eq!(zoom_work(Some("empty"), 80, 96), ZoomWork::None);
+        assert_eq!(zoom_work(Some("computer"), 80, 96), ZoomWork::Tiles);
+        assert_eq!(zoom_work(Some("trash"), 80, 96), ZoomWork::Tiles);
+    }
+
+    #[test]
+    fn grid_name_shrinks_when_the_icon_shrinks() {
+        assert_eq!(grid_name_chars(80), (10, 13));
+        assert_eq!(grid_name_chars(48), (6, 8));
+        assert_eq!(grid_name_chars(160), (20, 26));
+    }
+
+    #[test]
+    fn list_icon_stays_a_third_of_the_grid() {
+        assert_eq!(list_icon(48), 22);
+        assert_eq!(list_icon(96), 32);
+        assert!((22..=32).contains(&list_icon(80)));
+    }
 
     #[test]
     fn bare_space_previews_and_does_not_toggle_selection() {

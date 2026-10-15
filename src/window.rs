@@ -568,30 +568,27 @@ fn zoom(app: &Rc<App>, delta: i32) {
 /// Resize only the view the tab is actually showing.
 fn apply_visible_zoom(app: &Rc<App>, tab: &Rc<Tab>) {
     let zoom = app.zoom.get();
-    match tab.view_stack.visible_child_name().as_deref() {
-        Some("list") => {
-            if tab.list_zoom.get() == zoom {
-                return;
+    let showing = tab.view_stack.visible_child_name();
+    let stamped = match showing.as_deref() {
+        Some("list") => tab.list_zoom.get(),
+        _ => tab.grid_zoom.get(),
+    };
+    match view::zoom_work(showing.as_deref(), stamped, zoom) {
+        view::ZoomWork::None => {}
+        view::ZoomWork::Tiles => match showing.as_deref() {
+            Some("computer") => places::rescale_tiles(app, &tab.computer_box),
+            _ => places::rescale_tiles(app, &tab.trash_box),
+        },
+        view::ZoomWork::Resize(icon) => {
+            // Stamp first. A later bind reads this size. An unstamped view
+            // would keep asking for the old one.
+            if showing.as_deref() == Some("list") {
+                tab.list_zoom.set(zoom);
+                view::resize_names(tab.column_view.upcast_ref(), icon);
+            } else {
+                tab.grid_zoom.set(zoom);
+                view::resize_names(tab.grid_view.upcast_ref(), icon);
             }
-            // Stamp first. Rebuilding the columns notifies the model, which
-            // asks for this zoom again. An unstamped view rebuilds forever.
-            tab.list_zoom.set(zoom);
-            view::fill_columns(tab, &tab.column_view, view::list_icon(zoom));
-            if let Some(sorter) = tab.column_view.sorter()
-                && let Some(sm) = tab.selection.model().and_downcast::<gtk::SortListModel>()
-            {
-                sm.set_sorter(Some(&view::with_hidden_last(&sorter)));
-            }
-            apply_sort_to(app, tab);
-        }
-        Some("computer") => places::rescale_tiles(app, &tab.computer_box),
-        Some("trash") => places::rescale_tiles(app, &tab.trash_box),
-        _ => {
-            if tab.grid_zoom.get() == zoom {
-                return;
-            }
-            tab.grid_zoom.set(zoom);
-            tab.grid_view.set_factory(Some(&view::grid_factory(tab, zoom)));
         }
     }
 }
