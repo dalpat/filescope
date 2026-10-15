@@ -801,31 +801,79 @@ pub(super) fn rename_with_dialog(app: &Rc<super::App>) {
 
 pub(super) fn new_folder(app: &Rc<super::App>) {
     let tab = super::navigation::active_tab(app);
-    let Some(dir) = tab.dir_list.file().and_then(|f| f.path()) else { return };
-    let entry = gtk::Entry::builder().text("New Folder").activates_default(true).build();
-    let dialog = adw::AlertDialog::new(Some("New Folder"), None);
-    dialog.set_extra_child(Some(&entry));
-    dialog.add_responses(&[("cancel", "Cancel"), ("create", "Create")]);
-    dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("create"));
-    dialog.set_close_response("cancel");
+    // This PC and Trash are not directories. The listing underneath may still be one.
+    let Some(super::Place::Folder(file)) = super::navigation::here(&tab) else { return };
+    let Some(dir) = file.path() else { return };
+    let name = fileops::new_folder_name(&dir);
+    match fileops::make_dir(&dir, &name) {
+        Ok(path) => {
+            push_undo(&app, undo::Action::NewFolder { path });
+            // A search for something else would hide "New Folder".
+            tab.search_bar.set_search_mode(false);
+            super::navigation::refresh(&tab);
+            let app = app.clone();
+            let editing = tab.clone();
+            super::navigation::select_names(&tab, &[name], move || {
+                edit_when_loaded(app.clone(), editing.clone());
+            });
+        }
+        Err(_) => super::toast(&app, "Couldn't create folder"),
+    }
+}
+
+/// The listing arrives in batches. Edit only after it has finished, so a later
+/// batch does not rebuild the row and close the editor.
+fn edit_when_loaded(app: Rc<super::App>, tab: Rc<super::Tab>) {
+    if !tab.dir_list.is_loading() {
+        open_name_editor(app, tab);
+        return;
+    }
+    let handler = Rc::new(Cell::new(None));
+    let handler_in_signal = handler.clone();
+    let app_in_signal = app.clone();
+    let tab_in_signal = tab.clone();
+    let id = tab.dir_list.connect_loading_notify(move |list| {
+        if list.is_loading() {
+            return;
+        }
+        if let Some(id) = handler_in_signal.take() {
+            list.disconnect(id);
+        }
+        open_name_editor(app_in_signal.clone(), tab_in_signal.clone());
+    });
+    handler.set(Some(id));
+    if !tab.dir_list.is_loading() {
+        if let Some(id) = handler.take() {
+            tab.dir_list.disconnect(id);
+        }
+        open_name_editor(app, tab);
+    }
+}
+
+/// Scroll the selected row on screen, then open its name editor. One retry
+/// covers the row that was not drawn yet.
+fn open_name_editor(app: Rc<super::App>, tab: Rc<super::Tab>) {
+    let bitset = tab.selection.selection();
+    if bitset.size() == 1 {
+        let pos = bitset.nth(0);
+        let flags = gtk::ListScrollFlags::NONE;
+        if app.is_list.get() {
+            tab.column_view.scroll_to(pos, None, flags, None);
+        } else {
+            tab.grid_view.scroll_to(pos, flags, None);
+        }
+    }
     let app = app.clone();
-    dialog.choose(&app.window.clone(), gio::Cancellable::NONE, move |resp| {
-        if resp != "create" {
+    let tab = tab.clone();
+    glib::idle_add_local_once(move || {
+        if super::view::start_inline_rename(&app, &tab) {
             return;
         }
-        let name = entry.text().to_string();
-        if name.is_empty() || name.contains('/') {
-            super::toast(&app, "Invalid name");
-            return;
-        }
-        match fileops::make_dir(&dir, &name) {
-            Ok(path) => {
-                push_undo(&app, undo::Action::NewFolder { path });
-                super::navigation::refresh(&super::navigation::active_tab(&app));
-            }
-            Err(_) => super::toast(&app, "Couldn't create folder"),
-        }
+        let app = app.clone();
+        let tab = tab.clone();
+        glib::idle_add_local_once(move || {
+            super::view::start_inline_rename(&app, &tab);
+        });
     });
 }
 

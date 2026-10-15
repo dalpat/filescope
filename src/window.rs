@@ -924,7 +924,7 @@ fn context_menu_for(app: &Rc<App>, on_item: bool) -> gio::Menu {
         menu.append_section(None, &edit);
     } else {
         let folder = gio::Menu::new();
-        folder.append(Some("New Folder…"), Some("win.new-folder"));
+        folder.append(Some("New Folder"), Some("win.new-folder"));
         if has_clip {
             folder.append(Some("Paste"), Some("win.paste"));
         }
@@ -1000,7 +1000,7 @@ fn primary_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     let a = gio::Menu::new();
     a.append(Some("New Tab"), Some("win.new-tab"));
-    a.append(Some("New Folder…"), Some("win.new-folder"));
+    a.append(Some("New Folder"), Some("win.new-folder"));
     a.append(Some("Open Terminal Here"), Some("win.open-terminal"));
     a.append(Some("Terminal Pane"), Some("win.terminal-pane"));
     a.append(Some("Bookmark This Folder"), Some("win.bookmark"));

@@ -44,6 +44,21 @@ pub fn remove(path: &Path) -> io::Result<()> {
     }
 }
 
+/// "New Folder", then "New Folder 2", "New Folder 3". Not the " (copy)" suffix.
+pub fn new_folder_name(dir: &Path) -> String {
+    let base = "New Folder";
+    if !dir.join(base).exists() {
+        return base.to_string();
+    }
+    for n in 2.. {
+        let name = format!("{base} {n}");
+        if !dir.join(&name).exists() {
+            return name;
+        }
+    }
+    unreachable!()
+}
+
 /// Create a new directory named `name` inside `dir`. Errors if it already exists.
 pub fn make_dir(dir: &Path, name: &str) -> io::Result<PathBuf> {
     let path = dir.join(name);
@@ -108,6 +123,31 @@ mod tests {
         // With the copy present too → " (copy 2)".
         fs::write(tmp.join("file (copy).txt"), b"x").unwrap();
         assert_eq!(unique_destination(&tmp, name), tmp.join("file (copy 2).txt"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn new_folder_name_avoids_what_is_already_there() {
+        let tmp = std::env::temp_dir().join(format!("filescope-new-folder-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(new_folder_name(&tmp), "New Folder");
+        fs::create_dir(tmp.join("New Folder")).unwrap();
+        assert_eq!(new_folder_name(&tmp), "New Folder 2");
+        fs::create_dir(tmp.join("New Folder 2")).unwrap();
+        assert_eq!(new_folder_name(&tmp), "New Folder 3");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn new_folder_name_ignores_the_copy_suffix() {
+        let tmp = std::env::temp_dir().join(format!("filescope-new-folder-copy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::create_dir(tmp.join("New Folder (copy)")).unwrap();
+        assert_eq!(new_folder_name(&tmp), "New Folder");
+        fs::create_dir(tmp.join("New Folder")).unwrap();
+        assert_eq!(new_folder_name(&tmp), "New Folder 2");
         let _ = fs::remove_dir_all(&tmp);
     }
 
