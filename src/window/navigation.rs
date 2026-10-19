@@ -131,6 +131,7 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         breadcrumb,
         computer_box,
         trash_box,
+        trash_count: Cell::new(0),
         search_bar: search_bar.clone(),
         search_entry: search_entry.clone(),
         back: RefCell::new(Vec::new()),

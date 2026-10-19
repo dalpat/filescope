@@ -9,7 +9,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 
-use crate::{archive, bookmarks, format, preview, settings, trash, undo};
+use crate::{archive, bookmarks, format, preview, settings, undo};
 
 mod commands;
 mod navigation;
@@ -109,6 +109,8 @@ struct Tab {
     breadcrumb: gtk::Box,
     computer_box: gtk::Box,
     trash_box: gtk::Box,
+    /// Count from the rendered Trash listing, independent of the folder model.
+    trash_count: Cell<u32>,
     search_bar: gtk::SearchBar,
     search_entry: gtk::SearchEntry,
     back: RefCell<Vec<Place>>,
@@ -783,6 +785,22 @@ fn about(app: &Rc<App>) {
 
 // --- Chrome -----------------------------------------------------------------
 
+fn status_line(view: &str, total: u32, selected: u64, single: Option<&gio::FileInfo>) -> String {
+    match (view, selected, single) {
+        ("computer", _, _) => String::new(),
+        ("trash", _, _) | (_, 0, _) => format!("{total} item{}", plural(total as usize)),
+        (_, 1, Some(info)) => {
+            let name = info.display_name();
+            if info.file_type() == gio::FileType::Directory {
+                name.to_string()
+            } else {
+                format!("{name} — {}", format::human_size(info.size().max(0) as u64))
+            }
+        }
+        _ => format!("{selected} selected"),
+    }
+}
+
 fn update_chrome(app: &Rc<App>) {
     let tab = navigation::active_tab(app);
     app.back_btn.set_sensitive(!tab.back.borrow().is_empty());
@@ -807,36 +825,19 @@ fn update_chrome(app: &Rc<App>) {
     };
     app.window.set_title(Some(&win_title));
 
-    let total = tab.selection.n_items();
-    let sel = commands::selected(&tab);
-    let text = if let Some(name) = special {
-        // The special views have their own contents; the tab's listing isn't it.
-        match name {
-            "Trash" => {
-                let n = trash::entries_in(&trash::home_trash()).len();
-                format!("Trash — {n} item{}", plural(n))
-            }
-            other => other.to_string(),
-        }
-    } else if sel.is_empty() {
-        format!("{total} item{}", plural(total as usize))
-    } else if let [(_, info)] = sel.as_slice() {
-        // A single selection: show its full name (folders) or name and size.
-        let name = info.display_name();
-        if info.file_type() == gio::FileType::Directory {
-            name.to_string()
-        } else {
-            format!("{name} — {}", format::human_size(info.size().max(0) as u64))
-        }
+    let total = if showing.as_deref() == Some("trash") {
+        tab.trash_count.get()
     } else {
-        let bytes: u64 = sel
-            .iter()
-            .filter(|(_, i)| i.file_type() != gio::FileType::Directory)
-            .map(|(_, i)| i.size().max(0) as u64)
-            .sum();
-        format!("{} of {total} selected — {}", sel.len(), format::human_size(bytes))
+        tab.selection.n_items()
     };
-    app.status.set_label(&text);
+    let selection = tab.selection.selection();
+    let selected = selection.size();
+    let single = if special.is_none() && selected == 1 {
+        tab.selection.item(selection.minimum()).and_downcast::<gio::FileInfo>()
+    } else {
+        None
+    };
+    app.status.set_label(&status_line(showing.as_deref().unwrap_or("grid"), total, selected, single.as_ref()));
     update_actions(app, &tab);
 }
 
@@ -1057,6 +1058,65 @@ fn permission_string(mode: u32) -> String {
 mod tests {
     use super::commands::parse_clipboard;
     use super::{ACCELS, GNOME_COPIED, URI_LIST};
+
+    fn status_item(name: &str, kind: gtk::gio::FileType, size: i64) -> gtk::gio::FileInfo {
+        let info = gtk::gio::FileInfo::new();
+        info.set_display_name(name);
+        info.set_file_type(kind);
+        info.set_size(size);
+        info
+    }
+
+    #[test]
+    fn status_line_counts_large_selections_without_item_metadata() {
+        assert_eq!(super::status_line("grid", 10_000, 10_000, None), "10000 selected");
+        assert_eq!(super::status_line("list", 10_000, 10_000, None), "10000 selected");
+    }
+
+    #[test]
+    fn status_line_for_a_folder() {
+        use gtk::gio::FileType;
+        for view in ["grid", "list", "empty"] {
+            assert_eq!(super::status_line(view, 12, 0, None), "12 items");
+            let file = status_item("notes.txt", FileType::Regular, 1000);
+            let folder = status_item("Photos", FileType::Directory, 4096);
+            assert_eq!(super::status_line(view, 12, 1, Some(&file)), "notes.txt — 1.0 kB");
+            assert_eq!(super::status_line(view, 12, 1, Some(&folder)), "Photos");
+            assert_eq!(super::status_line(view, 12, 3, None), "3 selected");
+        }
+    }
+
+    #[test]
+    fn status_line_for_this_pc_is_empty() {
+        let file = status_item("notes.txt", gtk::gio::FileType::Regular, 1000);
+        assert_eq!(super::status_line("computer", 12, 0, None), "");
+        assert_eq!(super::status_line("computer", 12, 1, Some(&file)), "");
+        assert_eq!(super::status_line("computer", 12, 10_000, None), "");
+    }
+
+    #[test]
+    fn status_line_for_trash_uses_the_given_count() {
+        let file = status_item("old-folder-selection.txt", gtk::gio::FileType::Regular, 1000);
+        assert_eq!(super::status_line("trash", 4, 0, None), "4 items");
+        assert_eq!(super::status_line("trash", 4, 1, Some(&file)), "4 items");
+        assert_eq!(super::status_line("trash", 4, 10_000, None), "4 items");
+        for (count, expected) in [(0, "0 items"), (1, "1 item"), (2, "2 items")] {
+            assert_eq!(super::status_line("trash", count, 0, None), expected);
+        }
+    }
+
+    #[test]
+    fn status_line_pluralizes_item_count() {
+        for (count, expected) in [(0, "0 items"), (1, "1 item"), (2, "2 items")] {
+            assert_eq!(super::status_line("grid", count, 0, None), expected);
+        }
+    }
+
+    #[test]
+    fn status_line_clamps_unknown_file_size() {
+        let file = status_item("notes.txt", gtk::gio::FileType::Regular, -1);
+        assert_eq!(super::status_line("grid", 1, 1, Some(&file)), "notes.txt — 0 B");
+    }
 
 
     #[test]

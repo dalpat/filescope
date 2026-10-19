@@ -483,6 +483,7 @@ pub(super) fn show_trash(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
 
     let root = trash::home_trash();
     let entries = trash::entries_in(&root);
+    tab.trash_count.set(entries.len() as u32);
 
     if entries.is_empty() {
         let page = adw::StatusPage::builder()
