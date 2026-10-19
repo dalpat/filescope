@@ -280,7 +280,7 @@ fn launch(uri: String) {
         });
         if ran
             && let Some((image, token, pixel_size, path)) = paint
-            && let Some(pixels) = crate::icon::decode_limited(path.clone(), pixel_size).await
+            && let Some(pixels) = crate::icon::decode_limited(path.clone(), pixel_size, None).await
         {
             let current = unsafe { image.data::<u64>("thumb-token") };
             if current.map(|p| unsafe { *p.as_ref() }) == Some(token) {

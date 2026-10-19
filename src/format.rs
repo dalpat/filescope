@@ -15,14 +15,22 @@ pub fn human_size(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
-/// A short, friendly modified-time label from a GLib `DateTime`.
+/// A short, friendly local-time label, regardless of the timestamp's source zone.
 pub fn modified(dt: &gtk::glib::DateTime) -> String {
-    dt.format("%Y-%m-%d %H:%M").map(|s| s.to_string()).unwrap_or_default()
+    dt.to_local().and_then(|local| local.format("%Y-%m-%d %H:%M")).map(|s| s.to_string()).unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::human_size;
+
+    #[test]
+    fn timestamps_use_one_local_timezone() {
+        let utc = gtk::glib::DateTime::from_iso8601("2024-01-02T00:00:00Z", None).unwrap();
+        let offset = gtk::glib::DateTime::from_iso8601("2024-01-02T05:30:00+05:30", None).unwrap();
+        assert_eq!(super::modified(&utc), super::modified(&offset));
+        assert!(!super::modified(&utc).is_empty());
+    }
 
     #[test]
     fn scales_through_units() {

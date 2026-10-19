@@ -262,7 +262,7 @@ fn paint_icon(image: &gtk::Image, window: &adw::ApplicationWindow, icon: &gio::I
             return;
         }
         glib::spawn_future_local(async move {
-            let Some(pixels) = crate::icon::decode_limited(path.clone(), px).await else {
+            let Some(pixels) = crate::icon::decode_limited(path.clone(), px, None).await else {
                 return;
             };
             let texture = pixels.texture();
@@ -283,7 +283,7 @@ fn load_file_thumb(image: &gtk::Image, path: std::path::PathBuf, size: i32) {
         return;
     }
     glib::spawn_future_local(async move {
-        let Some(pixels) = crate::icon::decode_limited(path.clone(), size).await else {
+        let Some(pixels) = crate::icon::decode_limited(path.clone(), size, None).await else {
             return;
         };
         if !icon_is(image.upcast_ref(), token) {

@@ -803,7 +803,7 @@ fn set_thumbnail(image: &gtk::Image, info: &gio::FileInfo, size: i32) {
 
     let image = image.clone();
     glib::spawn_future_local(async move {
-        let Some(pixels) = crate::icon::decode_limited(path.clone(), size).await else {
+        let Some(pixels) = crate::icon::decode_limited(path.clone(), size, None).await else {
             return;
         };
         // Only apply if this widget is still showing the file we decoded for.

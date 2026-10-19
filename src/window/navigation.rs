@@ -116,7 +116,12 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     content.append(&crumb_scroller);
     content.append(&search_bar);
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    content.append(&view_stack);
+    let preview_pane = crate::preview::pane::Pane::new(app.preview_pane_default.get());
+    let browser = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    view_stack.set_hexpand(true);
+    browser.append(&view_stack);
+    browser.append(&preview_pane.widget);
+    content.append(&browser);
     let terminal_pane = super::terminal::Pane::new();
     content.append(&terminal_pane.widget());
 
@@ -132,6 +137,7 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         computer_box,
         trash_box,
         trash_count: Cell::new(0),
+        preview_pane,
         search_bar: search_bar.clone(),
         search_entry: search_entry.clone(),
         back: RefCell::new(Vec::new()),
@@ -163,7 +169,11 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     // Selection → chrome.
     {
         let app = app.clone();
-        selection.connect_selection_changed(move |_, _, _| super::update_chrome(&app));
+        let tab = tab.clone();
+        selection.connect_selection_changed(move |_, _, _| {
+            super::update_chrome(&app);
+            super::update_preview(&tab);
+        });
     }
     {
         let app = app.clone();
@@ -171,6 +181,19 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         selection.connect_items_changed(move |_, _, _, _| {
             super::update_chrome(&app);
             refresh_view_mode(&app, &tab, false);
+            super::update_preview(&tab);
+        });
+    }
+    {
+        let weak = Rc::downgrade(&tab);
+        tab.view_stack.connect_visible_child_name_notify(move |_| {
+            if let Some(tab) = weak.upgrade() { super::update_preview(&tab); }
+        });
+    }
+    {
+        let weak = Rc::downgrade(&tab);
+        tab.dir_list.connect_file_notify(move |_| {
+            if let Some(tab) = weak.upgrade() { super::update_preview(&tab); }
         });
     }
     // The listing loads asynchronously; re-evaluate the empty state once it does.

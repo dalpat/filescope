@@ -4,8 +4,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Once};
 
 use gtk::{gdk, gio, glib, prelude::*};
 
@@ -247,9 +247,16 @@ pub(crate) fn store_photo(path: &Path, size: i32, texture: &gdk::Texture) {
 
 /// Decode off the UI thread. A folder of photos used to start one decode per
 /// file at once and pin every core; two at a time is enough to fill the view.
-pub(crate) async fn decode_limited(path: PathBuf, size: i32) -> Option<Pixels> {
-    let _slot = acquire_slot().await;
-    gio::spawn_blocking(move || decode_pixels(&path, size)).await.ok().flatten()
+pub(crate) async fn decode_limited(path: PathBuf, size: i32, cancel: Option<Arc<AtomicBool>>) -> Option<Pixels> {
+    let slot = acquire_slot(cancel.as_deref()).await?;
+    gio::spawn_blocking(move || {
+        // Keep the slot until the worker finishes, even if its waiter is dropped.
+        let _slot = slot;
+        if cancel.as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return None;
+        }
+        decode_pixels(&path, size)
+    }).await.ok().flatten()
 }
 
 struct Slot;
@@ -260,15 +267,18 @@ impl Drop for Slot {
     }
 }
 
-async fn acquire_slot() -> Slot {
+async fn acquire_slot(cancel: Option<&AtomicBool>) -> Option<Slot> {
     loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return None;
+        }
         let n = DECODE_BUSY.load(Ordering::Relaxed);
         if n < DECODE_SLOTS
             && DECODE_BUSY
                 .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
         {
-            return Slot;
+            return Some(Slot);
         }
         glib::timeout_future(std::time::Duration::from_millis(20)).await;
     }
@@ -304,6 +314,47 @@ fn store(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancelled_image_waiter_exits_before_decoder_slots_are_freed() {
+        use super::*;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let context = glib::MainContext::new();
+        context.block_on(async {
+            let slots = Rc::new(RefCell::new(Vec::new()));
+            for _ in 0..DECODE_SLOTS {
+                let slot = acquire_slot(None).await.unwrap();
+                slots.borrow_mut().push(slot);
+            }
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let cancel_signal = cancelled.clone();
+            context.spawn_local(async move {
+                glib::timeout_future(Duration::from_millis(10)).await;
+                cancel_signal.store(true, Ordering::Relaxed);
+            });
+            let freed = Rc::new(Cell::new(false));
+            let deadline_freed = freed.clone();
+            let deadline_slots = slots.clone();
+            let deadline = context.spawn_local(async move {
+                glib::timeout_future(Duration::from_secs(1)).await;
+                deadline_freed.set(true);
+                deadline_slots.borrow_mut().clear();
+            });
+            let result = decode_limited(
+                std::env::temp_dir().join("filescope-cancelled-preview.png"),
+                32,
+                Some(cancelled),
+            ).await;
+            deadline.abort();
+            slots.borrow_mut().clear();
+            assert!(result.is_none());
+            assert!(!freed.get(), "cancelled request waited for decoder slots instead of exiting");
+            assert_eq!(DECODE_BUSY.load(Ordering::Relaxed), 0);
+        });
+    }
+
     use super::{wants_symbolic, IconCache, themed_key};
 
     #[test]

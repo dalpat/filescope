@@ -81,7 +81,9 @@ pub(super) fn open_with(app: &Rc<super::App>) {
 /// Space toggles a preview of the single selected file. Sushi gets it when
 /// installed; otherwise the in-app window opens.
 pub(super) fn toggle_preview(app: &Rc<super::App>) {
-    if let Some(win) = app.preview.borrow_mut().take() {
+    // Closing emits close-request, whose callback borrows preview again.
+    let existing = app.preview.borrow_mut().take();
+    if let Some(win) = existing {
         win.close();
         return;
     }

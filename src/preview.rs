@@ -10,6 +10,8 @@ use gtk::{gio, glib};
 
 use crate::format;
 
+pub(crate) mod pane;
+
 const SUSHI_NAME: &str = "org.gnome.NautilusPreviewer";
 const SUSHI_PATH: &str = "/org/gnome/NautilusPreviewer";
 const SUSHI_IFACE: &str = "org.gnome.NautilusPreviewer2";

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub is_list: bool,
+    pub preview_pane: bool,
     pub zoom: i32,
     /// 0 = name, 1 = size, 2 = modified.
     pub sort_key: u8,
@@ -21,6 +22,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             is_list: false,
+            preview_pane: false,
             zoom: 80,
             sort_key: 0,
             sort_desc: false,
@@ -55,6 +57,7 @@ impl Settings {
             let (key, value) = (key.trim(), value.trim());
             match key {
                 "is_list" => set(&mut settings.is_list, value.parse().ok()),
+                "preview_pane" => set(&mut settings.preview_pane, value.parse().ok()),
                 "zoom" => {
                     set(&mut settings.zoom, value.parse().ok().map(|z: i32| z.clamp(ZOOM_MIN, ZOOM_MAX)))
                 }
@@ -75,6 +78,7 @@ impl Settings {
     pub fn serialize(&self) -> String {
         [
             format!("is_list={}", self.is_list),
+            format!("preview_pane={}", self.preview_pane),
             format!("zoom={}", self.zoom),
             format!("sort_key={}", self.sort_key),
             format!("sort_desc={}", self.sort_desc),
@@ -114,9 +118,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preview_pane_setting_survives_round_trip() {
+        let saved = Settings::parse("preview_pane=true\n").serialize();
+        assert!(saved.contains("preview_pane=true\n"));
+        assert_eq!(Settings::parse(&saved).serialize(), saved);
+        assert!(Settings::parse("").serialize().contains("preview_pane=false\n"));
+    }
+
+    #[test]
     fn round_trips_through_serialize_and_parse() {
         let settings = Settings {
             is_list: true,
+            preview_pane: true,
             zoom: 128,
             sort_key: 2,
             sort_desc: true,

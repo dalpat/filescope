@@ -25,6 +25,7 @@ const CSS: &str = "
 .fs-grid > child:selected { background: alpha(@accent_bg_color, 0.22); }
 .fs-drop { background: alpha(@accent_bg_color, 0.35); border-radius: 8px; outline: 2px solid @accent_color; outline-offset: -2px; }
 .fs-name { margin-top: 4px; }
+.fs-preview-pane { background: @window_bg_color; border-radius: 0; box-shadow: none; border-left: 1px solid alpha(@window_fg_color, 0.12); }
 .fs-hidden { opacity: 0.45; }
 columnview > header > button { padding: 2px 12px 8px; min-height: 0; }
 columnview > listview > row { border-radius: 8px; margin: 1px 8px; }
@@ -111,6 +112,7 @@ struct Tab {
     trash_box: gtk::Box,
     /// Count from the rendered Trash listing, independent of the folder model.
     trash_count: Cell<u32>,
+    preview_pane: Rc<preview::pane::Pane>,
     search_bar: gtk::SearchBar,
     search_entry: gtk::SearchEntry,
     back: RefCell<Vec<Place>>,
@@ -142,6 +144,7 @@ struct App {
     show_hidden: Rc<Cell<bool>>,
     bookmarks: RefCell<Vec<PathBuf>>,
     preview: RefCell<Option<adw::Window>>,
+    preview_pane_default: Cell<bool>,
     /// Shared sort: which column (0 = name, 1 = size, 2 = modified) and whether
     /// descending. Applied to the active tab (both grid and list share one sort
     /// model), and seeded into new tabs.
@@ -343,6 +346,7 @@ fn build(app: &adw::Application) {
         show_hidden: Rc::new(Cell::new(cfg.show_hidden)),
         bookmarks: RefCell::new(bookmarks::load()),
         preview: RefCell::new(None),
+        preview_pane_default: Cell::new(cfg.preview_pane),
         sort_key: Cell::new(cfg.sort_key),
         sort_desc: Cell::new(cfg.sort_desc),
         progress_box,
@@ -370,16 +374,10 @@ fn build(app: &adw::Application) {
         let state = state.clone();
         window.connect_close_request(move |window| {
             preview::close_sushi(window);
-            settings::save(&settings::Settings {
-                is_list: state.is_list.get(),
-                zoom: state.zoom.get(),
-                sort_key: state.sort_key.get(),
-                sort_desc: state.sort_desc.get(),
-                show_hidden: state.show_hidden.get(),
-                width: window.default_width(),
-                height: window.default_height(),
-                maximized: window.is_maximized(),
-            });
+            for tab in state.tabs.borrow().iter() {
+                tab.preview_pane.set_visible(false);
+            }
+            save_settings(&state);
             glib::Propagation::Proceed
         });
     }
@@ -396,6 +394,9 @@ fn build(app: &adw::Application) {
             if tv.n_pages() <= 1 {
                 tv.close_page_finish(page, false);
             } else {
+                for tab in state.tabs.borrow().iter().filter(|t| t.page.borrow().as_ref() == Some(page)) {
+                    tab.preview_pane.set_visible(false);
+                }
                 state.tabs.borrow_mut().retain(|t| t.page.borrow().as_ref() != Some(page));
                 tv.close_page_finish(page, true);
             }
@@ -635,6 +636,7 @@ const ACCELS: &[(&str, &[&str])] = &[
     ("select-all", &["<ctrl>a"]),
     ("refresh", &["<ctrl>r", "F5"]),
     ("find", &["<ctrl>f"]),
+    ("preview-pane", &["<ctrl><shift>p"]),
     ("toggle-hidden", &["<ctrl>h"]),
     ("bookmark", &["<ctrl>d"]),
     ("undo", &["<ctrl>z"]),
@@ -693,6 +695,21 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     action!("zoom-in", |s: &Rc<App>| zoom(s, ZOOM_STEP));
     action!("zoom-out", |s: &Rc<App>| zoom(s, -ZOOM_STEP));
     action!("about", about);
+
+    let pane = gio::SimpleAction::new_stateful("preview-pane", None, &false.to_variant());
+    {
+        let state = state.clone();
+        pane.connect_activate(move |action, _| {
+            let tab = navigation::active_tab(&state);
+            let visible = !tab.preview_pane.widget.is_visible();
+            tab.preview_pane.set_visible(visible);
+            update_preview(&tab);
+            action.set_state(&visible.to_variant());
+            state.preview_pane_default.set(visible);
+            save_settings(&state);
+        });
+    }
+    state.window.add_action(&pane);
 
     let default_fm = gio::SimpleAction::new_stateful(
         "default-file-manager",
@@ -803,6 +820,7 @@ fn status_line(view: &str, total: u32, selected: u64, single: Option<&gio::FileI
 
 fn update_chrome(app: &Rc<App>) {
     let tab = navigation::active_tab(app);
+    commands::set_action_state(app, "preview-pane", &tab.preview_pane.widget.is_visible().to_variant());
     app.back_btn.set_sensitive(!tab.back.borrow().is_empty());
     app.fwd_btn.set_sensitive(!tab.fwd.borrow().is_empty());
     app.up_btn.set_sensitive(tab.dir_list.file().and_then(|f| f.parent()).is_some());
@@ -997,6 +1015,35 @@ fn toggle_terminal_pane(app: &Rc<App>) {
     tab.terminal.toggle(cwd.as_deref());
 }
 
+fn save_settings(app: &App) {
+    settings::save(&settings::Settings {
+        is_list: app.is_list.get(),
+        preview_pane: app.preview_pane_default.get(),
+        zoom: app.zoom.get(),
+        sort_key: app.sort_key.get(),
+        sort_desc: app.sort_desc.get(),
+        show_hidden: app.show_hidden.get(),
+        width: app.window.default_width(),
+        height: app.window.default_height(),
+        maximized: app.window.is_maximized(),
+    });
+}
+
+fn update_preview(tab: &Tab) {
+    let selection = tab.selection.selection();
+    let target = if selection.size() == 1
+        && !matches!(tab.view_stack.visible_child_name().as_deref(), Some("computer" | "trash"))
+    {
+        tab.dir_list.file().and_then(|dir| {
+            let info = tab.selection.item(selection.minimum()).and_downcast::<gio::FileInfo>()?;
+            Some((dir.child(info.name()), info))
+        })
+    } else {
+        None
+    };
+    tab.preview_pane.set_target(target);
+}
+
 fn primary_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     let a = gio::Menu::new();
@@ -1009,6 +1056,7 @@ fn primary_menu() -> gio::Menu {
     let b = gio::Menu::new();
     b.append(Some("Search…"), Some("win.find"));
     b.append(Some("Show Hidden Files"), Some("win.toggle-hidden"));
+    b.append(Some("Preview Pane"), Some("win.preview-pane"));
     b.append(Some("Zoom In"), Some("win.zoom-in"));
     b.append(Some("Zoom Out"), Some("win.zoom-out"));
     b.append(Some("Refresh"), Some("win.refresh"));
@@ -1043,7 +1091,7 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-fn permission_string(mode: u32) -> String {
+pub(crate) fn permission_string(mode: u32) -> String {
     let bit = |shift: u32, ch: char| if mode & (1 << shift) != 0 { ch } else { '-' };
     [
         bit(8, 'r'), bit(7, 'w'), bit(6, 'x'),
