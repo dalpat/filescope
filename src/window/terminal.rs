@@ -10,6 +10,40 @@ use vte::prelude::*;
 const MIN_HEIGHT: i32 = 120;
 const MAX_HEIGHT: i32 = 640;
 
+struct Session {
+    terminal: vte::Terminal,
+    spawn: gtk::gio::Cancellable,
+    pid: Cell<Option<gtk::glib::Pid>>,
+    closing: Cell<bool>,
+    exited: Cell<bool>,
+}
+
+impl Session {
+    fn signal(&self, signal: i32) {
+        if let Some(pid) = self.pid.get() {
+            // VTE starts the shell in its own session/process group and reaps it.
+            unsafe {
+                libc::kill(-pid.0, signal);
+                libc::kill(pid.0, signal);
+            }
+        }
+    }
+
+    fn close(self: &Rc<Self>) {
+        if self.closing.replace(true) { return; }
+        self.spawn.cancel();
+        self.signal(libc::SIGHUP);
+        let session = self.clone();
+        let hold = gtk::gio::Application::default().map(|app| app.hold());
+        gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+            // child-exited clears pid before this runs, avoiding signals to a reused PID.
+            session.signal(libc::SIGKILL);
+            // Dropping the terminal releases its PTY; it may already be disposed.
+            drop(hold);
+        });
+    }
+}
+
 /// One tab's bottom pane. The shell is started once and kept when the pane hides.
 pub(super) struct Pane {
     revealer: gtk::Revealer,
@@ -17,6 +51,8 @@ pub(super) struct Pane {
     note: gtk::Label,
     shell: Rc<RefCell<Option<vte::Terminal>>>,
     height: Rc<Cell<i32>>,
+    session: RefCell<Option<Rc<Session>>>,
+    closed: Cell<bool>,
 }
 
 impl Pane {
@@ -91,10 +127,13 @@ impl Pane {
             note,
             shell,
             height,
+            session: RefCell::new(None),
+            closed: Cell::new(false),
         };
-        let hide = pane.revealer.clone();
-        let shell = pane.shell.clone();
+        let hide = pane.revealer.downgrade();
+        let shell = Rc::downgrade(&pane.shell);
         close.connect_clicked(move |_| {
+            let (Some(hide), Some(shell)) = (hide.upgrade(), shell.upgrade()) else { return; };
             hide.set_reveal_child(false);
             if let Some(term) = shell.borrow().as_ref() {
                 set_shell_accels(term, true);
@@ -107,8 +146,20 @@ impl Pane {
         self.revealer.clone()
     }
 
+    pub(super) fn shutdown(&self) {
+        if self.closed.replace(true) { return; }
+        let term = self.shell.borrow_mut().take();
+        if let Some(term) = term {
+            if term.has_focus() { set_shell_accels(&term, true); }
+            if term.parent().is_some() { self.body.remove(&term); }
+        }
+        if let Some(session) = self.session.borrow_mut().take() { session.close(); }
+        self.revealer.set_reveal_child(false);
+    }
+
     /// Show or hide the pane. A shell starts only the first time `cwd` is a folder.
     pub(super) fn toggle(&self, cwd: Option<&Path>) {
+        if self.closed.get() { return; }
         if self.revealer.reveals_child() {
             self.revealer.set_reveal_child(false);
             if let Some(term) = self.shell.borrow().as_ref() {
@@ -142,10 +193,21 @@ impl Pane {
         self.body.append(&term);
         *self.shell.borrow_mut() = Some(term.clone());
 
-        let body = self.body.clone();
-        let note = self.note.clone();
-        let shell = self.shell.clone();
+        let session = Rc::new(Session {
+            terminal: term.clone(), spawn: gtk::gio::Cancellable::new(),
+            pid: Cell::new(None), closing: Cell::new(false), exited: Cell::new(false),
+        });
+        *self.session.borrow_mut() = Some(session.clone());
+        let body = self.body.downgrade();
+        let note = self.note.downgrade();
+        let shell = Rc::downgrade(&self.shell);
+        let child = Rc::downgrade(&session);
         term.connect_child_exited(move |term, _status| {
+            let Some(child) = child.upgrade() else { return; };
+            child.pid.set(None);
+            child.exited.set(true);
+            if child.closing.get() { return; }
+            let (Some(body), Some(note), Some(shell)) = (body.upgrade(), note.upgrade(), shell.upgrade()) else { return; };
             // Ctrl+D (or `exit`) ended the shell. Drop it so the next open starts fresh.
             body.remove(term);
             body.set_size_request(-1, -1);
@@ -158,10 +220,10 @@ impl Pane {
         let shell_bin = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let env = process_env();
         let env_refs: Vec<&str> = env.iter().map(String::as_str).collect();
-        let host = self.body.clone();
-        let note = self.note.clone();
-        let shell = self.shell.clone();
-        let failed = term.clone();
+        let host = self.body.downgrade();
+        let note = self.note.downgrade();
+        let shell = Rc::downgrade(&self.shell);
+        let child = Rc::downgrade(&session);
         term.spawn_async(
             vte::PtyFlags::DEFAULT,
             Some(dir),
@@ -170,21 +232,35 @@ impl Pane {
             gtk::glib::SpawnFlags::DEFAULT,
             || {},
             -1,
-            None::<&gtk::gio::Cancellable>,
-            move |result| match result {
-                Ok(pid) => failed.watch_child(pid),
+            Some(&session.spawn),
+            move |result| {
+                let Some(child) = child.upgrade() else { return; };
+                match result {
+                Ok(pid) => {
+                    // spawn_async already installs VTE's child watch.
+                    if !child.exited.get() {
+                        child.pid.set(Some(pid));
+                        if child.closing.get() { child.signal(libc::SIGHUP); }
+                    }
+                }
                 Err(_) => {
-                    host.remove(&failed);
+                    if child.closing.get() { return; }
+                    let (Some(host), Some(note), Some(shell)) = (host.upgrade(), note.upgrade(), shell.upgrade()) else { return; };
+                    if child.terminal.has_focus() { set_shell_accels(&child.terminal, true); }
+                    host.remove(&child.terminal);
                     note.set_label("Couldn't start the shell");
                     note.set_visible(true);
                     *shell.borrow_mut() = None;
-                    set_shell_accels(&failed, true);
                 }
-            },
+            }},
         );
         term.grab_focus();
         set_shell_accels(&term, false);
     }
+}
+
+impl Drop for Pane {
+    fn drop(&mut self) { self.shutdown(); }
 }
 
 /// Dragging the handle up grows the pane. `dy` is negative when the pointer moves up.
@@ -316,10 +392,10 @@ fn process_env() -> Vec<String> {
 /// turn them off so Ctrl+C and Ctrl+D reach the command. Ctrl+backtick still closes the pane.
 fn watch_focus(term: &vte::Terminal) {
     let focus = gtk::EventControllerFocus::new();
-    let enter = term.clone();
-    focus.connect_enter(move |_| set_shell_accels(&enter, false));
-    let leave = term.clone();
-    focus.connect_leave(move |_| set_shell_accels(&leave, true));
+    let enter = term.downgrade();
+    focus.connect_enter(move |_| { if let Some(term) = enter.upgrade() { set_shell_accels(&term, false); } });
+    let leave = term.downgrade();
+    focus.connect_leave(move |_| { if let Some(term) = leave.upgrade() { set_shell_accels(&term, true); } });
     term.add_controller(focus);
 }
 
@@ -335,6 +411,57 @@ fn set_shell_accels(term: &vte::Terminal, enable: bool) {
 #[cfg(test)]
 mod tests {
     use super::dragged_height;
+
+    #[test]
+    #[ignore = "requires an isolated graphical session with SHELL=/bin/sh"]
+    fn terminal_shutdown_reaps_running_and_spawning_shells() {
+        use super::*;
+        assert_eq!(std::env::var("SHELL").as_deref(), Ok("/bin/sh"));
+        gtk::init().unwrap();
+        let context = gtk::glib::MainContext::default();
+        context.with_thread_default(|| context.block_on(async {
+            for (immediate, stubborn) in [(false, false), (true, false), (false, true)] {
+                let pane = Pane::new();
+                let window = gtk::Window::new();
+                window.set_child(Some(&pane.widget()));
+                window.present();
+                pane.toggle(Some(std::path::Path::new("/tmp")));
+                let session = pane.session.borrow().clone().unwrap();
+                let weak = Rc::downgrade(&session);
+                if !immediate {
+                    let started = std::time::Instant::now();
+                    while session.pid.get().is_none() {
+                        assert!(started.elapsed().as_secs() < 5);
+                        gtk::glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+                if stubborn {
+                    let marker = std::env::temp_dir().join(format!("filescope-shell-ready-{}", std::process::id()));
+                    let _ = std::fs::remove_file(&marker);
+                    session.terminal.feed_child(format!("trap '' HUP; echo ready > {}\n", marker.display()).as_bytes());
+                    let started = std::time::Instant::now();
+                    while !marker.exists() {
+                        assert!(started.elapsed().as_secs() < 5, "shell did not install its signal trap");
+                        gtk::glib::timeout_future(std::time::Duration::from_millis(10)).await;
+                    }
+                    std::fs::remove_file(marker).unwrap();
+                }
+                let pid = session.pid.get();
+                pane.shutdown();
+                pane.shutdown(); // Closing twice is harmless.
+                window.close();
+                assert!(pane.shell.borrow().is_none());
+                assert!(pane.session.borrow().is_none());
+                drop(session);
+                gtk::glib::timeout_future(std::time::Duration::from_millis(800)).await;
+                assert!(weak.upgrade().is_none(), "terminal session was retained");
+                if let Some(pid) = pid {
+                    assert_eq!(unsafe { libc::kill(pid.0, 0) }, -1, "closed shell is still alive");
+                    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+                }
+            }
+        })).unwrap();
+    }
 
     #[test]
     fn dragging_up_grows_the_pane_and_down_shrinks_it() {

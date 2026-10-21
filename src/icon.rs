@@ -156,6 +156,7 @@ struct Shown {
 thread_local! {
     static THEMED: RefCell<IconCache<gtk::IconPaintable>> = RefCell::new(IconCache::new());
     static SHOWN: RefCell<Vec<Shown>> = RefCell::new(Vec::new());
+    static STATUS: RefCell<Vec<(glib::WeakRef<adw::StatusPage>, String, i32)>> = RefCell::new(Vec::new());
 }
 
 fn watch_theme(display: &gdk::Display) {
@@ -187,6 +188,14 @@ fn refresh_shown() {
         if let Some(paintable) = still_icon(&display, scale, &icon, size) {
             image.set_paintable(Some(&paintable));
         }
+    }
+    let pages = STATUS.with(|pages| {
+        let mut pages = pages.borrow_mut();
+        pages.retain(|(page, _, _)| page.upgrade().is_some());
+        pages.iter().filter_map(|(page, name, size)| page.upgrade().map(|page| (page, name.clone(), *size))).collect::<Vec<_>>()
+    });
+    for (page, name, size) in pages {
+        page.set_paintable(status_paintable(&name, size).as_ref());
     }
 }
 
@@ -319,6 +328,44 @@ fn store(
 #[cfg(test)]
 mod tests {
     #[test]
+    #[ignore = "requires an isolated graphical session"]
+    fn theme_change_refreshes_images_and_status_pages() {
+        use super::*;
+        adw::init().unwrap();
+        let root = std::env::temp_dir().join(format!("filescope-icon-themes-{}", std::process::id()));
+        for (name, color) in [("Before", "red"), ("After", "blue")] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(dir.join("scalable/actions")).unwrap();
+            std::fs::write(dir.join("index.theme"), format!("[Icon Theme]\nName={name}\nDirectories=scalable/actions\n[scalable/actions]\nSize=128\nType=Scalable\nMinSize=1\nMaxSize=256\nContext=Actions\n")).unwrap();
+            std::fs::write(dir.join("scalable/actions/folder-symbolic.svg"), format!("<svg xmlns='http://www.w3.org/2000/svg' width='128' height='128'><rect width='128' height='128' fill='{color}'/></svg>")).unwrap();
+        }
+        let display = gdk::Display::default().unwrap();
+        gtk::IconTheme::for_display(&display).add_search_path(&root);
+        let settings = gtk::Settings::default().unwrap();
+        settings.set_gtk_icon_theme_name(Some("Before"));
+        let first = image_named("folder-symbolic", 128);
+        let second = image_named("folder-symbolic", 128);
+        let page = adw::StatusPage::new();
+        show_status(&page, "folder-symbolic", 128);
+        assert_eq!(first.paintable(), second.paintable());
+        assert_eq!(page.paintable(), first.paintable());
+        let context = glib::MainContext::default();
+        context.block_on(async {
+            settings.set_gtk_icon_theme_name(Some("After"));
+            glib::timeout_future(std::time::Duration::from_millis(100)).await;
+        });
+        let current = status_paintable("folder-symbolic", 128).unwrap();
+        assert!(current.file().unwrap().path().unwrap().starts_with(root.join("After")));
+        assert_eq!(first.paintable(), Some(current.clone().upcast()));
+        assert_eq!(second.paintable(), first.paintable());
+        assert_eq!(page.paintable(), first.paintable());
+        drop(page);
+        refresh_shown();
+        STATUS.with(|pages| assert!(pages.borrow().is_empty()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cancelled_image_waiter_exits_before_decoder_slots_are_freed() {
         use super::*;
         use std::cell::Cell;
@@ -439,4 +486,13 @@ pub(crate) fn flat_button(name: &str, tooltip: &str) -> gtk::Button {
 pub(crate) fn status_paintable(name: &str, size: i32) -> Option<gtk::IconPaintable> {
     let display = gdk::Display::default()?;
     still_named(&display, display_scale(&display), name, size)
+}
+
+pub(crate) fn show_status(page: &adw::StatusPage, name: &str, size: i32) {
+    page.set_paintable(status_paintable(name, size).as_ref());
+    STATUS.with(|pages| {
+        let mut pages = pages.borrow_mut();
+        pages.retain(|(weak, _, _)| weak.upgrade().is_some_and(|old| old != *page));
+        pages.push((page.downgrade(), name.to_owned(), size));
+    });
 }

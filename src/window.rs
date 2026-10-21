@@ -128,6 +128,20 @@ struct Tab {
     terminal: terminal::Pane,
 }
 
+impl Tab {
+    fn shutdown(&self) {
+        self.terminal.shutdown();
+        self.search.cancel();
+        self.preview_pane.set_visible(false);
+        // Special-view cards hold navigation callbacks back to this tab.
+        for container in [&self.computer_box, &self.trash_box] {
+            while let Some(child) = container.first_child() {
+                container.remove(&child);
+            }
+        }
+    }
+}
+
 /// The whole window and its shared state.
 struct App {
     window: adw::ApplicationWindow,
@@ -392,8 +406,7 @@ fn build(app: &adw::Application) {
         window.connect_close_request(move |window| {
             preview::close_sushi(window);
             for tab in state.tabs.borrow().iter() {
-                tab.search.cancel();
-                tab.preview_pane.set_visible(false);
+                tab.shutdown();
             }
             save_settings(&state);
             // The search service can outlive this window. Reopening must build
@@ -420,8 +433,7 @@ fn build(app: &adw::Application) {
                 tv.close_page_finish(page, false);
             } else {
                 for tab in state.tabs.borrow().iter().filter(|t| t.page.borrow().as_ref() == Some(page)) {
-                    tab.search.cancel();
-                tab.preview_pane.set_visible(false);
+                    tab.shutdown();
                 }
                 state.tabs.borrow_mut().retain(|t| t.page.borrow().as_ref() != Some(page));
                 tv.close_page_finish(page, true);
@@ -1143,6 +1155,44 @@ pub(crate) fn permission_string(mode: u32) -> String {
 mod tests {
     use super::commands::parse_clipboard;
     use super::{ACCELS, GNOME_COPIED, URI_LIST};
+
+    #[test]
+    #[ignore = "requires an isolated graphical session and temporary XDG_CONFIG_HOME"]
+    fn closed_tabs_release_folder_and_special_views() {
+        use super::*;
+        assert!(std::env::var_os("XDG_CONFIG_HOME").is_some());
+        adw::init().unwrap();
+        gtk::Settings::default().unwrap().set_gtk_enable_animations(false);
+        let application = adw::Application::builder()
+            .application_id("dev.filescope.TabCleanupTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let context = glib::MainContext::default();
+        context.block_on(async {
+            open_files(&application, &[gio::File::for_path(std::env::temp_dir())]);
+            let app = app_state(&application).unwrap();
+            for view in ["grid", "computer", "trash"] {
+                navigation::new_tab(&app, gio::File::for_path(std::env::temp_dir()), true);
+                let tab = navigation::active_tab(&app);
+                match view {
+                    "computer" => places::show_computer(&app, &tab),
+                    "trash" => places::show_trash(&app, &tab),
+                    _ => {},
+                }
+                glib::timeout_future(std::time::Duration::from_millis(200)).await;
+                let weak = Rc::downgrade(&tab);
+                let page = tab.page.borrow().clone().unwrap();
+                drop(tab);
+                app.tab_view.close_page(&page);
+                drop(page);
+                glib::timeout_future(std::time::Duration::from_millis(600)).await;
+                assert!(weak.upgrade().is_none(), "closed {view} tab is retained");
+                assert_eq!(app.tabs.borrow().len(), 1);
+            }
+            app.window.close();
+        });
+    }
 
     fn status_item(name: &str, kind: gtk::gio::FileType, size: i64) -> gtk::gio::FileInfo {
         let info = gtk::gio::FileInfo::new();

@@ -122,8 +122,9 @@ Built with **Rust + GTK4 + libadwaita**.
 ## Install (prebuilt — no build tools needed)
 
 Grab the latest tarball from the [**Releases**](../../releases) page and run its
-installer. You only need a modern GNOME desktop (GTK 4.16+ / libadwaita 1.5+
-runtime, e.g. GNOME 46+) — **no compiler, no Rust, no `-dev` packages**:
+installer. The x86_64 Linux build requires glibc 2.39+, GTK 4.16+, libadwaita 1.5+,
+and VTE's GTK4 library (VTE 0.65+) — **no compiler, no Rust, no `-dev` packages**. On Debian/Ubuntu,
+the VTE runtime package is `libvte-2.91-gtk4-0`; GTK3-only VTE does not satisfy it:
 
 ```sh
 tar -xzf filescope-*-x86_64-linux.tar.gz
@@ -140,10 +141,10 @@ not to install? Just run `./filescope` from the extracted folder. Remove it with
 
 ## Build & run
 
-Building **from source** requires the GTK4 and libadwaita development packages:
+Building **from source** also requires the GTK4, libadwaita, and VTE GTK4 development packages:
 
 ```sh
-sudo apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev
+sudo apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
 ```
 
 Then:

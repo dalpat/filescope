@@ -46,9 +46,7 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         .title("This Folder Is Empty")
         .description("Drop files here, or paste to add some.")
         .build();
-    if let Some(paintable) = crate::icon::status_paintable("folder-symbolic", 128) {
-        empty_page.set_paintable(Some(&paintable));
-    }
+    crate::icon::show_status(&empty_page, "folder-symbolic", 128);
 
     let view_stack = gtk::Stack::new();
     view_stack.add_named(&grid_scroller, Some("grid"));
@@ -125,28 +123,30 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
 
     // Activation on both views.
     {
-        let app = app.clone();
-        let tab = tab.clone();
-        grid_view.connect_activate(move |_, pos| super::commands::activate(&app, &tab, pos));
+        let app = Rc::downgrade(app);
+        let tab = Rc::downgrade(&tab);
+        grid_view.connect_activate(move |_, pos| { if let (Some(app), Some(tab)) = (app.upgrade(), tab.upgrade()) { super::commands::activate(&app, &tab, pos); } });
     }
     {
-        let app = app.clone();
-        let tab = tab.clone();
-        column_view.connect_activate(move |_, pos| super::commands::activate(&app, &tab, pos));
+        let app = Rc::downgrade(app);
+        let tab = Rc::downgrade(&tab);
+        column_view.connect_activate(move |_, pos| { if let (Some(app), Some(tab)) = (app.upgrade(), tab.upgrade()) { super::commands::activate(&app, &tab, pos); } });
     }
     // Selection → chrome.
     {
-        let app = app.clone();
-        let tab = tab.clone();
+        let app = Rc::downgrade(app);
+        let tab = Rc::downgrade(&tab);
         selection.connect_selection_changed(move |_, _, _| {
+            let (Some(app), Some(tab)) = (app.upgrade(), tab.upgrade()) else { return; };
             super::update_chrome(&app);
             super::update_preview(&tab);
         });
     }
     {
-        let app = app.clone();
-        let tab = tab.clone();
+        let app = Rc::downgrade(app);
+        let tab = Rc::downgrade(&tab);
         selection.connect_items_changed(move |_, _, _, _| {
+            let (Some(app), Some(tab)) = (app.upgrade(), tab.upgrade()) else { return; };
             super::update_chrome(&app);
             refresh_view_mode(&app, &tab, false);
             super::update_preview(&tab);
@@ -166,10 +166,10 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     }
     // The listing loads asynchronously; re-evaluate the empty state once it does.
     {
-        let app = app.clone();
-        let tab = tab.clone();
         let dir_list = tab.dir_list.clone();
-        dir_list.connect_loading_notify(move |_| refresh_view_mode(&app, &tab, false));
+        let app = Rc::downgrade(app);
+        let tab = Rc::downgrade(&tab);
+        dir_list.connect_loading_notify(move |_| { if let (Some(app), Some(tab)) = (app.upgrade(), tab.upgrade()) { refresh_view_mode(&app, &tab, false); } });
     }
     // Context menu.
     super::view::attach_context_menu(app, &grid_view);
@@ -372,10 +372,10 @@ pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn
         return;
     }
     let names = Rc::new(names.to_vec());
-    let then = Rc::new(then);
+    let then = Rc::new(RefCell::new(Some(then)));
     let done = Rc::new(Cell::new(false));
     let attempt = Rc::new({
-        let tab = tab.clone();
+        let tab = Rc::downgrade(tab);
         let names = names.clone();
         let then = then.clone();
         let done = done.clone();
@@ -383,6 +383,7 @@ pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn
             if done.get() {
                 return;
             }
+            let Some(tab) = tab.upgrade() else { return; };
             let selection = &tab.selection;
             let mut found = Vec::new();
             for i in 0..selection.n_items() {
@@ -404,9 +405,8 @@ pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn
                 selection.select_item(*pos, n == 0);
             }
             done.set(true);
-            if !found.is_empty() {
-                then();
-            }
+            let callback = then.borrow_mut().take();
+            if !found.is_empty() && let Some(callback) = callback { callback(); }
         }
     });
     attempt();
@@ -441,10 +441,10 @@ pub(super) fn rebuild_breadcrumb(app: &Rc<super::App>, tab: &Rc<super::Tab>, fil
             button.add_css_class("current");
         }
         {
-            let app = app.clone();
-            let tab = tab.clone();
+            let app = Rc::downgrade(app);
+            let tab = Rc::downgrade(tab);
             let target = f.clone();
-            button.connect_clicked(move |_| navigate(&app, &tab, target.clone()));
+            button.connect_clicked(move |_| { if let (Some(app), Some(tab)) = (app.upgrade(), tab.upgrade()) { navigate(&app, &tab, target.clone()); } });
         }
         tab.breadcrumb.append(&button);
     }

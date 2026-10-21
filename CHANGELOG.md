@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.6.0] - 2026-10-21
+
+Indexed search, a preview pane, and a terminal inside each tab.
+
+### Added
+- **GNOME Overview search** with ranked results, file-type icons, readable
+  locations, and a working “more” action. **Ctrl+F** searches the current folder
+  and its indexed descendants; load more results without the Overview limit.
+  A bounded fallback remains available when the index cannot be used.
+- **Preview pane** with image/text previews and file properties, including
+  properties alongside image previews.
+- **Terminal pane** per tab, toggled with Ctrl+Backtick. Hiding it retains the
+  shell and its working directory; closing the tab terminates the session.
+- **Missing thumbnails** generated through installed desktop thumbnailers,
+  with validated cache entries, cancellation, and process timeouts.
+
+### Changed
+- **New Folder** creates and selects the folder immediately, with inline name
+  editing and numeric suffixes for existing names. Rename and creation can be
+  undone separately; creation undo preserves files added afterward.
+- **Zoom** resizes existing grid/list cells without resetting selection or
+  scrolling. Names grow with icons, and icons reload at the requested resolution.
+- **Shared theme icons** refresh visible consumers, including empty states,
+  when the theme changes.
+- **Status bar** uses concise item and selection information.
+
+### Fixed
+- Closed tabs release retained view callbacks and terminal resources, including
+  shells still starting or ignoring the normal shutdown signal.
+- Shell exit status stays visible, and an unset Ptyxis profile uses fallback colors.
+- Empty or invalid inline names report an error without adding an undo action.
+- Search supports symlinked scopes, keeps real paths for duplicate names, and
+  disables folder sorting while results are ordered by relevance.
+
+### Installation
+- The terminal pane requires the **VTE GTK4 runtime** (`libvte-2.91-gtk4-0`
+  on Debian/Ubuntu). Source builds also need `libvte-2.91-gtk4-dev`.
+- GNOME search registration is installed system-wide and may request
+  administrator authentication; the app itself remains installed per user.
+
 ## [0.5.0] - 2026-10-13
 
 A home page for the computer, and a folder of photos no longer decodes every

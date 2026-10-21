@@ -12,8 +12,10 @@ use crate::{fileops, format, ops, undo};
 
 /// Name size follows the icon, the way a folder zoom does in Explorer.
 fn name_font(icon_px: i32) -> gtk::pango::AttrList {
-    let points = (icon_px as f32 / 6.0).clamp(11.0, 18.0);
-    let desc = gtk::pango::FontDescription::from_string(&format!("{points}pt"));
+    let divisor = if icon_px < super::ZOOM_MIN { 2.0 } else { 6.0 };
+    let points = (icon_px as f32 / divisor).clamp(11.0, 18.0);
+    let mut desc = gtk::pango::FontDescription::new();
+    desc.set_size((points * gtk::pango::SCALE as f32).round() as i32);
     let attrs = gtk::pango::AttrList::new();
     attrs.insert(gtk::pango::AttrFontDesc::new(&desc));
     attrs
@@ -56,12 +58,15 @@ pub(super) fn resize_names(root: &gtk::Widget, icon_px: i32) {
 fn resize_widget(widget: &gtk::Widget, icon_px: i32, font: &gtk::pango::AttrList) {
     if let Some(image) = widget.downcast_ref::<gtk::Image>() {
         image.set_pixel_size(icon_px);
-        // Photos already on screen were decoded at the previous size.
-        if icon_px >= 32
-            && let Some(info) = unsafe { image.data::<gio::FileInfo>("fs-file-info") }
-        {
+        if let Some(info) = unsafe { image.data::<gio::FileInfo>("fs-file-info") } {
             let info = unsafe { info.as_ref() }.clone();
-            set_thumbnail(image, &info, icon_px);
+            set_themed_icon(image, &info);
+            if icon_px >= 32 {
+                set_thumbnail(image, &info, icon_px);
+            } else {
+                // A pending large thumbnail must not replace the small list icon.
+                crate::thumbnails::arm(image);
+            }
         }
     }
     if let Some(label) = widget.downcast_ref::<gtk::Label>()
@@ -83,9 +88,10 @@ fn resize_widget(widget: &gtk::Widget, icon_px: i32, font: &gtk::pango::AttrList
 pub(super) fn attach_context_menu(app: &Rc<super::App>, widget: &impl IsA<gtk::Widget>) {
     let gesture = gtk::GestureClick::new();
     gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
-    let app = app.clone();
-    let view = widget.as_ref().clone();
+    let app = Rc::downgrade(app);
+    let view = widget.as_ref().downgrade();
     gesture.connect_pressed(move |g, _, x, y| {
+        let (Some(app), Some(view)) = (app.upgrade(), view.upgrade()) else { return; };
         g.set_state(gtk::EventSequenceState::Claimed);
         let tab = super::navigation::active_tab(&app);
         let on_item = if let Some(pos) = position_at(&view, x, y) {
@@ -108,9 +114,9 @@ pub(super) fn attach_context_menu(app: &Rc<super::App>, widget: &impl IsA<gtk::W
         }
         let menu = super::context_menu_for(&app, on_item);
         let popover = gtk::PopoverMenu::from_model(None::<&gio::Menu>);
-        let focus = view.clone();
+        let focus = view.downgrade();
         popover.connect_closed(move |_| {
-            focus.grab_focus();
+            if let Some(focus) = focus.upgrade() { focus.grab_focus(); }
         });
         popover.set_parent(&view);
         popover.set_has_arrow(false);
@@ -152,8 +158,9 @@ fn position_at(view: &impl IsA<gtk::Widget>, x: f64, y: f64) -> Option<u32> {
 pub(super) fn attach_view_keys(app: &Rc<super::App>, view: &impl IsA<gtk::Widget>) {
     let key = gtk::EventControllerKey::new();
     key.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let app = app.clone();
+    let app = Rc::downgrade(app);
     key.connect_key_pressed(move |controller, keyval, _, state| {
+        let Some(app) = app.upgrade() else { return glib::Propagation::Proceed; };
         let typing = controller.widget().is_some_and(|widget| focus_is_text_input(&widget));
         if !claims_view_key(keyval, state, typing) {
             return glib::Propagation::Proceed;
@@ -223,8 +230,9 @@ fn attach_item_drag(tab: &Rc<super::Tab>, view: &gtk::Widget, cell: &impl IsA<gt
     let source = gtk::DragSource::new();
     source.set_propagation_phase(gtk::PropagationPhase::Capture);
     source.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE);
-    let tab = tab.clone();
+    let tab = Rc::downgrade(tab);
     source.connect_prepare(move |_, _, _| {
+        let tab = tab.upgrade()?;
         let files: Vec<gio::File> = super::commands::selected(&tab).into_iter().map(|(f, _)| f).collect();
         if files.is_empty() {
             return None;
@@ -238,12 +246,12 @@ fn attach_item_drag(tab: &Rc<super::Tab>, view: &gtk::Widget, cell: &impl IsA<gt
     let click = gtk::GestureClick::new();
     click.set_button(gdk::BUTTON_PRIMARY);
     click.set_propagation_phase(gtk::PropagationPhase::Bubble);
-    let down = view.clone();
-    click.connect_pressed(move |_, _, _, _| set_rubberband(&down, false));
-    let up = view.clone();
-    click.connect_released(move |_, _, _, _| set_rubberband(&up, true));
-    let stop = view.clone();
-    click.connect_stopped(move |_| set_rubberband(&stop, true));
+    let down = view.downgrade();
+    click.connect_pressed(move |_, _, _, _| { if let Some(view) = down.upgrade() { set_rubberband(&view, false); } });
+    let up = view.downgrade();
+    click.connect_released(move |_, _, _, _| { if let Some(view) = up.upgrade() { set_rubberband(&view, true); } });
+    let stop = view.downgrade();
+    click.connect_stopped(move |_| { if let Some(view) = stop.upgrade() { set_rubberband(&view, true); } });
     cell.add_controller(click);
 }
 
@@ -264,9 +272,10 @@ pub(super) fn attach_drop_target(app: &Rc<super::App>, tab: &Rc<super::Tab>, vie
     let highlighted: Rc<RefCell<Option<gtk::Widget>>> = Rc::new(RefCell::new(None));
 
     {
-        let view = view.clone();
+        let view = view.as_ref().downgrade();
         let hl = highlighted.clone();
         target.connect_motion(move |_, x, y| {
+            let Some(view) = view.upgrade() else { return gdk::DragAction::empty(); };
             set_drop_highlight(&view, x, y, &hl);
             gdk::DragAction::COPY | gdk::DragAction::MOVE
         });
@@ -276,10 +285,11 @@ pub(super) fn attach_drop_target(app: &Rc<super::App>, tab: &Rc<super::Tab>, vie
         target.connect_leave(move |_| clear_drop_highlight(&hl));
     }
     {
-        let app = app.clone();
-        let tab = tab.clone();
-        let view = view.clone();
+        let app = Rc::downgrade(app);
+        let tab = Rc::downgrade(tab);
+        let view = view.as_ref().downgrade();
         target.connect_drop(move |target, value, x, y| {
+            let (Some(app), Some(tab), Some(view)) = (app.upgrade(), tab.upgrade(), view.upgrade()) else { return false; };
             clear_drop_highlight(&highlighted);
             let Ok(list) = value.get::<gdk::FileList>() else {
                 return false;
@@ -611,10 +621,11 @@ pub(super) fn fill_columns(tab: &Rc<super::Tab>, column_view: &gtk::ColumnView, 
 
 fn name_column(tab: &Rc<super::Tab>, view: &gtk::ColumnView, icon_size: i32) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
-    let tab_setup = tab.clone();
-    let tab_bind = tab.clone();
-    let view = view.clone().upcast::<gtk::Widget>();
+    let tab_setup = Rc::downgrade(tab);
+    let tab_bind = Rc::downgrade(tab);
+    let view = view.clone().upcast::<gtk::Widget>().downgrade();
     factory.connect_setup(move |_, item| {
+        let (Some(tab_setup), Some(view)) = (tab_setup.upgrade(), view.upgrade()) else { return; };
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let image = gtk::Image::new();
         let label =
@@ -629,6 +640,7 @@ fn name_column(tab: &Rc<super::Tab>, view: &gtk::ColumnView, icon_size: i32) -> 
         item.set_child(Some(&row));
     });
     factory.connect_bind(move |_, item| {
+        let Some(tab_bind) = tab_bind.upgrade() else { return; };
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let info = item.item().and_downcast::<gio::FileInfo>().unwrap();
         let row = item.child().and_downcast::<gtk::Box>().unwrap();
@@ -658,9 +670,10 @@ fn name_column(tab: &Rc<super::Tab>, view: &gtk::ColumnView, icon_size: i32) -> 
 
 fn size_column(tab: &Rc<super::Tab>, view: &gtk::ColumnView) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
-    let tab = tab.clone();
-    let view = view.clone().upcast::<gtk::Widget>();
+    let tab = Rc::downgrade(tab);
+    let view = view.clone().upcast::<gtk::Widget>().downgrade();
     factory.connect_setup(move |_, item| {
+        let (Some(tab), Some(view)) = (tab.upgrade(), view.upgrade()) else { return; };
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let label = gtk::Label::builder().xalign(1.0).build();
         label.add_css_class("numeric");
@@ -689,9 +702,10 @@ fn size_column(tab: &Rc<super::Tab>, view: &gtk::ColumnView) -> gtk::ColumnViewC
 
 fn modified_column(tab: &Rc<super::Tab>, view: &gtk::ColumnView) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
-    let tab = tab.clone();
-    let view = view.clone().upcast::<gtk::Widget>();
+    let tab = Rc::downgrade(tab);
+    let view = view.clone().upcast::<gtk::Widget>().downgrade();
     factory.connect_setup(move |_, item| {
+        let (Some(tab), Some(view)) = (tab.upgrade(), view.upgrade()) else { return; };
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let label = gtk::Label::builder().xalign(0.0).build();
         attach_item_drag(&tab, &view, &label);
@@ -720,10 +734,11 @@ fn modified_column(tab: &Rc<super::Tab>, view: &gtk::ColumnView) -> gtk::ColumnV
 
 pub(super) fn grid_factory(tab: &Rc<super::Tab>, size: i32) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
-    let tab_setup = tab.clone();
-    let tab_bind = tab.clone();
-    let view = tab.grid_view.clone().upcast::<gtk::Widget>();
+    let tab_setup = Rc::downgrade(tab);
+    let tab_bind = Rc::downgrade(tab);
+    let view = tab.grid_view.clone().upcast::<gtk::Widget>().downgrade();
     factory.connect_setup(move |_, item| {
+        let (Some(tab_setup), Some(view)) = (tab_setup.upgrade(), view.upgrade()) else { return; };
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let image = gtk::Image::builder().pixel_size(size).build();
         let label = gtk::Label::builder()
@@ -753,6 +768,7 @@ pub(super) fn grid_factory(tab: &Rc<super::Tab>, size: i32) -> gtk::SignalListIt
         item.set_child(Some(&cell));
     });
     factory.connect_bind(move |_, item| {
+        let Some(tab_bind) = tab_bind.upgrade() else { return; };
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let info = item.item().and_downcast::<gio::FileInfo>().unwrap();
         let cell = item.child().and_downcast::<gtk::Box>().unwrap();
@@ -851,6 +867,33 @@ fn rename_selection_region(name: &str, is_dir: bool) -> (i32, i32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires an isolated graphical session"]
+    fn zoom_refreshes_icon_resolution_and_cancels_small_row_thumbnails() {
+        use super::*;
+        gtk::init().unwrap();
+        let info = gio::FileInfo::new();
+        info.set_icon(&gio::ThemedIcon::new("text-x-generic"));
+        let image = gtk::Image::builder().pixel_size(48).build();
+        unsafe { image.set_data("fs-file-info", info.clone()) };
+        set_themed_icon(&image, &info);
+        resize_names(image.upcast_ref(), 160);
+        assert_eq!(image.pixel_size(), 160);
+        assert_eq!(unsafe { *image.data::<i32>("fs-theme-size").unwrap().as_ref() }, 160);
+        let token = unsafe { *image.data::<u64>("thumb-token").unwrap().as_ref() };
+        resize_names(image.upcast_ref(), 22);
+        assert_eq!(unsafe { *image.data::<i32>("fs-theme-size").unwrap().as_ref() }, 22);
+        assert_ne!(unsafe { *image.data::<u64>("thumb-token").unwrap().as_ref() }, token);
+    }
+
+    #[test]
+    fn zoom_font_sets_a_real_size_and_grows_in_both_views() {
+        let size = |pixels| super::name_font(pixels).iterator().font().0.size();
+        assert!(size(48) > 0, "zoom must set a font size, not a font family");
+        assert!(size(160) > size(48));
+        assert!(size(super::list_icon(160)) > size(super::list_icon(48)));
+    }
+
     use super::{
         claims_view_key, drop_kind, grid_name_chars, list_icon, rename_selection_region, zoom_work, ZoomWork,
     };

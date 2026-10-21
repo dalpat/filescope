@@ -493,9 +493,7 @@ pub(super) fn show_trash(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
             .description("Items you delete land here, and can be put back.")
             .vexpand(true)
             .build();
-        if let Some(paintable) = crate::icon::status_paintable("user-trash-symbolic", 128) {
-            page.set_paintable(Some(&paintable));
-        }
+        crate::icon::show_status(&page, "user-trash-symbolic", 128);
         box_.append(&page);
     } else {
         let (icon_px, tile_w, _, _) = pc_scale(app.zoom.get());
