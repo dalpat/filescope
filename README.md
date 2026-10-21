@@ -43,6 +43,25 @@ Built with **Rust + GTK4 + libadwaita**.
   are restored next launch.
 - **Tabs** — each tab is an independent folder with its own history and
   breadcrumb (Ctrl+T new, Ctrl+W close).
+- **GNOME Overview search** — find visible file and folder names under your home
+  directory using GNOME's LocalSearch/Tracker index, then open their parent folder
+  with the result selected. Results show file-type icons and readable parent paths.
+  Exact names rank first; dependency directories rank lower, with folders and name
+  prefixes preferred within each group. Up to 100 results are returned, and typing
+  more queries the index again. Coverage follows GNOME's configured Search Locations
+  under Home. Newly created files may take time to be indexed. Requires `tinysparql`
+  (or `tracker3`); if the index is unavailable, a bounded four-level, 20-result scan
+  is used instead. Clicking the provider heading or “more” opens a results tab
+  with the query preserved. **Ctrl+F** searches the current folder and its indexed
+  descendants in the same ranked list. Use **Load more results** to go beyond the
+  Overview limit, or right-click a result → **Open Containing Folder**. Clearing
+  the query or closing search restores the folder; Back restores a search after
+  navigating into a result. Search shows a notice when only the limited fallback
+  is available. Search scopes opened through folder symlinks resolve to their
+  indexed targets. Sort controls are disabled while results use relevance order
+  and become available again in ordinary folder views.
+  Enable filescope in GNOME Settings → Search if needed. Installing or removing
+  filescope also installs or removes its search provider and D-Bus service.
 - **Grid & list views** with **zoom in/out** (Ctrl +/−) — large icons and real
   **image thumbnails** (decoded off the UI thread, so image folders never hang),
   or a sortable Name / Size / Modified list.
@@ -109,7 +128,7 @@ runtime, e.g. GNOME 46+) — **no compiler, no Rust, no `-dev` packages**:
 ```sh
 tar -xzf filescope-*-x86_64-linux.tar.gz
 cd filescope-*-x86_64-linux
-./install.sh          # installs to ~/.local, no root
+./install.sh          # run as yourself; authenticates for GNOME search registration
 ```
 
 Then search **filescope** in the Activities Overview, or run `filescope`. Prefer
@@ -144,7 +163,13 @@ cargo build --release
 
 This builds the release binary and drops it, a `.desktop` launcher, and the app
 icon under your per-user XDG directories (`~/.local/bin`,
-`~/.local/share/applications`, `~/.local/share/icons`) — no root required. The
+`~/.local/share/applications`, `~/.local/share/icons`). Only the GNOME search
+registration goes in `/usr/local/share/gnome-shell/search-providers`, because
+GNOME ignores the per-user data directory for providers. Installation and
+uninstallation request administrator authentication for that shared file;
+run the installer as yourself, not with `sudo`. Updates with unchanged
+registration need no authentication. The D-Bus service stays under
+`$XDG_DATA_HOME/dbus-1/services` (normally `~/.local/share/dbus-1/services`). The
 launcher uses the app's own ID (`dev.filescope.Filescope`) and registers
 filescope as a folder handler, so you can also *Open With → filescope* on a
 folder.
@@ -153,6 +178,10 @@ folder.
 
 ```sh
 cargo test
+# Installer regression checks (requires bubblewrap and system Python with PyGObject):
+python3 tests/install.py
+# Real index queries against a disposable endpoint (requires tinysparql):
+FILESCOPE_TEST_INDEX=1 GIO_USE_VFS=local dbus-run-session -- cargo test indexed_query_integration -- --ignored --test-threads=1
 ```
 
 ### Capturing a screenshot

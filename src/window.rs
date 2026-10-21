@@ -14,6 +14,7 @@ use crate::{archive, bookmarks, format, preview, settings, undo};
 mod commands;
 mod navigation;
 mod places;
+mod search;
 mod terminal;
 mod view;
 
@@ -86,6 +87,7 @@ const URI_LIST: &str = "text/uri-list";
 /// A step in a tab's back/forward history. This PC is not a folder.
 pub(super) enum Place {
     Folder(gio::File),
+    Search { root: gio::File, query: String },
     Computer,
     Trash,
 }
@@ -93,7 +95,7 @@ pub(super) enum Place {
 /// Where an in-window shell can start. This PC and Trash are not directories.
 pub(super) fn terminal_cwd(place: &Place) -> Option<PathBuf> {
     match place {
-        Place::Folder(file) => file.path(),
+        Place::Folder(file) | Place::Search { root: file, .. } => file.path(),
         Place::Computer | Place::Trash => None,
     }
 }
@@ -104,6 +106,8 @@ struct Tab {
     dir_list: gtk::DirectoryList,
     filter: gtk::CustomFilter,
     selection: gtk::MultiSelection,
+    folder_model: gtk::SortListModel,
+    search: search::Pane,
     view_stack: gtk::Stack,
     grid_view: gtk::GridView,
     column_view: gtk::ColumnView,
@@ -185,6 +189,18 @@ pub fn open_files(app: &adw::Application, files: &[gio::File]) {
     if fresh {
         maybe_capture(app, &state);
     }
+}
+
+/// Continue an Overview query in a tab with the same indexed result ordering.
+pub(crate) fn open_search(app: &adw::Application, root: &gio::File, query: &str) {
+    if app_state(app).is_none() { build(app); }
+    let Some(state) = app_state(app) else { return; };
+    navigation::new_tab(&state, root.clone(), true);
+    let tab = navigation::active_tab(&state);
+    tab.search_bar.set_search_mode(true);
+    tab.search_entry.set_text(query);
+    search::changed(&state, &tab, true);
+    state.window.present();
 }
 
 /// Open folders from the file-manager bus (`ShowFolders` / `ShowItems`).
@@ -372,12 +388,21 @@ fn build(app: &adw::Application) {
     // Remember preferences for next launch.
     {
         let state = state.clone();
+        let application = app.downgrade();
         window.connect_close_request(move |window| {
             preview::close_sushi(window);
             for tab in state.tabs.borrow().iter() {
+                tab.search.cancel();
                 tab.preview_pane.set_visible(false);
             }
             save_settings(&state);
+            // The search service can outlive this window. Reopening must build
+            // a new window instead of presenting the destroyed one.
+            if let Some(application) = application.upgrade()
+                && app_state(&application).as_ref().is_some_and(|current| Rc::ptr_eq(current, &state))
+            {
+                unsafe { application.steal_data::<Rc<App>>(STATE_KEY) };
+            }
             glib::Propagation::Proceed
         });
     }
@@ -395,7 +420,8 @@ fn build(app: &adw::Application) {
                 tv.close_page_finish(page, false);
             } else {
                 for tab in state.tabs.borrow().iter().filter(|t| t.page.borrow().as_ref() == Some(page)) {
-                    tab.preview_pane.set_visible(false);
+                    tab.search.cancel();
+                tab.preview_pane.set_visible(false);
                 }
                 state.tabs.borrow_mut().retain(|t| t.page.borrow().as_ref() != Some(page));
                 tv.close_page_finish(page, true);
@@ -664,6 +690,7 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     action!("home", |s: &Rc<App>| { let t = navigation::active_tab(s); navigation::navigate(s, &t, gio::File::for_path(glib::home_dir())); });
     action!("open", commands::open_selected);
     action!("open-with", commands::open_with);
+    action!("open-containing-folder", commands::open_containing_folder);
     action!("preview", commands::toggle_preview);
     action!("copy", |s: &Rc<App>| commands::set_clipboard(s, false));
     action!("cut", |s: &Rc<App>| commands::set_clipboard(s, true));
@@ -678,6 +705,9 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     action!("refresh", |s: &Rc<App>| { navigation::refresh(&navigation::active_tab(s)); });
     action!("find", |s: &Rc<App>| {
         let t = navigation::active_tab(s);
+        if matches!(t.view_stack.visible_child_name().as_deref(), Some("computer" | "trash")) {
+            navigation::navigate(s, &t, gio::File::for_path(glib::home_dir()));
+        }
         let show = !t.search_bar.is_search_mode();
         t.search_bar.set_search_mode(show);
         if show {
@@ -833,14 +863,14 @@ fn update_chrome(app: &Rc<App>) {
         Some("trash") => Some("Trash"),
         _ => None,
     };
-    let win_title = match special {
+    let win_title = if tab.search.active.get() { format!("Search: {}", tab.search.query.borrow()) } else { match special {
         Some(name) => name.to_string(),
         None => tab
             .dir_list
             .file()
             .map(|f| f.basename().map(|b| b.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into()))
             .unwrap_or_else(|| "filescope".into()),
-    };
+    }};
     app.window.set_title(Some(&win_title));
 
     let total = if showing.as_deref() == Some("trash") {
@@ -864,6 +894,7 @@ fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
     let has_sel = count > 0;
     let one = count == 1;
     let has_clip = clipboard_has_files(app);
+    let folder = !tab.search.active.get();
     // "Extract Here" only makes sense when everything selected is an archive.
     // Open With and Preview only apply to a single file, not a folder.
     let sel = commands::selected(tab);
@@ -876,9 +907,11 @@ fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
 
     for (name, enabled) in [
         ("open", has_sel), ("open-with", single_file), ("preview", single_file), ("cut", has_sel),
-        ("copy", has_sel), ("paste", has_clip), ("rename", one), ("trash", has_sel),
+        ("copy", has_sel), ("paste", has_clip && folder), ("rename", one), ("trash", has_sel),
         ("delete", has_sel), ("properties", one),
-        ("extract", all_archives), ("compress", has_sel),
+        ("extract", all_archives && folder), ("compress", has_sel && folder),
+        ("new-folder", folder), ("open-containing-folder", one && !folder),
+        ("sort", folder), ("sort-descending", folder),
         ("undo", !app.undo_stack.borrow().is_empty()),
         ("redo", !app.redo_stack.borrow().is_empty()),
     ] {
@@ -914,6 +947,9 @@ fn context_menu_for(app: &Rc<App>, on_item: bool) -> gio::Menu {
     if on_item && !sel.is_empty() {
         let primary = gio::Menu::new();
         primary.append(Some("Open"), Some("win.open"));
+        if tab.search.active.get() && one {
+            primary.append(Some("Open Containing Folder"), Some("win.open-containing-folder"));
+        }
         if single_file {
             primary.append(Some("Open With…"), Some("win.open-with"));
             // Space previews from the file view. It is not a window accelerator,
@@ -1036,7 +1072,8 @@ fn update_preview(tab: &Tab) {
     {
         tab.dir_list.file().and_then(|dir| {
             let info = tab.selection.item(selection.minimum()).and_downcast::<gio::FileInfo>()?;
-            Some((dir.child(info.name()), info))
+            let directory = if tab.search.active.get() { None } else { Some(&dir) };
+            Some((commands::file_from_info(&info, directory)?, info))
         })
     } else {
         None

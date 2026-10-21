@@ -11,6 +11,13 @@ use gtk::{gdk, gio, glib};
 
 use crate::{archive, fileops, format, ops, preview, undo};
 
+/// Search rows carry their real file; folder rows can use the listing directory.
+pub(super) fn file_from_info(info: &gio::FileInfo, directory: Option<&gio::File>) -> Option<gio::File> {
+    info.attribute_object("standard::file").and_downcast::<gio::File>()
+        .or_else(|| directory.map(|dir| dir.child(info.name())))
+}
+
+
 pub(super) fn selected(tab: &Rc<super::Tab>) -> Vec<(gio::File, gio::FileInfo)> {
     let Some(dir) = tab.dir_list.file() else { return Vec::new() };
     let bitset = tab.selection.selection();
@@ -19,7 +26,8 @@ pub(super) fn selected(tab: &Rc<super::Tab>) -> Vec<(gio::File, gio::FileInfo)> 
         let pos = bitset.nth(i as u32);
         if let Some(obj) = tab.selection.item(pos) {
             let info = obj.downcast::<gio::FileInfo>().unwrap();
-            out.push((dir.child(info.name()), info));
+            let directory = if tab.search.active.get() { None } else { Some(&dir) };
+            if let Some(file) = file_from_info(&info, directory) { out.push((file, info)); }
         }
     }
     out
@@ -29,12 +37,23 @@ pub(super) fn activate(app: &Rc<super::App>, tab: &Rc<super::Tab>, position: u32
     let Some(item) = tab.selection.item(position) else { return };
     let info = item.downcast::<gio::FileInfo>().unwrap();
     let Some(dir) = tab.dir_list.file() else { return };
-    let child = dir.child(info.name());
+    let directory = if tab.search.active.get() { None } else { Some(&dir) };
+    let Some(child) = file_from_info(&info, directory) else { return; };
     if info.file_type() == gio::FileType::Directory {
         super::navigation::navigate(app, tab, child);
     } else {
         launch(app, &child);
     }
+}
+
+pub(super) fn open_containing_folder(app: &Rc<super::App>) {
+    let tab = super::navigation::active_tab(app);
+    let items = selected(&tab);
+    let [(file, info)] = items.as_slice() else { return; };
+    let Some(parent) = file.parent() else { return; };
+    let name = info.name().to_string_lossy().into_owned();
+    super::navigation::navigate(app, &tab, parent);
+    super::navigation::select_names(&tab, &[name], || {});
 }
 
 pub(super) fn open_selected(app: &Rc<super::App>) {
@@ -1048,4 +1067,26 @@ pub(super) fn prop_row(title: &str, value: &str) -> adw::ActionRow {
     let row = adw::ActionRow::builder().title(title).subtitle(value).build();
     row.set_subtitle_selectable(true);
     row
+}
+
+#[cfg(test)]
+mod search_path_tests {
+    use super::*;
+
+    #[test]
+    fn same_named_search_results_keep_their_real_parents() {
+        let scope = gio::File::for_path("/home/user");
+        for parent in ["one", "two"] {
+            let real = scope.child(parent).child("report.txt");
+            let info = gio::FileInfo::new();
+            info.set_name("report.txt");
+            info.set_attribute_object("standard::file", &real);
+            assert_eq!(file_from_info(&info, Some(&scope)), Some(real.clone()));
+            assert_eq!(file_from_info(&info, None), Some(real));
+        }
+        let normal = gio::FileInfo::new();
+        normal.set_name("report.txt");
+        assert!(file_from_info(&normal, Some(&scope)).unwrap().equal(&scope.child("report.txt")));
+        assert!(file_from_info(&normal, None).is_none());
+    }
 }

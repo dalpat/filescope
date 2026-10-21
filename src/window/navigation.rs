@@ -14,25 +14,10 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         gtk::DirectoryList::builder().attributes(super::ATTRS).io_priority(glib::Priority::DEFAULT).build();
 
     let show_hidden = app.show_hidden.clone();
-    // The live search term (lowercased), shared with the filter. Empty ⇒ no
-    // search filtering.
-    let search_term = Rc::new(RefCell::new(String::new()));
-    let filter = {
-        let show_hidden = show_hidden.clone();
-        let search_term = search_term.clone();
-        gtk::CustomFilter::new(move |obj| {
-            let info = obj.downcast_ref::<gio::FileInfo>().unwrap();
-            // Hidden files, unless the user opted to show them.
-            if !show_hidden.get()
-                && (info.is_hidden() || info.name().to_string_lossy().starts_with('.'))
-            {
-                return false;
-            }
-            // Name search (case-insensitive substring).
-            let term = search_term.borrow();
-            term.is_empty() || info.display_name().to_lowercase().contains(term.as_str())
-        })
-    };
+    let filter = gtk::CustomFilter::new(move |obj| {
+        let info = obj.downcast_ref::<gio::FileInfo>().unwrap();
+        show_hidden.get() || !(info.is_hidden() || info.name().to_string_lossy().starts_with('.'))
+    });
     let filtered = gtk::FilterListModel::new(Some(dir_list.clone()), Some(filter.clone()));
     let sort_model = gtk::SortListModel::new(Some(filtered), None::<gtk::Sorter>);
     let selection = gtk::MultiSelection::new(Some(sort_model.clone()));
@@ -84,33 +69,12 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         .child(&breadcrumb)
         .build();
 
-    // Per-tab search bar (hidden until Ctrl+F). Typing filters the current folder
-    // by name via the shared `search_term`.
-    let search_entry = gtk::SearchEntry::builder().placeholder_text("Search this folder").build();
+    let search_entry = gtk::SearchEntry::builder().placeholder_text("Search this folder and subfolders").hexpand(true).build();
     let search_bar = gtk::SearchBar::builder().build();
     search_bar.set_child(Some(&search_entry));
     search_bar.connect_entry(&search_entry);
-    {
-        let search_term = search_term.clone();
-        let filter = filter.clone();
-        search_entry.connect_search_changed(move |e| {
-            *search_term.borrow_mut() = e.text().to_lowercase();
-            filter.changed(gtk::FilterChange::Different);
-        });
-    }
-    {
-        // Closing the search bar clears the term so the full folder returns.
-        let search_term = search_term.clone();
-        let filter = filter.clone();
-        let entry = search_entry.clone();
-        search_bar.connect_search_mode_enabled_notify(move |bar| {
-            if !bar.is_search_mode() {
-                entry.set_text("");
-                search_term.borrow_mut().clear();
-                filter.changed(gtk::FilterChange::Different);
-            }
-        });
-    }
+    let search = super::search::Pane::new(&selection);
+    view_stack.add_named(&search.widget, Some("search"));
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&crumb_scroller);
@@ -130,6 +94,8 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         dir_list,
         filter,
         selection: selection.clone(),
+        folder_model: sort_model.clone(),
+        search,
         view_stack,
         grid_view: grid_view.clone(),
         column_view: column_view.clone(),
@@ -154,6 +120,8 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     let page = app.tab_view.append(&content);
     page.set_title("Home");
     *tab.page.borrow_mut() = Some(page.clone());
+
+    super::search::connect(app, &tab);
 
     // Activation on both views.
     {
@@ -304,6 +272,9 @@ fn advance(back: &mut Vec<super::Place>, fwd: &mut Vec<super::Place>, here: supe
 
 /// Where the tab is showing right now, for the back/forward stack.
 pub(super) fn here(tab: &super::Tab) -> Option<super::Place> {
+    if tab.search.active.get() {
+        return tab.dir_list.file().map(|root| super::Place::Search { root, query: tab.search.query.borrow().clone() });
+    }
     match tab.view_stack.visible_child_name().as_deref() {
         Some("computer") => Some(super::Place::Computer),
         Some("trash") => Some(super::Place::Trash),
@@ -316,6 +287,12 @@ fn open_place(app: &Rc<super::App>, tab: &Rc<super::Tab>, place: super::Place) {
         super::Place::Computer => super::places::show_computer(app, tab),
         super::Place::Trash => super::places::show_trash(app, tab),
         super::Place::Folder(file) => set_dir(app, tab, &file),
+        super::Place::Search { root, query } => {
+            set_dir(app, tab, &root);
+            tab.search_bar.set_search_mode(true);
+            tab.search_entry.set_text(&query);
+            super::search::changed(app, tab, false);
+        }
     }
 }
 
@@ -350,6 +327,10 @@ pub(super) fn set_dir(app: &Rc<super::App>, tab: &Rc<super::Tab>, file: &gio::Fi
 pub(super) fn refresh_view_mode(app: &Rc<super::App>, tab: &Rc<super::Tab>, force: bool) {
     // "This PC" and "Trash" are modes of their own — background updates (a
     // listing settling, an item count changing) must not yank the user out.
+    if tab.search.active.get() {
+        tab.view_stack.set_visible_child_name("search");
+        return;
+    }
     let showing = tab.view_stack.visible_child_name();
     if !force && matches!(showing.as_deref(), Some("computer") | Some("trash")) {
         return;
@@ -377,6 +358,7 @@ pub(super) fn set_path_visible(tab: &super::Tab, on: bool) {
 }
 
 pub(super) fn refresh(tab: &Rc<super::Tab>) {
+    if tab.search.active.get() { super::search::refresh(tab); return; }
     if let Some(file) = tab.dir_list.file() {
         tab.dir_list.set_file(gio::File::NONE);
         tab.dir_list.set_file(Some(&file));
@@ -471,6 +453,19 @@ pub(super) fn rebuild_breadcrumb(app: &Rc<super::App>, tab: &Rc<super::Tab>, fil
 #[cfg(test)]
 mod tests {
     use super::super::Place;
+    use gtk::prelude::*;
+
+    #[test]
+    fn navigation_returns_to_search_with_scope_and_query() {
+        let root = gtk::gio::File::for_path("/home/user/Documents");
+        let mut back = vec![Place::Search { root: root.clone(), query: "annual report".into() }];
+        let mut fwd = Vec::new();
+        let previous = super::retreat(&mut back, &mut fwd, Place::Folder(root.child("reports"))).unwrap();
+        assert!(matches!(&previous, Place::Search { root: scope, query } if scope == &root && query == "annual report"));
+        let next = super::advance(&mut back, &mut fwd, previous).unwrap();
+        assert!(matches!(next, Place::Folder(_)));
+        assert!(matches!(back.last(), Some(Place::Search { .. })));
+    }
 
     #[test]
     fn back_from_a_folder_returns_to_this_pc() {

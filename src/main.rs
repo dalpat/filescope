@@ -14,6 +14,7 @@ mod icon;
 mod ops;
 mod preview;
 mod settings;
+mod search_provider;
 mod thumbnails;
 mod trash;
 mod undo;
@@ -32,7 +33,7 @@ fn main() -> gtk::glib::ExitCode {
         flags |= gtk::gio::ApplicationFlags::NON_UNIQUE;
     }
 
-    let app = adw::Application::builder().application_id(APP_ID).flags(flags).build();
+    let app = search_provider::new_application(flags);
     app.connect_startup(|app| file_manager::own(app));
     app.connect_activate(|app| window::open_files(app, &[]));
     app.connect_open(|app, files, _| window::open_files(app, files));

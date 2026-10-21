@@ -491,6 +491,7 @@ fn cell_at_position(widget: &gtk::Widget, position: u32) -> Option<gtk::Widget> 
 /// Start renaming the selected item in place. Returns false when the row isn't
 /// realized (e.g. scrolled out of view), so the caller can fall back to a dialog.
 pub(super) fn start_inline_rename(app: &Rc<super::App>, tab: &Rc<super::Tab>) -> bool {
+    if tab.search.active.get() { return false; } // Search uses the rename dialog.
     let bitset = tab.selection.selection();
     if bitset.size() != 1 {
         return false;
