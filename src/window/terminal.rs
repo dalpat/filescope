@@ -145,13 +145,13 @@ impl Pane {
         let body = self.body.clone();
         let note = self.note.clone();
         let shell = self.shell.clone();
-        let revealer = self.revealer.clone();
         term.connect_child_exited(move |term, _status| {
             // Ctrl+D (or `exit`) ended the shell. Drop it so the next open starts fresh.
             body.remove(term);
-            note.set_visible(false);
+            body.set_size_request(-1, -1);
+            note.set_label("Shell exited. Close and reopen the pane to start a new session.");
+            note.set_visible(true);
             *shell.borrow_mut() = None;
-            revealer.set_reveal_child(false);
             set_shell_accels(term, true);
         });
 
@@ -217,6 +217,7 @@ fn paint_colors(term: &vte::Terminal) {
 fn apply_ptyxis(term: &vte::Terminal) -> bool {
     let Some(settings) = settings_if_installed("org.gnome.Ptyxis") else { return false };
     let uuid = settings.string("default-profile-uuid");
+    if uuid.is_empty() || uuid.contains('/') { return false; }
     let path = format!("/org/gnome/Ptyxis/Profiles/{uuid}/");
     let Some(profile) = settings_at("org.gnome.Ptyxis.Profile", &path) else { return false };
     let Some(text) = palette_text(profile.string("palette").as_str()) else { return false };

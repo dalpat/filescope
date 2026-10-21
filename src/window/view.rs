@@ -577,10 +577,10 @@ pub(super) fn start_inline_rename(app: &Rc<super::App>, tab: &Rc<super::Tab>) ->
 
 /// Apply an inline rename, recording it for undo.
 fn commit_inline_rename(app: &Rc<super::App>, file: &gio::File, old: &str, new: &str) {
-    if new.is_empty() || new == old {
+    if new == old {
         return; // nothing to do
     }
-    if new.contains('/') {
+    if new.is_empty() || new.contains('/') {
         super::toast(app, "Invalid name");
         return;
     }

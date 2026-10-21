@@ -2,9 +2,9 @@
 // decoded here.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -13,6 +13,9 @@ use gtk::{gio, glib, prelude::*};
 const THUMB_SIZE: i32 = 256;
 const IMAGE_MAX: u64 = 10 * 1024 * 1024;
 const RUN_SLOTS: usize = 2;
+
+mod generation;
+use generation::{Outcome, Source, Work};
 
 pub(crate) struct Thumbnailer {
     pub exec: String,
@@ -175,8 +178,7 @@ fn parse_thumbnailer(text: &str) -> Option<Parsed> {
 
 struct Job {
     uri: String,
-    argv: Vec<String>,
-    output: PathBuf,
+    work: Work,
     image: gtk::Image,
     token: u64,
     pixel_size: i32,
@@ -185,14 +187,26 @@ struct Job {
 struct State {
     queue: Queue,
     jobs: Vec<Job>,
-    failed: HashSet<String>,
+    failed: HashMap<String, Source>,
+}
+
+impl State {
+    fn complete(&mut self, uri: &str, outcome: Outcome) -> Option<String> {
+        if outcome.published {
+            self.failed.remove(uri);
+        } else if let Some(source) = outcome.source {
+            self.failed.insert(uri.to_string(), source);
+        }
+        self.jobs.retain(|job| job.uri != uri);
+        self.queue.finish(uri)
+    }
 }
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State {
         queue: Queue::new(),
         jobs: Vec::new(),
-        failed: HashSet::new(),
+        failed: HashMap::new(),
     });
 }
 
@@ -209,22 +223,19 @@ pub(crate) fn arm(image: &gtk::Image) -> u64 {
 pub(crate) fn schedule(image: &gtk::Image, info: &gio::FileInfo, pixel_size: i32, token: u64) {
     let Some(file) = info.attribute_object("standard::file").and_downcast::<gio::File>() else { return };
     let uri = file.uri().to_string();
-    if STATE.with(|state| state.borrow().failed.contains(&uri)) {
-        return;
-    }
     let Some(mime) = info.content_type() else { return };
     let bytes = info.size().max(0) as u64;
     let Some(thumbnailer) = system_thumbnailer(mime.as_str()) else { return };
     if skips_large(&thumbnailer, bytes) {
         return;
     }
-    let output = cache_path(&glib::user_cache_dir().join("thumbnails"), &uri);
-    let input = file.path().unwrap_or_else(|| PathBuf::from(&uri));
-    let argv = thumbnail_command(&thumbnailer.exec, &uri, &input, &output, THUMB_SIZE);
+    let Some(input) = file.path() else { return; };
+    let xdg = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from);
+    let output = cache_path(&cache_root(xdg.as_deref(), &glib::home_dir()), &uri);
+    let work = Work { uri: uri.clone(), input, output, exec: thumbnailer.exec };
     let job = Job {
         uri: uri.clone(),
-        argv,
-        output,
+        work,
         image: image.clone(),
         token,
         pixel_size,
@@ -235,6 +246,7 @@ pub(crate) fn schedule(image: &gtk::Image, info: &gio::FileInfo, pixel_size: i32
         match admit {
             Admit::Duplicate => {
                 if let Some(existing) = state.jobs.iter_mut().find(|job| job.uri == uri) {
+                    existing.work = job.work;
                     existing.image = job.image;
                     existing.token = job.token;
                     existing.pixel_size = job.pixel_size;
@@ -250,57 +262,41 @@ pub(crate) fn schedule(image: &gtk::Image, info: &gio::FileInfo, pixel_size: i32
 }
 
 fn launch(uri: String) {
-    let Some((argv, output)) = STATE.with(|state| {
-        state.borrow().jobs.iter().find(|job| job.uri == uri).map(|job| (job.argv.clone(), job.output.clone()))
-    }) else {
-        return;
-    };
-    if argv.is_empty() {
-        return;
-    }
-    if let Some(parent) = output.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let output_for_cmd = output.clone();
+    let Some((work, failed)) = STATE.with(|state| {
+        let state = state.borrow();
+        state.jobs.iter().find(|job| job.uri == uri)
+            .map(|job| (job.work.clone(), state.failed.get(&uri).cloned()))
+    }) else { return; };
     glib::spawn_future_local(async move {
-        let ran = gio::spawn_blocking(move || {
-            Command::new(&argv[0])
-                .args(&argv[1..])
-                .status()
-                .ok()
-                .is_some_and(|status| status.success())
-                && output_for_cmd.is_file()
-        })
-        .await
-        .unwrap_or(false);
+        let outcome = gio::spawn_blocking(move || generation::generate(work, failed, Duration::from_secs(30)))
+            .await.unwrap_or(Outcome { source: None, published: false });
         let paint = STATE.with(|state| {
             state.borrow().jobs.iter().find(|job| job.uri == uri).map(|job| {
-                (job.image.clone(), job.token, job.pixel_size, job.output.clone())
+                (job.image.clone(), job.token, job.pixel_size, job.work.output.clone())
             })
         });
-        if ran
+        if outcome.published
             && let Some((image, token, pixel_size, path)) = paint
-            && let Some(pixels) = crate::icon::decode_limited(path.clone(), pixel_size, None).await
         {
-            let current = unsafe { image.data::<u64>("thumb-token") };
-            if current.map(|p| unsafe { *p.as_ref() }) == Some(token) {
+            crate::icon::invalidate_photo(&path);
+            if let Some(pixels) = crate::icon::decode_limited(path.clone(), pixel_size, None).await {
                 let texture = pixels.texture();
+                // Refresh the cached texture even when the requesting row was recycled.
                 crate::icon::store_photo(&path, pixel_size, &texture);
-                image.set_paintable(Some(&texture));
+                let current = unsafe { image.data::<u64>("thumb-token") };
+                if current.map(|p| unsafe { *p.as_ref() }) == Some(token) {
+                    image.set_paintable(Some(&texture));
+                }
             }
         }
-        let next = STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            if !ran {
-                state.failed.insert(uri.clone());
-            }
-            state.jobs.retain(|job| job.uri != uri);
-            state.queue.finish(&uri)
-        });
-        if let Some(next) = next {
-            launch(next);
-        }
+        let next = STATE.with(|state| state.borrow_mut().complete(&uri, outcome));
+        if let Some(next) = next { launch(next); }
     });
+}
+
+fn cache_root(xdg_cache_home: Option<&Path>, home: &Path) -> PathBuf {
+    xdg_cache_home.filter(|root| !root.as_os_str().is_empty()).map(Path::to_path_buf)
+        .unwrap_or_else(|| home.join(".cache")).join("thumbnails")
 }
 
 #[cfg(test)]
@@ -310,6 +306,15 @@ mod tests {
 
     const URI: &str = "file:///home/a/b.mp4";
     const GST: &str = "/usr/bin/gst-video-thumbnailer --input-uri %u --output %o --size %s";
+
+    #[test]
+    fn cache_path_honors_xdg_cache_home() {
+        let home = Path::new("/home/test");
+        assert_eq!(cache_root(Some(Path::new("/tmp/custom")), home), Path::new("/tmp/custom/thumbnails"));
+        for root in [None, Some(Path::new(""))] {
+            assert_eq!(cache_root(root, home), Path::new("/home/test/.cache/thumbnails"));
+        }
+    }
 
     #[test]
     fn thumbnail_command_fills_uri_output_and_size() {

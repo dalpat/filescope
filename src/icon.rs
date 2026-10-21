@@ -245,6 +245,10 @@ pub(crate) fn store_photo(path: &Path, size: i32, texture: &gdk::Texture) {
     store(&PHOTO_CACHE, path.to_path_buf(), size, texture);
 }
 
+pub(crate) fn invalidate_photo(path: &Path) {
+    PHOTO_CACHE.with(|cache| cache.borrow_mut().retain(|(cached, _), _| cached != path));
+}
+
 /// Decode off the UI thread. A folder of photos used to start one decode per
 /// file at once and pin every core; two at a time is enough to fill the view.
 pub(crate) async fn decode_limited(path: PathBuf, size: i32, cancel: Option<Arc<AtomicBool>>) -> Option<Pixels> {

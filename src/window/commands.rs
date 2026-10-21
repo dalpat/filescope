@@ -511,7 +511,7 @@ pub(super) fn undo(app: &Rc<super::App>) {
             true
         }
         undo::Action::Rename { from, to } => undo::move_exact(to, from).is_ok(),
-        undo::Action::NewFolder { path } => std::fs::remove_dir(path).is_ok(),
+        undo::Action::NewFolder { path } => undo::undo_new_folder(path).is_ok(),
         undo::Action::Trash { originals } => {
             originals.iter().all(|p| undo::restore_from_trash(p))
         }

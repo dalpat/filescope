@@ -182,6 +182,9 @@ cargo test
 python3 tests/install.py
 # Real index queries against a disposable endpoint (requires tinysparql):
 FILESCOPE_TEST_INDEX=1 GIO_USE_VFS=local dbus-run-session -- cargo test indexed_query_integration -- --ignored --test-threads=1
+# Real thumbnailers and GIO cache pickup (requires glycin, gst-video-thumbnailer, ffmpeg):
+thumbnail_test_cache=$(mktemp -d /tmp/filescope-thumbnail-real-XXXXXX)
+XDG_CACHE_HOME="$thumbnail_test_cache" GIO_USE_VFS=local cargo test installed_thumbnailers_publish_valid_cache -- --ignored --test-threads=1
 ```
 
 ### Capturing a screenshot

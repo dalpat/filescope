@@ -40,6 +40,11 @@ fn count(n: usize) -> String {
     format!("{n} item{}", if n == 1 { "" } else { "s" })
 }
 
+/// Creation undo must never remove files added to the new folder afterward.
+pub(crate) fn undo_new_folder(path: &Path) -> std::io::Result<()> {
+    fs::remove_dir(path)
+}
+
 /// Move `from` back to `to` exactly. Same-filesystem renames are instant; a
 /// cross-filesystem entry falls back to a copy followed by removing the source.
 pub fn move_exact(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -118,6 +123,19 @@ fn restore_via_gio(original: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_folder_undo_preserves_added_contents() {
+        let path = std::env::temp_dir().join(format!("filescope-new-folder-undo-{}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        let added = path.join("keep.txt");
+        fs::write(&added, "keep me").unwrap();
+        assert!(undo_new_folder(&path).is_err());
+        assert_eq!(fs::read_to_string(&added).unwrap(), "keep me");
+        fs::remove_file(added).unwrap();
+        undo_new_folder(&path).unwrap();
+        assert!(!path.exists());
+    }
 
     #[test]
     fn move_exact_restores_a_file_to_its_original_path() {
