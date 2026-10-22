@@ -19,6 +19,9 @@ pub(super) fn file_from_info(info: &gio::FileInfo, directory: Option<&gio::File>
 
 
 pub(super) fn selected(tab: &Rc<super::Tab>) -> Vec<(gio::File, gio::FileInfo)> {
+    if tab.view_stack.visible_child_name().as_deref() == Some("trash") {
+        return Vec::new();
+    }
     let Some(dir) = tab.dir_list.file() else { return Vec::new() };
     let bitset = tab.selection.selection();
     let mut out = Vec::new();
@@ -564,6 +567,9 @@ pub(super) fn redo(app: &Rc<super::App>) {
 pub(super) fn refresh_all(app: &Rc<super::App>) {
     for tab in app.tabs.borrow().iter() {
         super::navigation::refresh(tab);
+        if tab.view_stack.visible_child_name().as_deref() == Some("trash") {
+            super::places::show_trash(app, tab);
+        }
     }
     super::update_chrome(app);
 }

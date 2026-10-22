@@ -55,6 +55,10 @@ flowbox.pc-tiles > flowboxchild:hover {
   box-shadow: none;
   padding: 0;
 }
+flowbox.trash-items > flowboxchild:selected > button {
+  background: alpha(@accent_bg_color, 0.22);
+  border-color: @accent_bg_color;
+}
 .drive-bar { min-height: 8px; }
 .drive-bar > trough, .drive-bar > trough > progress { min-height: 8px; border-radius: 8px; }
 expander.pc-section > title { font-size: 13px; font-weight: normal; color: alpha(@window_fg_color, 0.55); padding: 2px 2px 12px; }
@@ -713,8 +717,22 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     action!("new-folder", commands::new_folder);
     action!("new-tab", |s: &Rc<App>| { navigation::new_tab(s, gio::File::for_path(glib::home_dir()), true); });
     action!("close-tab", |s: &Rc<App>| { let t = navigation::active_tab(s); if let Some(p) = t.page.borrow().as_ref() { s.tab_view.close_page(p); } });
-    action!("select-all", |s: &Rc<App>| { navigation::active_tab(s).selection.select_all(); });
-    action!("refresh", |s: &Rc<App>| { navigation::refresh(&navigation::active_tab(s)); });
+    action!("select-all", |s: &Rc<App>| {
+        let tab = navigation::active_tab(s);
+        if tab.view_stack.visible_child_name().as_deref() == Some("trash") {
+            if let Some(flow) = places::trash_flow(&tab) { flow.select_all(); }
+        } else {
+            tab.selection.select_all();
+        }
+    });
+    action!("refresh", |s: &Rc<App>| {
+        let tab = navigation::active_tab(s);
+        if tab.view_stack.visible_child_name().as_deref() == Some("trash") {
+            places::show_trash(s, &tab);
+        } else {
+            navigation::refresh(&tab);
+        }
+    });
     action!("find", |s: &Rc<App>| {
         let t = navigation::active_tab(s);
         if matches!(t.view_stack.visible_child_name().as_deref(), Some("computer" | "trash")) {
@@ -902,11 +920,12 @@ fn update_chrome(app: &Rc<App>) {
 }
 
 fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
+    let trash = tab.view_stack.visible_child_name().as_deref() == Some("trash");
     let count = tab.selection.selection().size();
-    let has_sel = count > 0;
-    let one = count == 1;
+    let has_sel = count > 0 && !trash;
+    let one = count == 1 && !trash;
     let has_clip = clipboard_has_files(app);
-    let folder = !tab.search.active.get();
+    let folder = !tab.search.active.get() && !trash;
     // "Extract Here" only makes sense when everything selected is an archive.
     // Open With and Preview only apply to a single file, not a folder.
     let sel = commands::selected(tab);
