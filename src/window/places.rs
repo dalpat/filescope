@@ -469,194 +469,25 @@ fn xdg_place(dir: glib::UserDirectory) -> Option<(&'static str, &'static str, Pa
 
 // --- Trash ------------------------------------------------------------------
 
-/// Populate and show the Trash view in `tab`: every trashed item with where it
-/// came from, selection-based Restore, and Empty Trash.
+/// Show ordinary folder-style items with an independent Trash selection.
 pub(super) fn show_trash(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
     tab.search_bar.set_search_mode(false);
-    let box_ = &tab.trash_box;
-    box_.insert_action_group("trash", None::<&gio::SimpleActionGroup>);
-    while let Some(child) = box_.first_child() {
-        box_.remove(&child);
-    }
-    box_.set_margin_top(18);
-    box_.set_margin_bottom(24);
-    box_.set_margin_start(22);
-    box_.set_margin_end(22);
-    box_.set_spacing(8);
-
-    let root = trash::home_trash();
-    let entries = trash::entries_in(&root);
-    tab.trash_count.set(entries.len() as u32);
-
-    if entries.is_empty() {
-        let page = adw::StatusPage::builder()
-            .title("Trash Is Empty")
-            .description("Items you delete land here, and can be put back.")
-            .vexpand(true)
-            .build();
-        crate::icon::show_status(&page, "user-trash-symbolic", 128);
-        box_.append(&page);
-    } else {
-        let (icon_px, tile_w, _, _) = pc_scale(app.zoom.get());
-        let list = app.is_list.get();
-        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        bar.set_halign(gtk::Align::End);
-        bar.set_margin_bottom(8);
-        let restore_btn = gtk::Button::with_label("Restore");
-        restore_btn.set_action_name(Some("trash.restore"));
-        bar.append(&restore_btn);
-        let empty_btn = gtk::Button::with_label("Empty Trash");
-        empty_btn.add_css_class("destructive-action");
-        let app_btn = app.clone();
-        empty_btn.connect_clicked(move |_| confirm_empty_trash(&app_btn));
-        bar.append(&empty_btn);
-        box_.append(&bar);
-
-        let flow = tile_row(list);
-        flow.set_selection_mode(gtk::SelectionMode::Multiple);
-        flow.set_activate_on_single_click(false);
-        flow.add_css_class("trash-items");
-        let entries = Rc::new(entries);
-        let restore = gio::SimpleAction::new("restore", None);
-        restore.set_enabled(false);
-        {
-            let app = Rc::downgrade(app);
-            let tab = Rc::downgrade(tab);
-            let flow = flow.downgrade();
-            let entries = entries.clone();
-            restore.connect_activate(move |_, _| {
-                let (Some(app), Some(tab), Some(flow)) = (app.upgrade(), tab.upgrade(), flow.upgrade()) else { return; };
-                let selected = trash::selected_entries(&entries, flow.selected_children().iter().map(|child| child.index() as usize));
-                restore_trash_selection(&app, &tab, &selected);
-            });
-        }
-        let actions = gio::SimpleActionGroup::new();
-        actions.add_action(&restore);
-        box_.insert_action_group("trash", Some(&actions));
-        flow.connect_selected_children_changed(move |flow| {
-            let count = flow.selected_children().len();
-            restore.set_enabled(count > 0);
-            restore_btn.set_label(&if count == 0 { "Restore".into() } else { format!("Restore ({count})") });
-        });
-        attach_trash_menu(&flow);
-        let scale = app.window.scale_factor().max(1);
-        for entry in entries.iter() {
-            let stored = gio::File::for_path(root.join("files").join(&entry.name));
-            let (icon, thumb) = file_face(&stored);
-            let label = entry
-                .original
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| entry.name.clone());
-            let from = entry
-                .original
-                .parent()
-                .and_then(|parent| parent.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| entry.original.display().to_string());
-            let when = entry.deleted.as_deref().and_then(|stamp| stamp.split('T').next()).unwrap_or("");
-            let tip = if when.is_empty() {
-                format!("From {from}. Select, then choose Restore.")
-            } else {
-                format!("From {from} · {when}. Select, then choose Restore.")
-            };
-            let window = app.window.clone();
-            let card = shortcut_card(&window, &icon, &label, tile_w, icon_px, list, || {});
-            // The FlowBox owns selection and keyboard focus, not the old button.
-            card.set_can_target(false);
-            card.set_focusable(false);
-            if let Some(path) = thumb {
-                unsafe { card.set_data("fs-thumb", path.clone()) };
-                if let Some(image) = first_image(card.upcast_ref()) {
-                    load_file_thumb(&image, path, icon_px * scale);
-                }
-            }
-            insert_tile(&flow, &card, tile_w, list);
-            if let Some(child) = flow.last_child() {
-                child.set_tooltip_text(Some(&tip));
-                child.update_property(&[gtk::accessible::Property::Label(&label)]);
-            }
-        }
-        box_.append(&flow);
-    }
-
-    if let Some(page) = tab.page.borrow().as_ref() {
-        page.set_title("Trash");
-    }
+    let existing = tab.trash_view.borrow().clone();
+    let pane = existing.unwrap_or_else(|| {
+        let pane = super::trash_view::Pane::new(app, tab);
+        tab.trash_box.append(&pane.widget);
+        *tab.trash_view.borrow_mut() = Some(pane.clone());
+        pane
+    });
+    pane.refresh(app);
+    if let Some(page) = tab.page.borrow().as_ref() { page.set_title("Trash"); }
     tab.view_stack.set_visible_child_name("trash");
     super::navigation::set_path_visible(tab, false);
     sync_sidebar(app);
     super::update_chrome(app);
 }
 
-/// The Trash selection belongs to this view, never the hidden folder model.
-pub(super) fn trash_flow(tab: &super::Tab) -> Option<gtk::FlowBox> {
-    let mut child = tab.trash_box.first_child();
-    while let Some(widget) = child {
-        if let Some(flow) = widget.downcast_ref::<gtk::FlowBox>() {
-            return Some(flow.clone());
-        }
-        child = widget.next_sibling();
-    }
-    None
-}
-
-fn attach_trash_menu(flow: &gtk::FlowBox) {
-    // A popover is parented manually, so remove it before the view is disposed.
-    flow.connect_unmap(|flow| unsafe {
-        if let Some(popover) = flow.steal_data::<gtk::PopoverMenu>("fs-context-menu") {
-            popover.unparent();
-        }
-    });
-    let click = gtk::GestureClick::new();
-    click.set_button(gdk::BUTTON_SECONDARY);
-    let weak = flow.downgrade();
-    click.connect_pressed(move |gesture, _, x, y| {
-        let Some(flow) = weak.upgrade() else { return; };
-        let Some(child) = flow.child_at_pos(x as i32, y as i32) else { return; };
-        gesture.set_state(gtk::EventSequenceState::Claimed);
-        if !child.is_selected() {
-            flow.unselect_all();
-            flow.select_child(&child);
-        }
-        child.grab_focus();
-        trash_context_menu(&flow, x as i32, y as i32);
-    });
-    flow.add_controller(click);
-    let key = gtk::EventControllerKey::new();
-    let weak = flow.downgrade();
-    key.connect_key_pressed(move |_, key, _, modifiers| {
-        if key == gdk::Key::Menu || (key == gdk::Key::F10 && modifiers.contains(gdk::ModifierType::SHIFT_MASK)) {
-            if let Some(flow) = weak.upgrade() {
-                let bounds = flow.selected_children().first().and_then(|child| child.compute_bounds(&flow));
-                let (x, y) = bounds.map(|rect| ((rect.x() + rect.width() / 2.0) as i32, (rect.y() + rect.height()) as i32))
-                    .unwrap_or((0, 0));
-                trash_context_menu(&flow, x, y);
-            }
-            return glib::Propagation::Stop;
-        }
-        glib::Propagation::Proceed
-    });
-    flow.add_controller(key);
-}
-
-fn trash_context_menu(flow: &gtk::FlowBox, x: i32, y: i32) {
-    unsafe {
-        if let Some(old) = flow.steal_data::<gtk::PopoverMenu>("fs-context-menu") {
-            old.unparent();
-        }
-    }
-    let menu = gio::Menu::new();
-    menu.append(Some("Restore"), Some("trash.restore"));
-    let popover = gtk::PopoverMenu::from_model(Some(&menu));
-    popover.set_parent(flow);
-    popover.set_has_arrow(false);
-    popover.set_pointing_to(Some(&gdk::Rectangle::new(x, y, 0, 0)));
-    unsafe { flow.set_data("fs-context-menu", popover.clone()); }
-    popover.popup();
-}
-
-fn restore_trash_selection(app: &Rc<super::App>, tab: &Rc<super::Tab>, entries: &[trash::Entry]) {
+pub(super) fn restore_trash_selection(app: &Rc<super::App>, tab: &Rc<super::Tab>, entries: &[trash::Entry]) {
     if entries.is_empty() || tab.view_stack.visible_child_name().as_deref() != Some("trash") {
         return;
     }
@@ -682,7 +513,7 @@ fn restore_trash_selection(app: &Rc<super::App>, tab: &Rc<super::Tab>, entries: 
 }
 
 /// Confirm, then permanently empty the Trash.
-fn confirm_empty_trash(app: &Rc<super::App>) {
+pub(super) fn confirm_empty_trash(app: &Rc<super::App>) {
     let dialog = adw::AlertDialog::new(
         Some("Empty the Trash?"),
         Some("Everything in the Trash will be permanently deleted. This cannot be undone."),

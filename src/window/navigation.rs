@@ -39,7 +39,7 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     let computer_scroller = gtk::ScrolledWindow::builder().vexpand(true).child(&computer_box).build();
 
     let trash_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
-    let trash_scroller = gtk::ScrolledWindow::builder().vexpand(true).child(&trash_box).build();
+    trash_box.set_vexpand(true);
 
     // Shown in place of the grid/list when the folder has no visible items.
     let empty_page = adw::StatusPage::builder()
@@ -52,7 +52,7 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     view_stack.add_named(&grid_scroller, Some("grid"));
     view_stack.add_named(&list_scroller, Some("list"));
     view_stack.add_named(&computer_scroller, Some("computer"));
-    view_stack.add_named(&trash_scroller, Some("trash"));
+    view_stack.add_named(&trash_box, Some("trash"));
     view_stack.add_named(&empty_page, Some("empty"));
 
     let breadcrumb = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
@@ -100,14 +100,14 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         breadcrumb,
         computer_box,
         trash_box,
-        trash_count: Cell::new(0),
+        trash_view: RefCell::new(None),
         preview_pane,
         search_bar: search_bar.clone(),
         search_entry: search_entry.clone(),
         back: RefCell::new(Vec::new()),
         fwd: RefCell::new(Vec::new()),
-        grid_zoom: Cell::new(grid_size),
-        list_zoom: Cell::new(grid_size),
+        grid_zoom: Rc::new(Cell::new(grid_size)),
+        list_zoom: Rc::new(Cell::new(grid_size)),
         terminal: terminal_pane,
     });
 
@@ -177,8 +177,8 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
 
     // Drag starts on an item. Empty space is the rubber band, set on the views above.
     // Drop still targets the whole view: a folder, or the empty space around it.
-    grid_view.set_factory(Some(&super::view::grid_factory(&tab, grid_size)));
-    super::view::fill_columns(&tab, &column_view, super::view::list_icon(grid_size));
+    grid_view.set_factory(Some(&super::view::grid_factory(Some(&tab), &grid_view, &tab.grid_zoom)));
+    super::view::fill_columns(Some(&tab), &column_view, &tab.list_zoom);
     if let Some(sorter) = column_view.sorter() {
         sort_model.set_sorter(Some(&super::view::with_hidden_last(&sorter)));
     }

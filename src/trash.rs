@@ -131,6 +131,7 @@ fn copy_without_replace(source: &Path, target: &Path) -> io::Result<()> {
 }
 
 /// Snapshot only the selected Trash identities; selecting never touches disk.
+#[cfg(test)]
 pub fn selected_entries(entries: &[Entry], positions: impl IntoIterator<Item = usize>) -> Vec<Entry> {
     positions.into_iter().filter_map(|position| entries.get(position).cloned()).collect()
 }

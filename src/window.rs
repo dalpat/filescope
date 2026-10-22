@@ -16,6 +16,7 @@ mod navigation;
 mod places;
 mod search;
 mod terminal;
+mod trash_view;
 mod view;
 
 
@@ -54,10 +55,6 @@ flowbox.pc-tiles > flowboxchild:hover {
   background: none;
   box-shadow: none;
   padding: 0;
-}
-flowbox.trash-items > flowboxchild:selected > button {
-  background: alpha(@accent_bg_color, 0.22);
-  border-color: @accent_bg_color;
 }
 .drive-bar { min-height: 8px; }
 .drive-bar > trough, .drive-bar > trough > progress { min-height: 8px; border-radius: 8px; }
@@ -118,16 +115,15 @@ struct Tab {
     breadcrumb: gtk::Box,
     computer_box: gtk::Box,
     trash_box: gtk::Box,
-    /// Count from the rendered Trash listing, independent of the folder model.
-    trash_count: Cell<u32>,
+    trash_view: RefCell<Option<Rc<trash_view::Pane>>>,
     preview_pane: Rc<preview::pane::Pane>,
     search_bar: gtk::SearchBar,
     search_entry: gtk::SearchEntry,
     back: RefCell<Vec<Place>>,
     fwd: RefCell<Vec<Place>>,
     /// Zoom last applied to each folder view. The hidden one stays stale until shown.
-    grid_zoom: Cell<i32>,
-    list_zoom: Cell<i32>,
+    grid_zoom: Rc<Cell<i32>>,
+    list_zoom: Rc<Cell<i32>>,
     /// Bottom shell for this tab. Hidden until the user opens it.
     terminal: terminal::Pane,
 }
@@ -478,7 +474,9 @@ fn build(app: &adw::Application) {
             for t in s.tabs.borrow().iter() {
                 match t.view_stack.visible_child_name().as_deref() {
                     Some("computer") => places::show_computer(&s, t),
-                    Some("trash") => places::show_trash(&s, t),
+                    Some("trash") => {
+                        if let Some(pane) = t.trash_view.borrow().as_ref() { pane.show_mode(&s); }
+                    }
                     _ => navigation::refresh_view_mode(&s, t, false),
                 }
             }
@@ -631,16 +629,17 @@ fn zoom(app: &Rc<App>, delta: i32) {
 fn apply_visible_zoom(app: &Rc<App>, tab: &Rc<Tab>) {
     let zoom = app.zoom.get();
     let showing = tab.view_stack.visible_child_name();
+    if showing.as_deref() == Some("trash") {
+        if let Some(pane) = tab.trash_view.borrow().as_ref() { pane.set_zoom(zoom); }
+        return;
+    }
     let stamped = match showing.as_deref() {
         Some("list") => tab.list_zoom.get(),
         _ => tab.grid_zoom.get(),
     };
     match view::zoom_work(showing.as_deref(), stamped, zoom) {
         view::ZoomWork::None => {}
-        view::ZoomWork::Tiles => match showing.as_deref() {
-            Some("computer") => places::rescale_tiles(app, &tab.computer_box),
-            _ => places::rescale_tiles(app, &tab.trash_box),
-        },
+        view::ZoomWork::Tiles => places::rescale_tiles(app, &tab.computer_box),
         view::ZoomWork::Resize(icon) => {
             // Stamp first. A later bind reads this size. An unstamped view
             // would keep asking for the old one.
@@ -719,11 +718,7 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     action!("close-tab", |s: &Rc<App>| { let t = navigation::active_tab(s); if let Some(p) = t.page.borrow().as_ref() { s.tab_view.close_page(p); } });
     action!("select-all", |s: &Rc<App>| {
         let tab = navigation::active_tab(s);
-        if tab.view_stack.visible_child_name().as_deref() == Some("trash") {
-            if let Some(flow) = places::trash_flow(&tab) { flow.select_all(); }
-        } else {
-            tab.selection.select_all();
-        }
+        visible_selection(&tab).select_all();
     });
     action!("refresh", |s: &Rc<App>| {
         let tab = navigation::active_tab(s);
@@ -865,7 +860,7 @@ fn about(app: &Rc<App>) {
 fn status_line(view: &str, total: u32, selected: u64, single: Option<&gio::FileInfo>) -> String {
     match (view, selected, single) {
         ("computer", _, _) => String::new(),
-        ("trash", _, _) | (_, 0, _) => format!("{total} item{}", plural(total as usize)),
+        (_, 0, _) => format!("{total} item{}", plural(total as usize)),
         (_, 1, Some(info)) => {
             let name = info.display_name();
             if info.file_type() == gio::FileType::Directory {
@@ -876,6 +871,14 @@ fn status_line(view: &str, total: u32, selected: u64, single: Option<&gio::FileI
         }
         _ => format!("{selected} selected"),
     }
+}
+
+fn visible_selection(tab: &Tab) -> gtk::MultiSelection {
+    if tab.view_stack.visible_child_name().as_deref() == Some("trash")
+        && let Some(pane) = tab.trash_view.borrow().as_ref() {
+        return pane.selection.clone();
+    }
+    tab.selection.clone()
 }
 
 fn update_chrome(app: &Rc<App>) {
@@ -903,15 +906,12 @@ fn update_chrome(app: &Rc<App>) {
     }};
     app.window.set_title(Some(&win_title));
 
-    let total = if showing.as_deref() == Some("trash") {
-        tab.trash_count.get()
-    } else {
-        tab.selection.n_items()
-    };
-    let selection = tab.selection.selection();
+    let model = visible_selection(&tab);
+    let total = model.n_items();
+    let selection = model.selection();
     let selected = selection.size();
-    let single = if special.is_none() && selected == 1 {
-        tab.selection.item(selection.minimum()).and_downcast::<gio::FileInfo>()
+    let single = if special != Some("This PC") && selected == 1 {
+        model.item(selection.minimum()).and_downcast::<gio::FileInfo>()
     } else {
         None
     };
@@ -964,6 +964,11 @@ fn clipboard_has_files(app: &App) -> bool {
 /// Right-click on empty space: only actions for the folder you are in.
 fn context_menu_for(app: &Rc<App>, on_item: bool) -> gio::Menu {
     let tab = navigation::active_tab(app);
+    if tab.view_stack.visible_child_name().as_deref() == Some("trash") {
+        let menu = gio::Menu::new();
+        if on_item { menu.append(Some("Restore"), Some("trash.restore")); }
+        return menu;
+    }
     let sel = commands::selected(&tab);
     let one = sel.len() == 1;
     let single_file = matches!(
@@ -1249,11 +1254,11 @@ mod tests {
     }
 
     #[test]
-    fn status_line_for_trash_uses_the_given_count() {
-        let file = status_item("old-folder-selection.txt", gtk::gio::FileType::Regular, 1000);
+    fn trash_selection_status_uses_trash_items() {
+        let file = status_item("trashed.txt", gtk::gio::FileType::Regular, 1000);
         assert_eq!(super::status_line("trash", 4, 0, None), "4 items");
-        assert_eq!(super::status_line("trash", 4, 1, Some(&file)), "4 items");
-        assert_eq!(super::status_line("trash", 4, 10_000, None), "4 items");
+        assert_eq!(super::status_line("trash", 4, 1, Some(&file)), "trashed.txt — 1.0 kB");
+        assert_eq!(super::status_line("trash", 4, 3, None), "3 selected");
         for (count, expected) in [(0, "0 items"), (1, "1 item"), (2, "2 items")] {
             assert_eq!(super::status_line("trash", count, 0, None), expected);
         }

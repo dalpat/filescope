@@ -180,6 +180,8 @@ fn refresh_shown() {
         shown.iter().filter_map(|row| row.image.upgrade()).collect::<Vec<_>>()
     });
     for image in alive {
+        // Decoded photos do not depend on the icon theme.
+        if image.paintable().is_some_and(|paintable| paintable.is::<gdk::Texture>()) { continue; }
         let Some(icon) = (unsafe { image.data::<gio::Icon>(ICON_KEY) }) else { continue };
         let icon = unsafe { icon.as_ref() }.clone();
         let size = unsafe { image.data::<i32>(SIZE_KEY) }.map(|p| unsafe { *p.as_ref() }).unwrap_or(16);
@@ -327,6 +329,19 @@ fn store(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires an isolated graphical session"]
+    fn theme_refresh_preserves_photo_thumbnails() {
+        use super::*;
+        gtk::init().unwrap();
+        let image = image_named("image-x-generic", 80);
+        let pixels = glib::Bytes::from_static(&[255, 80, 20, 255]);
+        let photo = gdk::MemoryTexture::new(1, 1, gdk::MemoryFormat::R8g8b8a8, &pixels, 4);
+        image.set_paintable(Some(&photo));
+        refresh_shown();
+        assert_eq!(image.paintable(), Some(photo.upcast::<gdk::Paintable>()));
+    }
+
     #[test]
     #[ignore = "requires an isolated graphical session"]
     fn theme_change_refreshes_images_and_status_pages() {
