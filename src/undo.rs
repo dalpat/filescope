@@ -19,6 +19,8 @@ pub enum Action {
     Copy { pairs: Vec<(PathBuf, PathBuf)> },
     Rename { from: PathBuf, to: PathBuf },
     NewFolder { path: PathBuf },
+    /// Guarded inverse requests, ready to run on undo or redo.
+    BatchRename { pending: Vec<crate::batch_rename::Rename> },
     /// Entries sent to Trash, by their original paths.
     Trash { originals: Vec<PathBuf> },
 }
@@ -29,6 +31,7 @@ impl Action {
         match self {
             Action::Move { pairs } => format!("move of {}", count(pairs.len())),
             Action::Copy { pairs } => format!("copy of {}", count(pairs.len())),
+            Action::BatchRename { pending } => format!("batch rename of {}", count(pending.len())),
             Action::Rename { .. } => "rename".to_string(),
             Action::NewFolder { .. } => "new folder".to_string(),
             Action::Trash { originals } => format!("trashing of {}", count(originals.len())),

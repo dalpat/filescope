@@ -87,13 +87,10 @@ pub fn restore_in(root: &Path, entry: &Entry) -> io::Result<PathBuf> {
 
 /// Reserve the destination atomically, including dangling symlinks and races.
 fn move_without_replace(source: &Path, target: &Path) -> io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let from = std::ffi::CString::new(source.as_os_str().as_bytes())?;
-    let to = std::ffi::CString::new(target.as_os_str().as_bytes())?;
-    if unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE) } == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
+    let error = match crate::fileops::rename_no_replace(source, target) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
     if error.raw_os_error() != Some(libc::EXDEV) {
         return Err(error);
     }

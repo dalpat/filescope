@@ -74,6 +74,18 @@ pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
     Ok(dest)
 }
 
+/// Atomically rename without replacing any existing entry, including symlinks.
+pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+    if unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Total apparent size (bytes) and entry count of a directory tree, for the
 /// Properties dialog. Symlinks are counted as entries but not followed (so the
 /// walk stays cycle-free and nothing outside the tree is double-counted), and
@@ -167,5 +179,34 @@ mod tests {
         remove(&file).unwrap();
         assert!(!file.exists());
         let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+
+    #[test]
+    fn racing_renames_never_replace_the_winner() {
+        let root = std::env::temp_dir().join(format!("filescope-rename-race-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = ["first", "second"].into_iter().map(|name| {
+            let source = root.join(name);
+            fs::write(&source, name).unwrap();
+            let target = root.join("destination");
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                (source.clone(), rename_no_replace(&source, &target))
+            })
+        }).collect();
+        let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|(_, result)| result.is_ok()).count(), 1);
+        let winner = results.iter().find(|(_, result)| result.is_ok()).unwrap();
+        assert_eq!(fs::read_to_string(root.join("destination")).unwrap(), winner.0.file_name().unwrap().to_str().unwrap());
+        let loser = results.iter().find(|(_, result)| result.is_err()).unwrap();
+        assert!(loser.0.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }

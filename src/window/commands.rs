@@ -492,11 +492,13 @@ pub(super) fn compress_selected(app: &Rc<super::App>) {
 pub(super) fn push_undo(app: &Rc<super::App>, action: undo::Action) {
     app.undo_stack.borrow_mut().push(action);
     app.redo_stack.borrow_mut().clear();
+    app.history_generation.set(app.history_generation.get().wrapping_add(1));
     super::update_chrome(app);
 }
 
 /// Reverse the most recent action.
 pub(super) fn undo(app: &Rc<super::App>) {
+    if app.history_busy.get() { return; }
     let Some(action) = app.undo_stack.borrow_mut().pop() else {
         super::toast(app, "Nothing to undo");
         return;
@@ -513,6 +515,7 @@ pub(super) fn undo(app: &Rc<super::App>) {
             start_job(app, ops::Kind::Delete, created, PathBuf::new(), false);
             true
         }
+        undo::Action::BatchRename { pending } => { batch_history(app, pending, true); return; }
         undo::Action::Rename { from, to } => undo::move_exact(to, from).is_ok(),
         undo::Action::NewFolder { path } => undo::undo_new_folder(path).is_ok(),
         undo::Action::Trash { originals } => {
@@ -530,6 +533,7 @@ pub(super) fn undo(app: &Rc<super::App>) {
 
 /// Re-apply the most recently undone action.
 pub(super) fn redo(app: &Rc<super::App>) {
+    if app.history_busy.get() { return; }
     let Some(action) = app.redo_stack.borrow_mut().pop() else {
         super::toast(app, "Nothing to redo");
         return;
@@ -548,6 +552,7 @@ pub(super) fn redo(app: &Rc<super::App>) {
             }
             true
         }
+        undo::Action::BatchRename { pending } => { batch_history(app, pending, false); return; }
         undo::Action::Rename { from, to } => undo::move_exact(from, to).is_ok(),
         undo::Action::NewFolder { path } => std::fs::create_dir(path).is_ok(),
         undo::Action::Trash { originals } => originals
@@ -561,6 +566,53 @@ pub(super) fn redo(app: &Rc<super::App>) {
     } else {
         super::toast(app, &format!("Couldn't fully redo the {what}"));
     }
+}
+
+/// Failed history requests stay on their original stack for a later retry.
+fn batch_history(app: &Rc<super::App>, pending: &[crate::batch_rename::Rename], undoing: bool) {
+    let undo_index = app.undo_stack.borrow().len();
+    let redo_index = app.redo_stack.borrow().len();
+    let generation = app.history_generation.get();
+    let pending = pending.to_vec();
+    app.history_busy.set(true);
+    super::update_chrome(app);
+    super::toast(app, if undoing { "Undoing batch rename…" } else { "Redoing batch rename…" });
+    let app = app.clone();
+    glib::spawn_future_local(async move {
+        let requests = pending.clone();
+        let result = gio::spawn_blocking(move || crate::batch_rename::run(&requests)).await;
+        let unchanged = app.history_generation.get() == generation;
+        let (origin, opposite, origin_index, opposite_index) = if undoing {
+            (&app.undo_stack, &app.redo_stack, undo_index, redo_index)
+        } else {
+            (&app.redo_stack, &app.undo_stack, redo_index, undo_index)
+        };
+        let (retry, inverse) = match &result {
+            Ok(outcome) => (
+                outcome.failed.iter().map(|(request, _)| request.clone()).collect(),
+                outcome.undo.clone(),
+            ),
+            Err(_) => (pending, Vec::new()),
+        };
+        // Keep this operation before actions completed while it was running,
+        // and never revive Redo after a new action has cleared it.
+        if !retry.is_empty() && (undoing || unchanged) {
+            let mut stack = origin.borrow_mut();
+            let index = origin_index.min(stack.len());
+            stack.insert(index, undo::Action::BatchRename { pending: retry });
+        }
+        if !inverse.is_empty() && (!undoing || unchanged) {
+            let mut stack = opposite.borrow_mut();
+            let index = opposite_index.min(stack.len());
+            stack.insert(index, undo::Action::BatchRename { pending: inverse });
+        }
+        app.history_busy.set(false);
+        refresh_all(&app);
+        match result {
+            Ok(outcome) => super::batch_rename::report(&app, &outcome, if undoing { "Restored" } else { "Renamed" }),
+            Err(_) => super::toast(&app, "Couldn't finish batch history; check the files before retrying"),
+        }
+    });
 }
 
 /// Reload every tab and refresh the chrome (after an undo/redo touches the disk).
@@ -781,6 +833,18 @@ pub(super) fn delete_selected(app: &Rc<super::App>) {
 /// when the row isn't on screen to host the editor.
 pub(super) fn rename_selected(app: &Rc<super::App>) {
     let tab = super::navigation::active_tab(app);
+    if matches!(tab.view_stack.visible_child_name().as_deref(), Some("trash" | "computer")) { return; }
+    let items = selected(&tab);
+    if items.len() as u64 != tab.selection.selection().size() {
+        super::toast(app, "Couldn't resolve every selected file");
+        return;
+    }
+    if items.len() > 1 {
+        let paths: Option<Vec<_>> = items.iter().map(|(file, _)| file.path()).collect();
+        if let Some(paths) = paths { super::batch_rename::show(app, paths); }
+        else { super::toast(app, "Batch rename requires local files"); }
+        return;
+    }
     if super::view::start_inline_rename(app, &tab) {
         return;
     }

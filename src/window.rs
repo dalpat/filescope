@@ -11,6 +11,7 @@ use gtk::{gio, glib};
 
 use crate::{archive, bookmarks, format, preview, settings, undo};
 
+mod batch_rename;
 mod commands;
 mod navigation;
 mod places;
@@ -174,6 +175,9 @@ struct App {
     /// Reversible history. Doing something new clears the redo side.
     undo_stack: RefCell<Vec<undo::Action>>,
     redo_stack: RefCell<Vec<undo::Action>>,
+    history_busy: Cell<bool>,
+    /// New actions invalidate Redo even when a history worker is still running.
+    history_generation: Cell<u64>,
 }
 
 const STATE_KEY: &str = "filescope-state";
@@ -383,6 +387,8 @@ fn build(app: &adw::Application) {
         progress_revealer,
         undo_stack: RefCell::new(Vec::new()),
         redo_stack: RefCell::new(Vec::new()),
+        history_busy: Cell::new(false),
+        history_generation: Cell::new(0),
     });
 
     install_actions(app, &state);
@@ -938,13 +944,13 @@ fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
 
     for (name, enabled) in [
         ("open", has_sel), ("open-with", single_file), ("preview", single_file), ("cut", has_sel),
-        ("copy", has_sel), ("paste", has_clip && folder), ("rename", one), ("trash", has_sel),
+        ("copy", has_sel), ("paste", has_clip && folder), ("rename", has_sel && tab.view_stack.visible_child_name().as_deref() != Some("computer")), ("trash", has_sel),
         ("delete", has_sel), ("properties", one),
         ("extract", all_archives && folder), ("compress", has_sel && folder),
         ("new-folder", folder), ("open-containing-folder", one && !folder),
         ("sort", folder), ("sort-descending", folder),
-        ("undo", !app.undo_stack.borrow().is_empty()),
-        ("redo", !app.redo_stack.borrow().is_empty()),
+        ("undo", !app.history_busy.get() && !app.undo_stack.borrow().is_empty()),
+        ("redo", !app.history_busy.get() && !app.redo_stack.borrow().is_empty()),
     ] {
         if let Some(act) = app.window.lookup_action(name) {
             act.downcast::<gio::SimpleAction>().unwrap().set_enabled(enabled);
@@ -1000,9 +1006,7 @@ fn context_menu_for(app: &Rc<App>, on_item: bool) -> gio::Menu {
         menu.append_section(None, &primary);
 
         let edit = gio::Menu::new();
-        if one {
-            edit.append(Some("Rename…"), Some("win.rename"));
-        }
+        edit.append(Some("Rename…"), Some("win.rename"));
         if all_archives {
             edit.append(Some("Extract Here"), Some("win.extract"));
         }

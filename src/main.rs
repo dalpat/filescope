@@ -6,6 +6,7 @@
 // accent theming follow the user's GNOME settings automatically.
 
 mod archive;
+mod batch_rename;
 mod bookmarks;
 mod file_manager;
 mod fileops;
