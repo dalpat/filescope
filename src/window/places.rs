@@ -13,6 +13,7 @@ use crate::{bookmarks, format, trash};
 
 /// Populate and show the "This PC" page: quick access, drives, and recent files.
 pub(super) fn show_computer(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
+    if tab.view_stack.visible_child_name().as_deref() != Some("computer") { tab.begin_navigation(); }
     tab.search_bar.set_search_mode(false);
     let box_ = &tab.computer_box;
     while let Some(child) = box_.first_child() {
@@ -471,6 +472,7 @@ fn xdg_place(dir: glib::UserDirectory) -> Option<(&'static str, &'static str, Pa
 
 /// Show ordinary folder-style items with an independent Trash selection.
 pub(super) fn show_trash(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
+    if tab.view_stack.visible_child_name().as_deref() != Some("trash") { tab.begin_navigation(); }
     tab.search_bar.set_search_mode(false);
     let existing = tab.trash_view.borrow().clone();
     let pane = existing.unwrap_or_else(|| {

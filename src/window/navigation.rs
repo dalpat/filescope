@@ -109,6 +109,7 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         grid_zoom: Rc::new(Cell::new(grid_size)),
         list_zoom: Rc::new(Cell::new(grid_size)),
         terminal: terminal_pane,
+        navigation_generation: Cell::new(0),
     });
 
     // Register the tab before appending: appending the first page auto-selects
@@ -120,6 +121,7 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     *tab.page.borrow_mut() = Some(page.clone());
 
     super::search::connect(app, &tab);
+    super::terminal::connect(app, &tab);
 
     // Activation on both views.
     {
@@ -304,6 +306,7 @@ pub(super) fn go_up(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
 
 /// Point `tab` at `file`, leaving any "This PC" view, and refresh chrome.
 pub(super) fn set_dir(app: &Rc<super::App>, tab: &Rc<super::Tab>, file: &gio::File) {
+    tab.begin_navigation();
     // A new folder starts unfiltered — close any open search from the last one.
     tab.search_bar.set_search_mode(false);
     tab.dir_list.set_file(Some(file));
@@ -374,6 +377,8 @@ pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn
     let names = Rc::new(names.to_vec());
     let then = Rc::new(RefCell::new(Some(then)));
     let done = Rc::new(Cell::new(false));
+    let generation = tab.navigation_generation.get();
+    let directory = tab.dir_list.file().map(|file| file.uri());
     let attempt = Rc::new({
         let tab = Rc::downgrade(tab);
         let names = names.clone();
@@ -384,6 +389,12 @@ pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn
                 return;
             }
             let Some(tab) = tab.upgrade() else { return; };
+            if tab.navigation_generation.get() != generation
+                || tab.dir_list.file().map(|file| file.uri()) != directory {
+                done.set(true);
+                then.borrow_mut().take();
+                return;
+            }
             let selection = &tab.selection;
             let mut found = Vec::new();
             for i in 0..selection.n_items() {

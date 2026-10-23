@@ -2,16 +2,19 @@
 //! and lives in commands.rs.
 
 use std::cell::{Cell, RefCell};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use vte::prelude::*;
+
+mod links;
 
 const MIN_HEIGHT: i32 = 120;
 const MAX_HEIGHT: i32 = 640;
 
 struct Session {
     terminal: vte::Terminal,
+    shell_exe: Option<PathBuf>,
     spawn: gtk::gio::Cancellable,
     pid: Cell<Option<gtk::glib::Pid>>,
     closing: Cell<bool>,
@@ -52,6 +55,7 @@ pub(super) struct Pane {
     shell: Rc<RefCell<Option<vte::Terminal>>>,
     height: Rc<Cell<i32>>,
     session: RefCell<Option<Rc<Session>>>,
+    open: links::Open,
     closed: Cell<bool>,
 }
 
@@ -128,6 +132,7 @@ impl Pane {
             shell,
             height,
             session: RefCell::new(None),
+            open: Rc::new(RefCell::new(None)),
             closed: Cell::new(false),
         };
         let hide = pane.revealer.downgrade();
@@ -150,7 +155,7 @@ impl Pane {
         if self.closed.replace(true) { return; }
         let term = self.shell.borrow_mut().take();
         if let Some(term) = term {
-            if term.has_focus() { set_shell_accels(&term, true); }
+            release_focus(&term);
             if term.parent().is_some() { self.body.remove(&term); }
         }
         if let Some(session) = self.session.borrow_mut().take() { session.close(); }
@@ -193,11 +198,13 @@ impl Pane {
         self.body.append(&term);
         *self.shell.borrow_mut() = Some(term.clone());
 
+        let shell_bin = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let session = Rc::new(Session {
-            terminal: term.clone(), spawn: gtk::gio::Cancellable::new(),
+            terminal: term.clone(), shell_exe: std::fs::canonicalize(&shell_bin).ok(), spawn: gtk::gio::Cancellable::new(),
             pid: Cell::new(None), closing: Cell::new(false), exited: Cell::new(false),
         });
         *self.session.borrow_mut() = Some(session.clone());
+        links::install(&term, &session, &self.open);
         let body = self.body.downgrade();
         let note = self.note.downgrade();
         let shell = Rc::downgrade(&self.shell);
@@ -209,15 +216,14 @@ impl Pane {
             if child.closing.get() { return; }
             let (Some(body), Some(note), Some(shell)) = (body.upgrade(), note.upgrade(), shell.upgrade()) else { return; };
             // Ctrl+D (or `exit`) ended the shell. Drop it so the next open starts fresh.
+            release_focus(term);
             body.remove(term);
             body.set_size_request(-1, -1);
             note.set_label("Shell exited. Close and reopen the pane to start a new session.");
             note.set_visible(true);
             *shell.borrow_mut() = None;
-            set_shell_accels(term, true);
         });
 
-        let shell_bin = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let env = process_env();
         let env_refs: Vec<&str> = env.iter().map(String::as_str).collect();
         let host = self.body.downgrade();
@@ -246,7 +252,7 @@ impl Pane {
                 Err(_) => {
                     if child.closing.get() { return; }
                     let (Some(host), Some(note), Some(shell)) = (host.upgrade(), note.upgrade(), shell.upgrade()) else { return; };
-                    if child.terminal.has_focus() { set_shell_accels(&child.terminal, true); }
+                    release_focus(&child.terminal);
                     host.remove(&child.terminal);
                     note.set_label("Couldn't start the shell");
                     note.set_visible(true);
@@ -257,6 +263,63 @@ impl Pane {
         term.grab_focus();
         set_shell_accels(&term, false);
     }
+}
+
+fn inspect_path(source: PathBuf) -> std::io::Result<(PathBuf, bool)> {
+    // Resolve symlink/.. parents, retaining the final entry even if its target is missing.
+    let source = match (source.parent(), source.file_name()) {
+        (Some(parent), Some(name)) => parent.canonicalize()?.join(name),
+        _ => source.canonicalize()?,
+    };
+    let entry = std::fs::symlink_metadata(&source)?;
+    let is_dir = entry.is_dir() || entry.file_type().is_symlink()
+        && std::fs::metadata(&source).is_ok_and(|target| target.is_dir());
+    Ok((source, is_dir))
+}
+
+/// Route every terminal action back to its owning tab, even if focus changes.
+pub(super) fn connect(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
+    let app = Rc::downgrade(app);
+    let tab_ref = Rc::downgrade(tab);
+    *tab.terminal.open.borrow_mut() = Some(Box::new(move |result| {
+        let (Some(app), Some(tab)) = (app.upgrade(), tab_ref.upgrade()) else { return; };
+        if tab.terminal.closed.get() { return; }
+        let generation = tab.begin_navigation();
+        match result {
+            Err(error) => super::toast(&app, &error),
+            Ok(links::Target::Web(uri)) => {
+                let weak = Rc::downgrade(&app);
+                gtk::UriLauncher::new(&uri).launch(Some(&app.window), gtk::gio::Cancellable::NONE, move |result| {
+                    if let (Err(error), Some(app)) = (result, weak.upgrade()) { super::toast(&app, &format!("Couldn't open link: {error}")); }
+                });
+            }
+            Ok(links::Target::Path(path)) => {
+                let app = Rc::downgrade(&app);
+                let tab = Rc::downgrade(&tab);
+                gtk::glib::spawn_future_local(async move {
+                    let source = path.clone();
+                    let result = gtk::gio::spawn_blocking(move || inspect_path(source)).await;
+                    let (Some(app), Some(tab)) = (app.upgrade(), tab.upgrade()) else { return; };
+                    if tab.terminal.closed.get() || tab.navigation_generation.get() != generation { return; }
+                    match result {
+                        Ok(Ok((path, true))) => super::navigation::navigate(&app, &tab, gtk::gio::File::for_path(&path)),
+                        Ok(Ok((path, false))) => {
+                            if let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|s| s.to_str())) {
+                                if name.starts_with('.') && !app.show_hidden.get()
+                                    && let Some(action) = app.window.lookup_action("toggle-hidden") {
+                                    action.activate(None);
+                                }
+                                super::navigation::navigate(&app, &tab, gtk::gio::File::for_path(parent));
+                                super::navigation::select_names(&tab, &[name.to_owned()], || {});
+                            }
+                        }
+                        Ok(Err(error)) => super::toast(&app, &format!("Couldn't open {}: {error}", path.display())),
+                        Err(_) => super::toast(&app, "Couldn't inspect the terminal path"),
+                    }
+                });
+            }
+        }
+    }));
 }
 
 impl Drop for Pane {
@@ -385,7 +448,38 @@ fn rgba(spec: &str) -> Option<gtk::gdk::RGBA> {
 }
 
 fn process_env() -> Vec<String> {
-    std::env::vars().map(|(key, value)| format!("{key}={value}")).collect()
+    std::env::vars().map(|(key, value)| {
+        let value = if matches!(key.as_str(), "LANG" | "LC_CTYPE" | "LC_ALL") {
+            terminal_locale(&value)
+        } else { value };
+        format!("{key}={value}")
+    }).collect()
+}
+
+fn terminal_locale(value: &str) -> String {
+    if value.is_empty() || matches!(value, "C" | "POSIX") || value.contains('.') {
+        return value.into();
+    }
+    let (name, modifier) = value.split_once('@').unwrap_or((value, ""));
+    let candidate = if modifier.is_empty() {
+        format!("{name}.UTF-8")
+    } else { format!("{name}.UTF-8@{modifier}") };
+    let Ok(locale) = std::ffi::CString::new(candidate.as_str()) else { return value.into(); };
+    // GNU tools can escape Unicode under a UTF-8 locale alias without an encoding suffix.
+    // Validate the explicit name without changing the GUI process's locale.
+    let handle = unsafe { libc::newlocale(libc::LC_CTYPE_MASK, locale.as_ptr(), std::ptr::null_mut()) };
+    if handle.is_null() { return value.into(); }
+    unsafe { libc::freelocale(handle); }
+    candidate
+}
+
+// GTK's root can retain an unparented focus widget, including an inactive one.
+fn release_focus(term: &vte::Terminal) {
+    let Some(root) = term.root() else { return; };
+    if root.focus().is_some_and(|focus| focus == *term.upcast_ref::<gtk::Widget>() || focus.is_ancestor(term)) {
+        set_shell_accels(term, true);
+        root.set_focus(None::<&gtk::Widget>);
+    }
 }
 
 /// Window shortcuts run before the focused widget. While the shell is focused,
@@ -461,6 +555,65 @@ mod tests {
                 }
             }
         })).unwrap();
+    }
+
+    #[test]
+    fn terminal_inspection_preserves_symlink_entries_and_directory_targets() {
+        let root = std::env::temp_dir().join(format!("filescope-terminal-links-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        std::fs::write(root.join("file"), "keep").unwrap();
+        for (name, target) in [("broken", "missing"), ("directory-link", "folder"), ("file-link", "file")] {
+            std::os::unix::fs::symlink(target, root.join(name)).unwrap();
+        }
+        for (name, is_dir) in [("broken", false), ("directory-link", true), ("file-link", false)] {
+            assert_eq!(super::inspect_path(root.join(name)).unwrap(), (root.join(name), is_dir));
+        }
+        assert!(super::inspect_path(root.join("missing")).is_err());
+        assert_eq!(std::fs::read_to_string(root.join("file")).unwrap(), "keep");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_locale_keeps_explicit_encodings_and_unavailable_locales() {
+        for value in ["", "C", "POSIX", "en_IN.UTF-8", "de_DE.ISO-8859-1", "sr_RS.UTF-8@latin", "filescope_missing_locale@modifier"] {
+            assert_eq!(super::terminal_locale(value), value);
+        }
+    }
+
+    #[test]
+    fn terminal_environment_prints_unicode_filenames() {
+        use std::process::Command;
+        const MARKER: &str = "FILESCOPE_LOCALE_TEST";
+        if std::env::var_os(MARKER).is_none() {
+            for key in ["LANG", "LC_CTYPE", "LC_ALL"] {
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "window::terminal::tests::terminal_environment_prints_unicode_filenames", "--nocapture"])
+                    .env(MARKER, key).env("LANG", "en_IN")
+                    .env_remove("LC_ALL").env_remove("LC_CTYPE").env(key, "en_IN")
+                    .output().unwrap();
+                assert!(output.status.success(), "{key}: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            }
+            return;
+        }
+        // This locale alias must exist to reproduce coreutils' missing-encoding behavior.
+        let locale = std::ffi::CString::new("en_IN.UTF-8").unwrap();
+        let handle = unsafe { libc::newlocale(libc::LC_CTYPE_MASK, locale.as_ptr(), std::ptr::null_mut()) };
+        if handle.is_null() { return; }
+        unsafe { libc::freelocale(handle); }
+        let root = std::env::temp_dir().join(format!("filescope-terminal-locale-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("हिन्दू.m4a"), "keep").unwrap();
+        let env: Vec<_> = super::process_env().into_iter().map(|item| {
+            let (key, value) = item.split_once('=').unwrap();
+            (key.to_owned(), value.to_owned())
+        }).collect();
+        let key = std::env::var(MARKER).unwrap();
+        assert_eq!(env.iter().find(|(name, _)| name == &key).map(|(_, value)| value.as_str()), Some("en_IN.UTF-8"));
+        let output = Command::new("ls").arg("--quoting-style=shell-escape").arg(&root)
+            .env_clear().envs(env).output().unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8(output.stdout).unwrap().contains("हिन्दू.m4a"), "Unicode names were escaped");
     }
 
     #[test]

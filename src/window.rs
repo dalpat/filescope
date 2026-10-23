@@ -127,9 +127,17 @@ struct Tab {
     list_zoom: Rc<Cell<i32>>,
     /// Bottom shell for this tab. Hidden until the user opens it.
     terminal: terminal::Pane,
+    /// Navigation and newer requests supersede pending terminal path inspections.
+    navigation_generation: Cell<u64>,
 }
 
 impl Tab {
+    fn begin_navigation(&self) -> u64 {
+        let generation = self.navigation_generation.get().wrapping_add(1);
+        self.navigation_generation.set(generation);
+        generation
+    }
+
     fn shutdown(&self) {
         self.terminal.shutdown();
         self.search.cancel();

@@ -184,6 +184,7 @@ pub(super) fn stop(app: &Rc<App>, tab: &Rc<Tab>) {
     tab.search.cancel();
     tab.search.query.borrow_mut().clear();
     if tab.search.active.replace(false) {
+        tab.begin_navigation();
         // Esc/clearing returns to the scope folder without a duplicate Back step.
         let root = tab.dir_list.file();
         if matches!(tab.back.borrow().last(), Some(Place::Folder(file)) if root.as_ref().is_some_and(|root| file.equal(root)))
@@ -220,6 +221,7 @@ pub(super) fn changed(app: &Rc<App>, tab: &Rc<Tab>, remember: bool) {
         tab.back.borrow_mut().push(Place::Folder(root));
         tab.fwd.borrow_mut().clear();
     }
+    tab.begin_navigation();
     tab.search.cancel();
     tab.search.active.set(true);
     *tab.search.query.borrow_mut() = query.clone();
