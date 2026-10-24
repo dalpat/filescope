@@ -10,7 +10,6 @@ use vte::prelude::*;
 mod links;
 
 const MIN_HEIGHT: i32 = 120;
-const MAX_HEIGHT: i32 = 640;
 
 struct Session {
     terminal: vte::Terminal,
@@ -50,10 +49,10 @@ impl Session {
 /// One tab's bottom pane. The shell is started once and kept when the pane hides.
 pub(super) struct Pane {
     revealer: gtk::Revealer,
-    body: gtk::Box,
+    split: gtk::Paned,
+    viewport: gtk::ScrolledWindow,
     note: gtk::Label,
     shell: Rc<RefCell<Option<vte::Terminal>>>,
-    height: Rc<Cell<i32>>,
     session: RefCell<Option<Rc<Session>>>,
     open: links::Open,
     closed: Cell<bool>,
@@ -69,8 +68,19 @@ impl Pane {
         note.add_css_class("dim-label");
 
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        body.set_vexpand(false);
+        body.set_vexpand(true);
         body.append(&note);
+        // VTE's current rows/columns must not become the window's minimum size.
+        let viewport = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::External)
+            .vscrollbar_policy(gtk::PolicyType::External)
+            .min_content_height(MIN_HEIGHT)
+            .max_content_height(200)
+            .propagate_natural_height(true)
+            .vexpand(true)
+            .visible(false)
+            .build();
+        body.append(&viewport);
 
         let title = gtk::Label::builder().label("Terminal").xalign(0.0).hexpand(true).build();
         let close = gtk::Button::new();
@@ -82,55 +92,35 @@ impl Pane {
         bar.append(&title);
         bar.append(&close);
 
-        let handle = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        handle.add_css_class("fs-terminal-handle");
-        handle.set_cursor(gtk::gdk::Cursor::from_name("ns-resize", None).as_ref());
-
-        let height = Rc::new(Cell::new(200));
-        let drag_origin = Rc::new(Cell::new(200));
         let shell: Rc<RefCell<Option<vte::Terminal>>> = Rc::new(RefCell::new(None));
-        let drag = gtk::GestureDrag::new();
-        {
-            let height = height.clone();
-            let drag_origin = drag_origin.clone();
-            drag.connect_drag_begin(move |_, _, _| drag_origin.set(height.get()));
-        }
-        {
-            let height = height.clone();
-            let drag_origin = drag_origin.clone();
-            let body = body.clone();
-            let shell = shell.clone();
-            drag.connect_drag_update(move |_, _, dy| {
-                let next = dragged_height(drag_origin.get(), dy);
-                height.set(next);
-                body.set_size_request(-1, next);
-                if let Some(term) = shell.borrow().as_ref() {
-                    term.set_size_request(-1, next);
-                }
-            });
-        }
-        handle.add_controller(drag);
 
         let wrap = gtk::Box::new(gtk::Orientation::Vertical, 0);
         wrap.add_css_class("fs-terminal");
-        wrap.set_vexpand(false);
-        wrap.append(&handle);
+        wrap.set_vexpand(true);
         wrap.append(&bar);
         wrap.append(&body);
 
         let revealer = gtk::Revealer::builder()
-            .transition_type(gtk::RevealerTransitionType::SlideUp)
+            .transition_type(gtk::RevealerTransitionType::None)
             .child(&wrap)
             .reveal_child(false)
-            .vexpand(false)
+            .vexpand(true)
             .build();
+        // A hidden end child also removes the divider and gives the browser all space.
+        revealer.bind_property("reveal-child", &revealer, "visible").sync_create().build();
+        let split = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .resize_start_child(true).resize_end_child(false)
+            .shrink_start_child(false).shrink_end_child(false)
+            .wide_handle(true).vexpand(true)
+            .end_child(&revealer).build();
 
         let pane = Self {
             revealer: revealer.clone(),
-            body,
+            split,
+            viewport,
             note,
             shell,
-            height,
             session: RefCell::new(None),
             open: Rc::new(RefCell::new(None)),
             closed: Cell::new(false),
@@ -147,8 +137,8 @@ impl Pane {
         pane
     }
 
-    pub(super) fn widget(&self) -> gtk::Revealer {
-        self.revealer.clone()
+    pub(super) fn widget(&self) -> gtk::Paned {
+        self.split.clone()
     }
 
     pub(super) fn shutdown(&self) {
@@ -156,7 +146,7 @@ impl Pane {
         let term = self.shell.borrow_mut().take();
         if let Some(term) = term {
             release_focus(&term);
-            if term.parent().is_some() { self.body.remove(&term); }
+            self.viewport.set_child(None::<&gtk::Widget>);
         }
         if let Some(session) = self.session.borrow_mut().take() { session.close(); }
         self.revealer.set_reveal_child(false);
@@ -174,9 +164,6 @@ impl Pane {
         }
         self.revealer.set_reveal_child(true);
         if let Some(term) = self.shell.borrow().as_ref() {
-            let next = self.height.get();
-            self.body.set_size_request(-1, next);
-            term.set_size_request(-1, next);
             term.grab_focus();
             set_shell_accels(term, false);
             return;
@@ -184,18 +171,17 @@ impl Pane {
         let Some(dir) = cwd.and_then(|path| path.to_str()) else {
             self.note.set_label("No folder to open a terminal in");
             self.note.set_visible(true);
-            self.body.set_size_request(-1, -1);
+            self.viewport.set_visible(false);
             return;
         };
         self.note.set_visible(false);
         let term = vte::Terminal::new();
         term.set_vexpand(true);
         term.set_hexpand(true);
-        term.set_size_request(-1, self.height.get());
-        self.body.set_size_request(-1, self.height.get());
         paint_colors(&term);
         watch_focus(&term);
-        self.body.append(&term);
+        self.viewport.set_child(Some(&term));
+        self.viewport.set_visible(true);
         *self.shell.borrow_mut() = Some(term.clone());
 
         let shell_bin = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -205,8 +191,8 @@ impl Pane {
         });
         *self.session.borrow_mut() = Some(session.clone());
         links::install(&term, &session, &self.open);
-        let body = self.body.downgrade();
-        let note = self.note.downgrade();
+        let viewport = self.viewport.downgrade();
+        let revealer = self.revealer.downgrade();
         let shell = Rc::downgrade(&self.shell);
         let child = Rc::downgrade(&session);
         term.connect_child_exited(move |term, _status| {
@@ -214,19 +200,18 @@ impl Pane {
             child.pid.set(None);
             child.exited.set(true);
             if child.closing.get() { return; }
-            let (Some(body), Some(note), Some(shell)) = (body.upgrade(), note.upgrade(), shell.upgrade()) else { return; };
+            let (Some(viewport), Some(revealer), Some(shell)) = (viewport.upgrade(), revealer.upgrade(), shell.upgrade()) else { return; };
             // Ctrl+D (or `exit`) ended the shell. Drop it so the next open starts fresh.
             release_focus(term);
-            body.remove(term);
-            body.set_size_request(-1, -1);
-            note.set_label("Shell exited. Close and reopen the pane to start a new session.");
-            note.set_visible(true);
+            viewport.set_child(None::<&gtk::Widget>);
+            viewport.set_visible(false);
+            revealer.set_reveal_child(false);
             *shell.borrow_mut() = None;
         });
 
         let env = process_env();
         let env_refs: Vec<&str> = env.iter().map(String::as_str).collect();
-        let host = self.body.downgrade();
+        let host = self.viewport.downgrade();
         let note = self.note.downgrade();
         let shell = Rc::downgrade(&self.shell);
         let child = Rc::downgrade(&session);
@@ -253,7 +238,8 @@ impl Pane {
                     if child.closing.get() { return; }
                     let (Some(host), Some(note), Some(shell)) = (host.upgrade(), note.upgrade(), shell.upgrade()) else { return; };
                     release_focus(&child.terminal);
-                    host.remove(&child.terminal);
+                    host.set_child(None::<&gtk::Widget>);
+                    host.set_visible(false);
                     note.set_label("Couldn't start the shell");
                     note.set_visible(true);
                     *shell.borrow_mut() = None;
@@ -324,11 +310,6 @@ pub(super) fn connect(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
 
 impl Drop for Pane {
     fn drop(&mut self) { self.shutdown(); }
-}
-
-/// Dragging the handle up grows the pane. `dy` is negative when the pointer moves up.
-fn dragged_height(start: i32, dy: f64) -> i32 {
-    ((start as f64 - dy).round() as i32).clamp(MIN_HEIGHT, MAX_HEIGHT)
 }
 
 struct Palette {
@@ -504,7 +485,63 @@ fn set_shell_accels(term: &vte::Terminal, enable: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::dragged_height;
+    #[test]
+    #[ignore = "requires an isolated graphical session with SHELL=/bin/sh and temporary XDG_CONFIG_HOME"]
+    fn terminal_window_can_shrink_after_growing() {
+        use super::*;
+        use super::super::{self as window, navigation};
+        assert!(std::env::var_os("XDG_CONFIG_HOME").is_some());
+        adw::init().unwrap();
+        gtk::Settings::default().unwrap().set_gtk_enable_animations(false);
+        let application = adw::Application::builder()
+            .application_id("dev.filescope.TerminalResizeTest")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE).build();
+        application.register(gtk::gio::Cancellable::NONE).unwrap();
+        gtk::glib::MainContext::default().block_on(async {
+            window::open_files(&application, &[gtk::gio::File::for_path("/tmp")]);
+            let app = window::app_state(&application).unwrap();
+            let tab = navigation::active_tab(&app);
+            app.window.set_default_size(1400, 900);
+            tab.terminal.toggle(Some(Path::new("/tmp")));
+            gtk::glib::timeout_future(std::time::Duration::from_millis(800)).await;
+            assert!(tab.terminal.session.borrow().as_ref().unwrap().pid.get().is_some());
+            assert!(app.window.measure(gtk::Orientation::Horizontal, -1).0 <= 800,
+                "terminal's allocated columns must not raise the window minimum width");
+            let term = tab.terminal.shell.borrow().clone().unwrap();
+            let original_height = term.height();
+            tab.terminal.split.set_position(180);
+            // Drive allocation explicitly: Broadway may defer frames without a visible client.
+            tab.terminal.split.allocate(tab.terminal.split.width(), tab.terminal.split.height(), -1, None);
+            gtk::glib::timeout_future(std::time::Duration::from_millis(200)).await;
+            assert!(term.height() > original_height + 100, "divider must grow the terminal");
+            let large_height = term.height();
+            tab.terminal.split.set_position(380);
+            tab.terminal.split.allocate(tab.terminal.split.width(), tab.terminal.split.height(), -1, None);
+            gtk::glib::timeout_future(std::time::Duration::from_millis(200)).await;
+            assert!(term.height() < large_height - 100, "divider must shrink the terminal");
+            let stable_height = term.height();
+            for _ in 0..5 {
+                gtk::glib::timeout_future(std::time::Duration::from_millis(40)).await;
+                assert_eq!(term.height(), stable_height, "terminal allocation must settle");
+            }
+            assert!(app.window.measure(gtk::Orientation::Vertical, 800).0 <= 600,
+                "enlarging the terminal must not raise the window minimum height");
+            // Default size is applied when a window is shown; drag resizing is checked separately.
+            app.window.set_visible(false);
+            app.window.set_default_size(800, 600);
+            app.window.present();
+            gtk::glib::timeout_future(std::time::Duration::from_millis(500)).await;
+            assert!(app.window.width() <= 800, "terminal prevents window shrinking: width {}", app.window.width());
+            assert!(app.window.height() <= 600, "terminal prevents window shrinking: height {}", app.window.height());
+            let session = tab.terminal.session.borrow().clone().unwrap();
+            tab.terminal.toggle(None);
+            gtk::glib::timeout_future(std::time::Duration::from_millis(100)).await;
+            assert!(!tab.terminal.revealer.is_visible());
+            tab.terminal.toggle(None);
+            assert!(Rc::ptr_eq(&session, tab.terminal.session.borrow().as_ref().unwrap()));
+            app.window.close();
+        });
+    }
 
     #[test]
     #[ignore = "requires an isolated graphical session with SHELL=/bin/sh"]
@@ -614,12 +651,6 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
         assert!(output.status.success());
         assert!(String::from_utf8(output.stdout).unwrap().contains("हिन्दू.m4a"), "Unicode names were escaped");
-    }
-
-    #[test]
-    fn dragging_up_grows_the_pane_and_down_shrinks_it() {
-        assert_eq!(dragged_height(200, -40.0), 240);
-        assert_eq!(dragged_height(200, 50.0), 150);
     }
 
     #[test]

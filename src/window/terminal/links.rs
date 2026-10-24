@@ -1122,12 +1122,12 @@ mod gtk_tests {
                     assert!(application.accels_for_action("win.copy").is_empty());
                     session.terminal.feed_child(b"\x04");
                     wait_for(|| owner.terminal.shell.borrow().is_none()).await;
+                    assert!(!owner.terminal.revealer.reveals_child(), "Ctrl+D must collapse the terminal pane");
                     assert!(
                         !application.accels_for_action("win.copy").is_empty(),
                         "Ctrl+D must restore file-view shortcuts"
                     );
                     drop(session);
-                    owner.terminal.toggle(Some(&root.join("shell"))); // Hide the exited shell's note.
                     owner.terminal.toggle(Some(&root.join("shell")));
                     let session = owner.terminal.session.borrow().clone().unwrap();
                     wait_for(|| session.pid.get().is_some()).await;

@@ -13,6 +13,7 @@ use crate::{archive, bookmarks, format, preview, settings, undo};
 
 mod batch_rename;
 mod commands;
+mod directory;
 mod navigation;
 mod places;
 mod search;
@@ -66,8 +67,6 @@ row:hover .bookmark-x,
 .bookmark-x:focus-visible { opacity: 1; }
 .bookmark-drop { background: alpha(@accent_bg_color, 0.22); }
 .fs-terminal { background: @window_bg_color; }
-.fs-terminal-handle { min-height: 5px; background: alpha(@window_fg_color, 0.10); }
-.fs-terminal-handle:hover { background: @accent_bg_color; }
 .fs-terminal-bar { padding: 0 8px; min-height: 28px; }
 .fs-terminal-bar label { font-size: 12px; color: alpha(@window_fg_color, 0.65); }
 .fs-terminal-bar button { min-height: 0; min-width: 0; padding: 4px; }
@@ -106,6 +105,7 @@ pub(super) fn terminal_cwd(place: &Place) -> Option<PathBuf> {
 struct Tab {
     page: RefCell<Option<adw::TabPage>>,
     dir_list: gtk::DirectoryList,
+    directory: Rc<directory::Contents>,
     filter: gtk::CustomFilter,
     selection: gtk::MultiSelection,
     folder_model: gtk::SortListModel,
@@ -139,6 +139,7 @@ impl Tab {
     }
 
     fn shutdown(&self) {
+        self.directory.stop();
         self.terminal.shutdown();
         self.search.cancel();
         self.preview_pane.set_visible(false);

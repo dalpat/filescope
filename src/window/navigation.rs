@@ -11,14 +11,15 @@ use gtk::{gio, glib};
 /// Create a tab showing `dir`, optionally selecting it.
 pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     let dir_list =
-        gtk::DirectoryList::builder().attributes(super::ATTRS).io_priority(glib::Priority::DEFAULT).build();
+        gtk::DirectoryList::builder().attributes(super::ATTRS).monitored(false).io_priority(glib::Priority::DEFAULT).build();
+    let directory = super::directory::Contents::new(&dir_list);
 
     let show_hidden = app.show_hidden.clone();
     let filter = gtk::CustomFilter::new(move |obj| {
         let info = obj.downcast_ref::<gio::FileInfo>().unwrap();
         show_hidden.get() || !(info.is_hidden() || info.name().to_string_lossy().starts_with('.'))
     });
-    let filtered = gtk::FilterListModel::new(Some(dir_list.clone()), Some(filter.clone()));
+    let filtered = gtk::FilterListModel::new(Some(directory.items.clone()), Some(filter.clone()));
     let sort_model = gtk::SortListModel::new(Some(filtered), None::<gtk::Sorter>);
     let selection = gtk::MultiSelection::new(Some(sort_model.clone()));
 
@@ -83,13 +84,14 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     view_stack.set_hexpand(true);
     browser.append(&view_stack);
     browser.append(&preview_pane.widget);
-    content.append(&browser);
     let terminal_pane = super::terminal::Pane::new();
+    terminal_pane.widget().set_start_child(Some(&browser));
     content.append(&terminal_pane.widget());
 
     let tab = Rc::new(super::Tab {
         page: RefCell::new(None),
         dir_list,
+        directory,
         filter,
         selection: selection.clone(),
         folder_model: sort_model.clone(),
