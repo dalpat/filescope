@@ -97,6 +97,7 @@ pub(super) fn attach_context_menu(app: &Rc<super::App>, widget: &impl IsA<gtk::W
         let (Some(app), Some(view)) = (app.upgrade(), view.upgrade()) else { return; };
         g.set_state(gtk::EventSequenceState::Claimed);
         let tab = super::navigation::active_tab(&app);
+        super::columns::focus_widget(&app, &tab, &view);
         let selection = super::visible_selection(&tab);
         let on_item = if let Some(pos) = position_at(&view, x, y) {
             // Right-click an unselected row: act on that row, not the previous selection.
@@ -190,7 +191,7 @@ pub(super) fn attach_view_keys(app: &Rc<super::App>, view: &impl IsA<gtk::Widget
 }
 
 /// True when keyboard focus is in a text entry inside `widget` (inline rename).
-fn focus_is_text_input(widget: &gtk::Widget) -> bool {
+pub(super) fn focus_is_text_input(widget: &gtk::Widget) -> bool {
     let Some(focus) = widget.root().and_then(|root| root.focus()) else {
         return false;
     };
@@ -294,12 +295,13 @@ pub(super) fn attach_drop_target(app: &Rc<super::App>, tab: &Rc<super::Tab>, vie
         let view = view.as_ref().downgrade();
         target.connect_drop(move |target, value, x, y| {
             let (Some(app), Some(tab), Some(view)) = (app.upgrade(), tab.upgrade(), view.upgrade()) else { return false; };
+            super::columns::focus_widget(&app, &tab, &view);
             clear_drop_highlight(&highlighted);
             let Ok(list) = value.get::<gdk::FileList>() else {
                 return false;
             };
             let sources: Vec<PathBuf> = list.files().iter().filter_map(|f| f.path()).collect();
-            let Some(current) = tab.dir_list.file().and_then(|f| f.path()) else {
+            let Some(current) = tab.current_dir().and_then(|f| f.path()) else {
                 return false;
             };
             // Into the folder under the pointer, or the current folder otherwise.
@@ -506,21 +508,24 @@ fn cell_at_position(widget: &gtk::Widget, position: u32) -> Option<gtk::Widget> 
 /// realized (e.g. scrolled out of view), so the caller can fall back to a dialog.
 pub(super) fn start_inline_rename(app: &Rc<super::App>, tab: &Rc<super::Tab>) -> bool {
     if tab.search.active.get() { return false; } // Search uses the rename dialog.
-    let bitset = tab.selection.selection();
+    let bitset = super::visible_selection(tab).selection();
     if bitset.size() != 1 {
         return false;
     }
     let position = bitset.nth(0);
-    let Some(info) = tab.selection.item(position).and_downcast::<gio::FileInfo>() else {
+    let Some(info) = super::visible_selection(tab).item(position).and_downcast::<gio::FileInfo>() else {
         return false;
     };
-    let Some(dir) = tab.dir_list.file() else { return false };
+    let Some(dir) = tab.current_dir() else { return false };
     let file = dir.child(info.name());
     let name = info.display_name().to_string();
     let is_dir = info.file_type() == gio::FileType::Directory;
 
     // Only the visible view can host the editor.
-    let view: gtk::Widget = if app.is_list.get() {
+    let view: gtk::Widget = if tab.view_stack.visible_child_name().as_deref() == Some("columns") {
+        let Some(view) = tab.columns.view() else { return false; };
+        view.upcast()
+    } else if app.view_mode.get() == super::ViewMode::List {
         tab.column_view.clone().upcast()
     } else {
         tab.grid_view.clone().upcast()
@@ -623,7 +628,7 @@ pub(super) fn fill_columns(tab: Option<&Rc<super::Tab>>, column_view: &gtk::Colu
     column_view.append_column(&modified_column(tab, column_view));
 }
 
-fn name_column(tab: Option<&Rc<super::Tab>>, view: &gtk::ColumnView, zoom: &Rc<Cell<i32>>) -> gtk::ColumnViewColumn {
+pub(super) fn name_column(tab: Option<&Rc<super::Tab>>, view: &gtk::ColumnView, zoom: &Rc<Cell<i32>>) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
     let tab_setup = tab.map(Rc::downgrade);
     let zoom_setup = zoom.clone();

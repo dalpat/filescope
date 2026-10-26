@@ -95,6 +95,7 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         filter,
         selection: selection.clone(),
         folder_model: sort_model.clone(),
+        columns: super::columns::Pane::new(),
         search,
         view_stack,
         grid_view: grid_view.clone(),
@@ -113,6 +114,8 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         terminal: terminal_pane,
         navigation_generation: Cell::new(0),
     });
+
+    tab.view_stack.add_named(&tab.columns.widget, Some("columns"));
 
     // Register the tab before appending: appending the first page auto-selects
     // it, which fires `selected-page-notify` → `active_tab()`; the tab must
@@ -282,7 +285,7 @@ pub(super) fn here(tab: &super::Tab) -> Option<super::Place> {
     match tab.view_stack.visible_child_name().as_deref() {
         Some("computer") => Some(super::Place::Computer),
         Some("trash") => Some(super::Place::Trash),
-        _ => tab.dir_list.file().map(super::Place::Folder),
+        _ => tab.current_dir().map(super::Place::Folder),
     }
 }
 
@@ -301,7 +304,7 @@ fn open_place(app: &Rc<super::App>, tab: &Rc<super::Tab>, place: super::Place) {
 }
 
 pub(super) fn go_up(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
-    if let Some(parent) = tab.dir_list.file().and_then(|f| f.parent()) {
+    if let Some(parent) = tab.current_dir().and_then(|f| f.parent()) {
         navigate(app, tab, parent);
     }
 }
@@ -312,9 +315,18 @@ pub(super) fn set_dir(app: &Rc<super::App>, tab: &Rc<super::Tab>, file: &gio::Fi
     // A new folder starts unfiltered — close any open search from the last one.
     tab.search_bar.set_search_mode(false);
     tab.dir_list.set_file(Some(file));
+    if app.view_mode.get() == super::ViewMode::Columns {
+        tab.columns.set_location(app, tab, file);
+    } else {
+        tab.columns.clear();
+    }
     set_path_visible(tab, true);
     // Force out of any "This PC" view into the directory (empty/grid/list).
     refresh_view_mode(app, tab, true);
+    // Only the displayed tab may take focus; never defer this until a load completes.
+    if tab.columns.widget.is_mapped() && let Some(view) = tab.columns.view() {
+        view.grab_focus();
+    }
     rebuild_breadcrumb(app, tab, file);
     if let Some(page) = tab.page.borrow().as_ref() {
         let title =
@@ -340,10 +352,18 @@ pub(super) fn refresh_view_mode(app: &Rc<super::App>, tab: &Rc<super::Tab>, forc
     if !force && matches!(showing.as_deref(), Some("computer") | Some("trash")) {
         return;
     }
+    if app.view_mode.get() == super::ViewMode::Columns {
+        if tab.columns.file().is_none() && let Some(file) = tab.dir_list.file() {
+            tab.columns.set_location(app, tab, &file);
+        }
+        tab.view_stack.set_visible_child_name("columns");
+        super::apply_visible_zoom(app, tab);
+        return;
+    }
     let empty = !tab.dir_list.is_loading() && tab.selection.n_items() == 0;
     let name = if empty {
         "empty"
-    } else if app.is_list.get() {
+    } else if app.view_mode.get() == super::ViewMode::List {
         "list"
     } else {
         "grid"
@@ -364,6 +384,7 @@ pub(super) fn set_path_visible(tab: &super::Tab, on: bool) {
 
 pub(super) fn refresh(tab: &Rc<super::Tab>) {
     if tab.search.active.get() { super::search::refresh(tab); return; }
+    if tab.view_stack.visible_child_name().as_deref() == Some("columns") { tab.columns.refresh(); return; }
     if let Some(file) = tab.dir_list.file() {
         tab.dir_list.set_file(gio::File::NONE);
         tab.dir_list.set_file(Some(&file));
@@ -380,7 +401,9 @@ pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn
     let then = Rc::new(RefCell::new(Some(then)));
     let done = Rc::new(Cell::new(false));
     let generation = tab.navigation_generation.get();
-    let directory = tab.dir_list.file().map(|file| file.uri());
+    let directory = tab.current_dir().map(|file| file.uri());
+    let source = tab.current_source();
+    let model = super::visible_selection(tab);
     let attempt = Rc::new({
         let tab = Rc::downgrade(tab);
         let names = names.clone();
@@ -392,12 +415,13 @@ pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn
             }
             let Some(tab) = tab.upgrade() else { return; };
             if tab.navigation_generation.get() != generation
-                || tab.dir_list.file().map(|file| file.uri()) != directory {
+                || tab.current_dir().map(|file| file.uri()) != directory {
                 done.set(true);
                 then.borrow_mut().take();
                 return;
             }
-            let selection = &tab.selection;
+            if tab.view_stack.visible_child_name().as_deref() == Some("columns") && tab.columns.restoring() { return; }
+            let selection = super::visible_selection(&tab);
             let mut found = Vec::new();
             for i in 0..selection.n_items() {
                 let Some(obj) = selection.item(i) else { continue };
@@ -407,7 +431,7 @@ pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn
                     found.push(i);
                 }
             }
-            let loading = tab.dir_list.is_loading();
+            let loading = tab.current_source().is_loading();
             if found.is_empty() && loading {
                 return;
             }
@@ -425,11 +449,11 @@ pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn
     attempt();
     {
         let attempt = attempt.clone();
-        tab.selection.connect_items_changed(move |_, _, _, _| attempt());
+        model.connect_items_changed(move |_, _, _, _| attempt());
     }
     {
         let attempt = attempt.clone();
-        tab.dir_list.connect_loading_notify(move |_| attempt());
+        source.connect_loading_notify(move |_| attempt());
     }
 }
 

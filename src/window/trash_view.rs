@@ -142,7 +142,7 @@ impl Pane {
 
     pub fn show_mode(&self, app: &super::App) {
         self.set_zoom(app.zoom.get());
-        self.stack.set_visible_child_name(if self.model.n_items() == 0 { "empty" } else if app.is_list.get() { "list" } else { "grid" });
+        self.stack.set_visible_child_name(if self.model.n_items() == 0 { "empty" } else if app.view_mode.get() == super::ViewMode::List { "list" } else { "grid" });
     }
 
     pub fn set_zoom(&self, size: i32) {
@@ -285,22 +285,7 @@ mod tests {
             open_files(&application, &[gio::File::for_path(root.join("folder"))]);
             let app = app_state(&application).unwrap();
             let tab = navigation::active_tab(&app);
-            let mut pending = vec![app.window.clone().upcast::<gtk::Widget>()];
-            let mut toggle = None;
-            while let Some(widget) = pending.pop() {
-                if let Some(button) = widget.downcast_ref::<gtk::ToggleButton>()
-                    && matches!(button.tooltip_text().as_deref(), Some("Grid view" | "List view")) {
-                    toggle = Some(button.clone());
-                    break;
-                }
-                let mut child = widget.first_child();
-                while let Some(widget) = child {
-                    child = widget.next_sibling();
-                    pending.push(widget);
-                }
-            }
-            let toggle = toggle.unwrap();
-            toggle.set_active(false);
+            gtk::prelude::WidgetExt::activate_action(&app.window, "win.view-mode", Some(&"grid".to_variant())).unwrap();
             glib::timeout_future(std::time::Duration::from_millis(200)).await;
             tab.selection.select_item(0, true);
             let old_selection = tab.selection.selection().size();
@@ -325,7 +310,7 @@ mod tests {
             pane.list.emit_by_name::<()>("activate", &[&0u32]);
             assert_eq!(trash::entries_in(&data.join("Trash")).len(), initial as usize);
             let first = pane.model.item(0);
-            toggle.set_active(true);
+            gtk::prelude::WidgetExt::activate_action(&app.window, "win.view-mode", Some(&"list".to_variant())).unwrap();
             assert_eq!(pane.model.item(0), first, "switching views must not reload the model");
             pane.set_zoom(128);
             assert_eq!(pane.stack.visible_child_name().as_deref(), Some("list"));

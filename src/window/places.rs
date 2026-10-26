@@ -27,7 +27,7 @@ pub(super) fn show_computer(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
     box_.set_vexpand(true);
 
     let (icon_px, tile_w, drive_icon, drive_w) = pc_scale(app.zoom.get());
-    let list = app.is_list.get();
+    let list = app.view_mode.get() == super::ViewMode::List;
     let places = tile_row(list);
     for dir in [
         glib::UserDirectory::Desktop,
@@ -184,7 +184,7 @@ pub(super) fn sync_sidebar(app: &Rc<super::App>) {
     }
     let tab = super::navigation::active_tab(app);
     let showing = tab.view_stack.visible_child_name();
-    let current = tab.dir_list.file().and_then(|file| file.path());
+    let current = tab.current_dir().and_then(|file| file.path());
     let list = &app.sidebar_list;
     let mut child = list.first_child();
     let mut matched = None;
@@ -362,7 +362,7 @@ pub(super) fn rescale_tiles(app: &Rc<super::App>, root: &impl IsA<gtk::Widget>) 
         tile_w,
         drive_icon,
         drive_w,
-        app.is_list.get(),
+        app.view_mode.get() == super::ViewMode::List,
     );
 }
 
@@ -734,7 +734,7 @@ fn unmount(app: &Rc<super::App>, mount: &gio::Mount) {
     // Any tab sitting inside this mount gets sent Home before it vanishes.
     if let Some(root) = mount.default_location().path() {
         for tab in app.tabs.borrow().iter() {
-            if tab.dir_list.file().and_then(|f| f.path()).is_some_and(|p| p.starts_with(&root)) {
+            if tab.current_dir().and_then(|f| f.path()).is_some_and(|p| p.starts_with(&root)) {
                 let tab = tab.clone();
                 let app = app.clone();
                 super::navigation::navigate(&app, &tab, gio::File::for_path(glib::home_dir()));
@@ -854,7 +854,7 @@ fn ntfs3g_fallback(app: &Rc<super::App>, tab: &Rc<super::Tab>, volume: &gio::Vol
 }
 
 pub(super) fn bookmark_current(app: &Rc<super::App>) {
-    let Some(path) = super::navigation::active_tab(app).dir_list.file().and_then(|f| f.path()) else { return };
+    let Some(path) = super::navigation::active_tab(app).current_dir().and_then(|f| f.path()) else { return };
     {
         let mut marks = app.bookmarks.borrow_mut();
         if marks.contains(&path) {

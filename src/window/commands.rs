@@ -22,12 +22,13 @@ pub(super) fn selected(tab: &Rc<super::Tab>) -> Vec<(gio::File, gio::FileInfo)> 
     if tab.view_stack.visible_child_name().as_deref() == Some("trash") {
         return Vec::new();
     }
-    let Some(dir) = tab.dir_list.file() else { return Vec::new() };
-    let bitset = tab.selection.selection();
+    let Some(dir) = tab.current_dir() else { return Vec::new() };
+    let selection = super::visible_selection(tab);
+    let bitset = selection.selection();
     let mut out = Vec::new();
     for i in 0..bitset.size() {
         let pos = bitset.nth(i as u32);
-        if let Some(obj) = tab.selection.item(pos) {
+        if let Some(obj) = selection.item(pos) {
             let info = obj.downcast::<gio::FileInfo>().unwrap();
             let directory = if tab.search.active.get() { None } else { Some(&dir) };
             if let Some(file) = file_from_info(&info, directory) { out.push((file, info)); }
@@ -37,9 +38,9 @@ pub(super) fn selected(tab: &Rc<super::Tab>) -> Vec<(gio::File, gio::FileInfo)> 
 }
 
 pub(super) fn activate(app: &Rc<super::App>, tab: &Rc<super::Tab>, position: u32) {
-    let Some(item) = tab.selection.item(position) else { return };
+    let Some(item) = super::visible_selection(tab).item(position) else { return };
     let info = item.downcast::<gio::FileInfo>().unwrap();
-    let Some(dir) = tab.dir_list.file() else { return };
+    let Some(dir) = tab.current_dir() else { return };
     let directory = if tab.search.active.get() { None } else { Some(&dir) };
     let Some(child) = file_from_info(&info, directory) else { return; };
     if info.file_type() == gio::FileType::Directory {
@@ -167,7 +168,7 @@ pub(super) fn launch(app: &Rc<super::App>, file: &gio::File) {
 /// Open a terminal in the active tab's folder (Ctrl+.). Only meaningful for a
 /// real on-disk directory (not the "This PC" view).
 pub(super) fn open_terminal(app: &Rc<super::App>) {
-    let Some(dir) = super::navigation::active_tab(app).dir_list.file().and_then(|f| f.path()) else { return };
+    let Some(dir) = super::navigation::active_tab(app).current_dir().and_then(|f| f.path()) else { return };
     if !open_terminal_at(&dir) {
         super::toast(app, "No terminal emulator found");
     }
@@ -387,7 +388,7 @@ pub(super) fn run_tool(
 /// Extract each selected archive into a new folder named after it.
 pub(super) fn extract_selected(app: &Rc<super::App>) {
     let tab = super::navigation::active_tab(app);
-    let Some(dir) = tab.dir_list.file().and_then(|f| f.path()) else { return };
+    let Some(dir) = tab.current_dir().and_then(|f| f.path()) else { return };
     for (file, info) in selected(&tab) {
         let name = info.display_name().to_string();
         let Some(format) = archive::Format::from_name(&name) else { continue };
@@ -423,7 +424,7 @@ pub(super) fn extract_selected(app: &Rc<super::App>) {
 /// Ask for a name and format, then compress the selection into the current folder.
 pub(super) fn compress_selected(app: &Rc<super::App>) {
     let tab = super::navigation::active_tab(app);
-    let Some(dir) = tab.dir_list.file().and_then(|f| f.path()) else { return };
+    let Some(dir) = tab.current_dir().and_then(|f| f.path()) else { return };
     let items: Vec<String> =
         selected(&tab).iter().map(|(_, i)| i.name().to_string_lossy().into_owned()).collect();
     if items.is_empty() {
@@ -762,7 +763,7 @@ pub(super) fn start_job(app: &Rc<super::App>, kind: ops::Kind, sources: Vec<Path
 
 pub(super) fn paste(app: &Rc<super::App>) {
     let tab = super::navigation::active_tab(app);
-    let Some(dir) = tab.dir_list.file().and_then(|f| f.path()) else { return };
+    let Some(dir) = tab.current_dir().and_then(|f| f.path()) else { return };
     let clipboard = app.window.clipboard();
     let app = app.clone();
     read_clipboard_files(&clipboard, move |cut, sources| {
@@ -835,7 +836,7 @@ pub(super) fn rename_selected(app: &Rc<super::App>) {
     let tab = super::navigation::active_tab(app);
     if matches!(tab.view_stack.visible_child_name().as_deref(), Some("trash" | "computer")) { return; }
     let items = selected(&tab);
-    if items.len() as u64 != tab.selection.selection().size() {
+    if items.len() as u64 != super::visible_selection(&tab).selection().size() {
         super::toast(app, "Couldn't resolve every selected file");
         return;
     }
@@ -915,7 +916,9 @@ pub(super) fn new_folder(app: &Rc<super::App>) {
 /// The listing arrives in batches. Edit only after it has finished, so a later
 /// batch does not rebuild the row and close the editor.
 fn edit_when_loaded(app: Rc<super::App>, tab: Rc<super::Tab>) {
-    if !tab.dir_list.is_loading() {
+    let generation = tab.navigation_generation.get();
+    let source = tab.current_source();
+    if !source.is_loading() {
         open_name_editor(app, tab);
         return;
     }
@@ -923,19 +926,21 @@ fn edit_when_loaded(app: Rc<super::App>, tab: Rc<super::Tab>) {
     let handler_in_signal = handler.clone();
     let app_in_signal = app.clone();
     let tab_in_signal = tab.clone();
-    let id = tab.dir_list.connect_loading_notify(move |list| {
+    let id = source.connect_loading_notify(move |list| {
         if list.is_loading() {
             return;
         }
         if let Some(id) = handler_in_signal.take() {
             list.disconnect(id);
         }
-        open_name_editor(app_in_signal.clone(), tab_in_signal.clone());
+        if tab_in_signal.navigation_generation.get() == generation {
+            open_name_editor(app_in_signal.clone(), tab_in_signal.clone());
+        }
     });
     handler.set(Some(id));
-    if !tab.dir_list.is_loading() {
+    if !source.is_loading() {
         if let Some(id) = handler.take() {
-            tab.dir_list.disconnect(id);
+            source.disconnect(id);
         }
         open_name_editor(app, tab);
     }
@@ -944,11 +949,14 @@ fn edit_when_loaded(app: Rc<super::App>, tab: Rc<super::Tab>) {
 /// Scroll the selected row on screen, then open its name editor. One retry
 /// covers the row that was not drawn yet.
 fn open_name_editor(app: Rc<super::App>, tab: Rc<super::Tab>) {
-    let bitset = tab.selection.selection();
+    let generation = tab.navigation_generation.get();
+    let bitset = super::visible_selection(&tab).selection();
     if bitset.size() == 1 {
         let pos = bitset.nth(0);
         let flags = gtk::ListScrollFlags::NONE;
-        if app.is_list.get() {
+        if tab.view_stack.visible_child_name().as_deref() == Some("columns") {
+            if let Some(view) = tab.columns.view() { view.scroll_to(pos, None, flags, None); }
+        } else if app.view_mode.get() == super::ViewMode::List {
             tab.column_view.scroll_to(pos, None, flags, None);
         } else {
             tab.grid_view.scroll_to(pos, flags, None);
@@ -957,12 +965,14 @@ fn open_name_editor(app: Rc<super::App>, tab: Rc<super::Tab>) {
     let app = app.clone();
     let tab = tab.clone();
     glib::idle_add_local_once(move || {
+        if tab.navigation_generation.get() != generation { return; }
         if super::view::start_inline_rename(&app, &tab) {
             return;
         }
         let app = app.clone();
         let tab = tab.clone();
         glib::idle_add_local_once(move || {
+            if tab.navigation_generation.get() != generation { return; }
             super::view::start_inline_rename(&app, &tab);
         });
     });

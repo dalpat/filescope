@@ -10,9 +10,11 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 
 use crate::{archive, bookmarks, format, preview, settings, undo};
+use settings::ViewMode;
 
 mod batch_rename;
 mod commands;
+mod columns;
 mod directory;
 mod navigation;
 mod places;
@@ -66,6 +68,7 @@ expander.pc-section > title { font-size: 13px; font-weight: normal; color: alpha
 row:hover .bookmark-x,
 .bookmark-x:focus-visible { opacity: 1; }
 .bookmark-drop { background: alpha(@accent_bg_color, 0.22); }
+.fs-column-focused { border-top: 2px solid @accent_color; }
 .fs-terminal { background: @window_bg_color; }
 .fs-terminal-bar { padding: 0 8px; min-height: 28px; }
 .fs-terminal-bar label { font-size: 12px; color: alpha(@window_fg_color, 0.65); }
@@ -109,6 +112,7 @@ struct Tab {
     filter: gtk::CustomFilter,
     selection: gtk::MultiSelection,
     folder_model: gtk::SortListModel,
+    columns: columns::Pane,
     search: search::Pane,
     view_stack: gtk::Stack,
     grid_view: gtk::GridView,
@@ -132,6 +136,20 @@ struct Tab {
 }
 
 impl Tab {
+    fn current_dir(&self) -> Option<gio::File> {
+        if self.view_stack.visible_child_name().as_deref() == Some("columns") {
+            return self.columns.file();
+        }
+        self.dir_list.file()
+    }
+
+    fn current_source(&self) -> gtk::DirectoryList {
+        if self.view_stack.visible_child_name().as_deref() == Some("columns") {
+            if let Some(source) = self.columns.source() { return source; }
+        }
+        self.dir_list.clone()
+    }
+
     fn begin_navigation(&self) -> u64 {
         let generation = self.navigation_generation.get().wrapping_add(1);
         self.navigation_generation.set(generation);
@@ -139,6 +157,8 @@ impl Tab {
     }
 
     fn shutdown(&self) {
+        self.begin_navigation();
+        self.columns.clear();
         self.directory.stop();
         self.terminal.shutdown();
         self.search.cancel();
@@ -168,7 +188,7 @@ struct App {
     /// A zoom is already waiting for the next frame, so more wheel ticks only
     /// update `zoom` and do not rebuild again.
     zoom_queued: Cell<bool>,
-    is_list: Cell<bool>,
+    view_mode: Cell<ViewMode>,
     show_hidden: Rc<Cell<bool>>,
     bookmarks: RefCell<Vec<PathBuf>>,
     preview: RefCell<Option<adw::Window>>,
@@ -281,10 +301,14 @@ fn build(app: &adw::Application) {
         .build();
     sidebar_toggle.add_css_class("flat");
     let new_tab_btn = crate::icon::flat_button("tab-new-symbolic", "New tab (Ctrl+T)");
-    let view_toggle = gtk::ToggleButton::builder()
-        .child(&crate::icon::image_named("view-list-symbolic", 16))
-        .tooltip_text("List view")
-        .build();
+    let view_toggle = gtk::MenuButton::builder()
+        .child(&crate::icon::image_named("view-grid-symbolic", 16))
+        .tooltip_text("View: Grid, List or Columns").build();
+    let view_menu = gio::Menu::new();
+    for (label, action) in [("Grid", "win.view-mode::grid"), ("List", "win.view-mode::list"), ("Columns", "win.view-mode::columns")] {
+        view_menu.append(Some(label), Some(action));
+    }
+    view_toggle.set_menu_model(Some(&view_menu));
     view_toggle.add_css_class("flat");
     let sort_btn = gtk::MenuButton::builder()
         .child(&crate::icon::image_named("view-sort-ascending-symbolic", 16))
@@ -385,7 +409,7 @@ fn build(app: &adw::Application) {
         tabs: RefCell::new(Vec::new()),
         zoom: Cell::new(cfg.zoom),
         zoom_queued: Cell::new(false),
-        is_list: Cell::new(cfg.is_list),
+        view_mode: Cell::new(cfg.view_mode),
         show_hidden: Rc::new(Cell::new(cfg.show_hidden)),
         bookmarks: RefCell::new(bookmarks::load()),
         preview: RefCell::new(None),
@@ -404,7 +428,7 @@ fn build(app: &adw::Application) {
     places::populate_sidebar(&state);
 
     // Reflect the loaded preferences in the widgets/actions that display them.
-    view_toggle.set_active(cfg.is_list);
+    commands::set_action_state(&state, "view-mode", &cfg.view_mode.name().to_variant());
     commands::set_action_state(&state, "toggle-hidden", &cfg.show_hidden.to_variant());
     commands::set_action_state(&state, "sort-descending", &cfg.sort_desc.to_variant());
     let sort_name = match cfg.sort_key {
@@ -472,30 +496,6 @@ fn build(app: &adw::Application) {
     {
         let s = state.clone();
         new_tab_btn.connect_clicked(move |_| { navigation::new_tab(&s, gio::File::for_path(glib::home_dir()), true); });
-    }
-    {
-        let s = state.clone();
-        view_toggle.connect_toggled(move |b| {
-            let list = b.is_active();
-            s.is_list.set(list);
-            if let Some(image) = b.child().and_downcast::<gtk::Image>() {
-                crate::icon::set_named(
-                    &image,
-                    if list { "view-grid-symbolic" } else { "view-list-symbolic" },
-                    16,
-                );
-            }
-            b.set_tooltip_text(Some(if list { "Grid view" } else { "List view" }));
-            for t in s.tabs.borrow().iter() {
-                match t.view_stack.visible_child_name().as_deref() {
-                    Some("computer") => places::show_computer(&s, t),
-                    Some("trash") => {
-                        if let Some(pane) = t.trash_view.borrow().as_ref() { pane.show_mode(&s); }
-                    }
-                    _ => navigation::refresh_view_mode(&s, t, false),
-                }
-            }
-        });
     }
     {
         let s = state.clone();
@@ -576,13 +576,14 @@ fn maybe_capture(app: &adw::Application, state: &Rc<App>) {
         let tab = navigation::active_tab(state);
         match view.as_str() {
             "list" => {
-                state.is_list.set(true);
+                state.view_mode.set(ViewMode::List);
                 tab.view_stack.set_visible_child_name("list");
             }
             "grid" => {
-                state.is_list.set(false);
+                state.view_mode.set(ViewMode::Grid);
                 tab.view_stack.set_visible_child_name("grid");
             }
+            "columns" => set_view_mode(state, ViewMode::Columns),
             "computer" => places::show_computer(state, &tab),
             "trash" => places::show_trash(state, &tab),
             _ => {}
@@ -643,6 +644,7 @@ fn zoom(app: &Rc<App>, delta: i32) {
 /// Resize only the view the tab is actually showing.
 fn apply_visible_zoom(app: &Rc<App>, tab: &Rc<Tab>) {
     let zoom = app.zoom.get();
+    if tab.view_stack.visible_child_name().as_deref() == Some("columns") { tab.columns.set_zoom(zoom); return; }
     let showing = tab.view_stack.visible_child_name();
     if showing.as_deref() == Some("trash") {
         if let Some(pane) = tab.trash_view.borrow().as_ref() { pane.set_zoom(zoom); }
@@ -766,6 +768,19 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     action!("zoom-out", |s: &Rc<App>| zoom(s, -ZOOM_STEP));
     action!("about", about);
 
+    let mode = gio::SimpleAction::new_stateful("view-mode", Some(glib::VariantTy::STRING), &state.view_mode.get().name().to_variant());
+    {
+        let state = state.clone();
+        mode.connect_activate(move |action, param| {
+            if let Some(mode) = param.and_then(|p| p.str()).and_then(ViewMode::parse) {
+                set_view_mode(&state, mode);
+                action.set_state(&mode.name().to_variant());
+                save_settings(&state);
+            }
+        });
+    }
+    state.window.add_action(&mode);
+
     let pane = gio::SimpleAction::new_stateful("preview-pane", None, &false.to_variant());
     {
         let state = state.clone();
@@ -816,6 +831,7 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
             s.show_hidden.set(now);
             for t in s.tabs.borrow().iter() {
                 t.filter.changed(gtk::FilterChange::Different);
+                t.columns.filter_changed();
             }
             update_chrome(&s);
         });
@@ -893,6 +909,8 @@ fn visible_selection(tab: &Tab) -> gtk::MultiSelection {
         && let Some(pane) = tab.trash_view.borrow().as_ref() {
         return pane.selection.clone();
     }
+    if tab.view_stack.visible_child_name().as_deref() == Some("columns")
+        && let Some(selection) = tab.columns.selection() { return selection; }
     tab.selection.clone()
 }
 
@@ -901,7 +919,7 @@ fn update_chrome(app: &Rc<App>) {
     commands::set_action_state(app, "preview-pane", &tab.preview_pane.widget.is_visible().to_variant());
     app.back_btn.set_sensitive(!tab.back.borrow().is_empty());
     app.fwd_btn.set_sensitive(!tab.fwd.borrow().is_empty());
-    app.up_btn.set_sensitive(tab.dir_list.file().and_then(|f| f.parent()).is_some());
+    app.up_btn.set_sensitive(tab.current_dir().and_then(|f| f.parent()).is_some());
 
     // The window (and, via it, the header) title follows the active tab's
     // location, so it always names the folder you're in — or the special view.
@@ -913,9 +931,7 @@ fn update_chrome(app: &Rc<App>) {
     };
     let win_title = if tab.search.active.get() { format!("Search: {}", tab.search.query.borrow()) } else { match special {
         Some(name) => name.to_string(),
-        None => tab
-            .dir_list
-            .file()
+        None => tab.current_dir()
             .map(|f| f.basename().map(|b| b.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into()))
             .unwrap_or_else(|| "filescope".into()),
     }};
@@ -936,7 +952,7 @@ fn update_chrome(app: &Rc<App>) {
 
 fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
     let trash = tab.view_stack.visible_child_name().as_deref() == Some("trash");
-    let count = tab.selection.selection().size();
+    let count = visible_selection(tab).selection().size();
     let has_sel = count > 0 && !trash;
     let one = count == 1 && !trash;
     let has_clip = clipboard_has_files(app);
@@ -1094,6 +1110,30 @@ fn apply_sort_to(app: &Rc<App>, tab: &Rc<Tab>) {
     tab.column_view.sort_by_column(Some(&col), dir);
 }
 
+fn set_view_mode(app: &Rc<App>, mode: ViewMode) {
+    commands::set_action_state(app, "view-mode", &mode.name().to_variant());
+    let old = app.view_mode.replace(mode);
+    if old == mode { return; }
+    let tabs: Vec<_> = app.tabs.borrow().iter().cloned().collect();
+    for tab in tabs {
+        match tab.view_stack.visible_child_name().as_deref() {
+            Some("computer") => places::show_computer(app, &tab),
+            Some("trash") => { if let Some(pane) = tab.trash_view.borrow().as_ref() { pane.show_mode(app); } }
+            Some("search") => {}
+            _ => {
+                let location = tab.current_dir();
+                let names: Vec<_> = commands::selected(&tab).iter().map(|(_, i)| i.name().to_string_lossy().into_owned()).collect();
+                if let Some(file) = location {
+                    navigation::set_dir(app, &tab, &file);
+                    visible_selection(&tab).unselect_all();
+                    navigation::select_names(&tab, &names, || {});
+                }
+            }
+        }
+    }
+    update_chrome(app);
+}
+
 fn toggle_terminal_pane(app: &Rc<App>) {
     let tab = navigation::active_tab(app);
     let cwd = navigation::here(&tab).as_ref().and_then(terminal_cwd);
@@ -1102,7 +1142,7 @@ fn toggle_terminal_pane(app: &Rc<App>) {
 
 fn save_settings(app: &App) {
     settings::save(&settings::Settings {
-        is_list: app.is_list.get(),
+        view_mode: app.view_mode.get(),
         preview_pane: app.preview_pane_default.get(),
         zoom: app.zoom.get(),
         sort_key: app.sort_key.get(),
@@ -1115,12 +1155,13 @@ fn save_settings(app: &App) {
 }
 
 fn update_preview(tab: &Tab) {
-    let selection = tab.selection.selection();
+    let model = visible_selection(tab);
+    let selection = model.selection();
     let target = if selection.size() == 1
         && !matches!(tab.view_stack.visible_child_name().as_deref(), Some("computer" | "trash"))
     {
-        tab.dir_list.file().and_then(|dir| {
-            let info = tab.selection.item(selection.minimum()).and_downcast::<gio::FileInfo>()?;
+        tab.current_dir().and_then(|dir| {
+            let info = model.item(selection.minimum()).and_downcast::<gio::FileInfo>()?;
             let directory = if tab.search.active.get() { None } else { Some(&dir) };
             Some((commands::file_from_info(&info, directory)?, info))
         })

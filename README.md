@@ -62,7 +62,13 @@ Built with **Rust + GTK4 + libadwaita**.
   and become available again in ordinary folder views.
   Enable filescope in GNOME Settings → Search if needed. Installing or removing
   filescope also installs or removes its search provider and D-Bus service.
-- **Grid & list views** with **zoom in/out** (Ctrl +/−) — large icons and real
+- **Grid, List & Columns views** — choose from the view menu. Columns shows
+  the current folder alongside up to two ancestors, then adds columns as you
+  browse deeper. Select a folder to show its children; Left/Right moves focus
+  between columns. Drag the dividers to resize, and scroll horizontally for
+  deeper paths. File actions use only the focused column. Selecting a file
+  opens the existing preview pane. View choice is remembered across launches.
+- **Zoom in/out** (Ctrl +/−) — large icons and real
   **image thumbnails** (decoded off the UI thread, so image folders never hang),
   or a sortable Name / Size / Modified list.
 - **Space to preview** — macOS Quick-Look style: press Space on a file for an
@@ -102,6 +108,7 @@ Built with **Rust + GTK4 + libadwaita**.
 | | |
 |---|---|
 | `Alt+←` / `Alt+→` / `Alt+↑` | Back / Forward / Up |
+| `←` / `→` in Columns | Focus previous / next column |
 | `Enter` / double-click | Open |
 | `Space` | Preview (Quick Look) |
 | `Ctrl+Shift+P` | Toggle preview pane |
@@ -192,7 +199,7 @@ XDG_CACHE_HOME="$thumbnail_test_cache" GIO_USE_VFS=local cargo test installed_th
 
 Set `FILESCOPE_SHOT` to render the window to a PNG in-process and exit — handy on
 systems where the compositor blocks normal screenshots. `FILESCOPE_SHOT_VIEW`
-(`grid` | `list` | `computer`) picks the view, and `FILESCOPE_DEMO=1` swaps in
+(`grid` | `list` | `columns` | `computer`) picks the view, and `FILESCOPE_DEMO=1` swaps in
 synthetic drives so nothing real is captured:
 
 ```sh
