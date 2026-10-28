@@ -1,0 +1,4 @@
+UPDATE_BINARY=filescope
+UPDATE_RECEIPT=.filescope-install
+UPDATE_BACKUP=.filescope-previous
+UPDATE_LOCK=.filescope-update.lock

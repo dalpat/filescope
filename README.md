@@ -73,6 +73,10 @@ Built with **Rust + GTK4 + libadwaita**.
   or a sortable Name / Size / Modified list.
 - **Space to preview** — macOS Quick-Look style: press Space on a file for an
   instant image / text / info preview; Space or Escape dismisses it.
+- **Update checks** — check for stable releases automatically or from the menu,
+  review release notes, and approve installation. Verified updates replace only
+  registered per-user installations; restart waits for file operations and shells.
+  See [update packaging and limitations](packaging/UPDATES.md).
 - **Resizable preview pane** (`Ctrl+Shift+P`) — drag its divider to give text,
   images and file details more room. Text stays unwrapped unless you turn on
   **Wrap**; long unwrapped lines scroll horizontally. Images fit the width and

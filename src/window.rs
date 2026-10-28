@@ -22,6 +22,7 @@ mod search;
 mod terminal;
 mod trash_view;
 mod view;
+mod updates;
 #[cfg(test)]
 mod preview_tests;
 #[cfg(test)]
@@ -212,6 +213,33 @@ struct App {
     /// New actions invalidate Redo even when a history worker is still running.
     history_generation: Cell<u64>,
     pending_renames: RefCell<Vec<std::rc::Weak<navigation::RenameScope>>>,
+    updates: updates::State,
+}
+
+thread_local! {
+    static BACKGROUND_WORK: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Main-thread guard: jobs outlive windows and must finish before restart or exit.
+struct BackgroundWork {
+    _hold: Option<gio::ApplicationHoldGuard>,
+}
+
+impl BackgroundWork {
+    fn new(app: &App) -> Self {
+        BACKGROUND_WORK.with(|count| count.set(count.get() + 1));
+        Self { _hold: app.window.application().map(|application| application.hold()) }
+    }
+
+    fn active() -> bool {
+        BACKGROUND_WORK.with(|count| count.get() != 0)
+    }
+}
+
+impl Drop for BackgroundWork {
+    fn drop(&mut self) {
+        BACKGROUND_WORK.with(|count| count.set(count.get() - 1));
+    }
 }
 
 const STATE_KEY: &str = "filescope-state";
@@ -428,9 +456,11 @@ fn build(app: &adw::Application) {
         history_busy: Cell::new(false),
         history_generation: Cell::new(0),
         pending_renames: RefCell::new(Vec::new()),
+        updates: updates::State::new(cfg.automatic_updates),
     });
 
     install_actions(app, &state);
+    updates::setup(&state);
     places::populate_sidebar(&state);
 
     // Reflect the loaded preferences in the widgets/actions that display them.
@@ -1152,6 +1182,7 @@ fn save_settings(app: &App) {
     settings::save(&settings::Settings {
         view_mode: app.view_mode.get(),
         preview_pane: app.preview_pane_default.get(),
+        automatic_updates: app.updates.automatic.get(),
         zoom: app.zoom.get(),
         sort_key: app.sort_key.get(),
         sort_desc: app.sort_desc.get(),
@@ -1200,6 +1231,9 @@ fn primary_menu() -> gio::Menu {
     defaults.append(Some("Default File Manager"), Some("win.default-file-manager"));
     menu.append_section(None, &defaults);
     let c = gio::Menu::new();
+    c.append(Some("Check for Updates…"), Some("win.check-updates"));
+    c.append(Some("Automatic Update Checks"), Some("win.automatic-updates"));
+    c.append(Some("Restart to Apply Update…"), Some("win.restart-update"));
     c.append(Some("About filescope"), Some("win.about"));
     menu.append_section(None, &c);
     menu

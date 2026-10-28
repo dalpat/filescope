@@ -36,6 +36,9 @@ def check_installers():
         run(script)
         assert not legacy.exists()
         assert binary.exists() and launcher.exists() and service.exists()
+        import hashlib
+        receipt = binary.with_name(".filescope-install")
+        assert hashlib.sha256(binary.read_bytes()).hexdigest() in receipt.read_text().splitlines()
         assert provider.stat().st_mode & 0o777 == 0o644
         assert any((Path(d) / "gnome-shell/search-providers" / provider.name).exists()
                    for d in GLib.get_system_data_dirs()), "GNOME cannot discover registration"
@@ -62,11 +65,14 @@ if __name__ == "__main__":
         repo = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(prefix="filescope-install-") as directory:
             work = Path(directory)
-            for name in ["home", "share", "data", "bin", "source/data/icons", "source/target/release", "bundle"]:
+            for name in ["home", "share", "data", "bin", "source/data/icons", "source/target/release", "source/packaging", "bundle"]:
                 (work / name).mkdir(parents=True)
             shutil.copy(__file__, work / "check.py")
             shutil.copy(repo / "install.sh", work / "source/install.sh")
             shutil.copy(repo / "packaging/install-release.sh", work / "bundle/install.sh")
+            for extra in ["update-layout", "install-binary.sh"]:
+                for dest in ["source/packaging", "bundle"]:
+                    shutil.copy(repo / "packaging" / extra, work / dest)
             app_id = "dev.filescope.Filescope"
             for dest in ["source/data", "bundle"]:
                 shutil.copy(repo / f"data/{app_id}.desktop", work / dest)

@@ -448,7 +448,7 @@ pub(super) fn protect_batch_directory(app: &Rc<super::App>, contents: &Rc<super:
     for scope in scopes { scope.protect(contents, false, new_choice); }
 }
 
-pub(super) struct BatchRename { scope: Rc<RenameScope> }
+pub(super) struct BatchRename { scope: Rc<RenameScope>, _work: super::BackgroundWork }
 impl BatchRename {
     pub fn new(app: &Rc<super::App>, requests: &[crate::batch_rename::Rename]) -> Self {
         let scope = Rc::new(RenameScope {
@@ -472,7 +472,7 @@ impl BatchRename {
             }
         }
         super::update_chrome(app);
-        Self { scope }
+        Self { scope, _work: super::BackgroundWork::new(app) }
     }
 
     fn aliases_for(file: &gio::File, canonical: &gio::File, pairs: &[(gio::File, gio::File)], aliases: &mut HashMap<(usize, glib::GString), (gio::File, gio::File, bool)>) {

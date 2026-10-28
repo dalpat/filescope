@@ -34,6 +34,7 @@ impl ViewMode {
 pub struct Settings {
     pub view_mode: ViewMode,
     pub preview_pane: bool,
+    pub automatic_updates: bool,
     pub zoom: i32,
     /// 0 = name, 1 = size, 2 = modified.
     pub sort_key: u8,
@@ -49,6 +50,7 @@ impl Default for Settings {
         Settings {
             view_mode: ViewMode::Grid,
             preview_pane: false,
+            automatic_updates: true,
             zoom: 80,
             sort_key: 0,
             sort_desc: false,
@@ -93,6 +95,7 @@ impl Settings {
                         explicit_view = Some(mode);
                     }
                 }
+                "automatic_updates" => set(&mut settings.automatic_updates, value.parse().ok()),
                 "preview_pane" => set(&mut settings.preview_pane, value.parse().ok()),
                 "zoom" => set(
                     &mut settings.zoom,
@@ -122,6 +125,7 @@ impl Settings {
         [
             format!("view_mode={}", self.view_mode.name()),
             format!("preview_pane={}", self.preview_pane),
+            format!("automatic_updates={}", self.automatic_updates),
             format!("zoom={}", self.zoom),
             format!("sort_key={}", self.sort_key),
             format!("sort_desc={}", self.sort_desc),
@@ -201,6 +205,7 @@ mod tests {
         let settings = Settings {
             view_mode: ViewMode::List,
             preview_pane: true,
+            automatic_updates: false,
             zoom: 128,
             sort_key: 2,
             sort_desc: true,

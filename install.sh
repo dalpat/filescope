@@ -13,6 +13,9 @@ APP_ID="dev.filescope.Filescope"
 BIN_NAME="filescope"
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$SCRIPT_DIR/packaging/update-layout"
+. "$SCRIPT_DIR/packaging/install-binary.sh"
+
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 BIN_DIR="$HOME/.local/bin"
 APP_DIR="$DATA_HOME/applications"
@@ -22,7 +25,7 @@ SERVICE_DIR="$DATA_HOME/dbus-1/services"
 
 DESKTOP_DEST="$APP_DIR/$APP_ID.desktop"
 ICON_DEST="$ICON_DIR/$APP_ID.svg"
-BIN_DEST="$BIN_DIR/$BIN_NAME"
+BIN_DEST="$BIN_DIR/$UPDATE_BINARY"
 SEARCH_DEST="$SEARCH_DIR/$APP_ID.search-provider.ini"
 SERVICE_DEST="$SERVICE_DIR/$APP_ID.service"
 LEGACY_SEARCH_DEST="$DATA_HOME/gnome-shell/search-providers/$APP_ID.search-provider.ini"
@@ -48,10 +51,15 @@ refresh_caches() {
 }
 
 if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "-u" ]; then
+    if [ -d "$BIN_DIR" ]; then
+        exec 9>> "$BIN_DIR/$UPDATE_LOCK"
+        flock -x 9
+    fi
     if [ -e "$SEARCH_DEST" ]; then
         as_admin rm -f "$SEARCH_DEST"
     fi
     rm -f "$DESKTOP_DEST" "$ICON_DEST" "$BIN_DEST" "$LEGACY_SEARCH_DEST" "$SERVICE_DEST"
+    rm -f "$BIN_DIR/$UPDATE_RECEIPT" "$BIN_DIR/$UPDATE_BACKUP"
     refresh_caches
     echo "Removed filescope desktop entry, icon, and binary."
     exit 0
@@ -64,7 +72,7 @@ BIN_SRC="$SCRIPT_DIR/target/release/$BIN_NAME"
 
 mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR" "$SERVICE_DIR"
 
-install -m 0755 "$BIN_SRC" "$BIN_DEST"
+install_user_binary "$BIN_SRC"
 install -m 0644 "$SCRIPT_DIR/data/icons/$APP_ID.svg" "$ICON_DEST"
 
 # Point the launcher at the absolute binary path so it works regardless of

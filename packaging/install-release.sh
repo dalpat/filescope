@@ -5,7 +5,7 @@
 # copies it into the tarball as install.sh, which is the command below.
 #
 # No build tools and no -dev packages are required — only the GTK4/libadwaita
-# *runtime* plus VTE's GTK4 runtime (GTK 4.16+ / libadwaita 1.5+ / VTE 0.65+).
+# *runtime* plus VTE's GTK4 runtime (GTK 4.16+ / libadwaita 1.5+ / VTE 0.70+).
 # The prebuilt x86_64 Linux binary also requires glibc 2.39+.
 #
 #   ./install.sh              install for the current user (under ~/.local)
@@ -18,6 +18,9 @@ set -eu
 APP_ID="dev.filescope.Filescope"
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
+. "$DIR/update-layout"
+. "$DIR/install-binary.sh"
+
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 BIN_DIR="$HOME/.local/bin"
 APP_DIR="$DATA_HOME/applications"
@@ -27,7 +30,7 @@ SERVICE_DIR="$DATA_HOME/dbus-1/services"
 
 DESKTOP_DEST="$APP_DIR/$APP_ID.desktop"
 ICON_DEST="$ICON_DIR/$APP_ID.svg"
-BIN_DEST="$BIN_DIR/filescope"
+BIN_DEST="$BIN_DIR/$UPDATE_BINARY"
 SEARCH_DEST="$SEARCH_DIR/$APP_ID.search-provider.ini"
 SERVICE_DEST="$SERVICE_DIR/$APP_ID.service"
 LEGACY_SEARCH_DEST="$DATA_HOME/gnome-shell/search-providers/$APP_ID.search-provider.ini"
@@ -53,10 +56,15 @@ refresh_caches() {
 }
 
 if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "-u" ]; then
+    if [ -d "$BIN_DIR" ]; then
+        exec 9>> "$BIN_DIR/$UPDATE_LOCK"
+        flock -x 9
+    fi
     if [ -e "$SEARCH_DEST" ]; then
         as_admin rm -f "$SEARCH_DEST"
     fi
     rm -f "$DESKTOP_DEST" "$ICON_DEST" "$BIN_DEST" "$LEGACY_SEARCH_DEST" "$SERVICE_DEST"
+    rm -f "$BIN_DIR/$UPDATE_RECEIPT" "$BIN_DIR/$UPDATE_BACKUP"
     refresh_caches
     echo "Removed filescope."
     exit 0
@@ -65,7 +73,7 @@ fi
 [ -x "$DIR/filescope" ] || { echo "error: filescope binary not found next to this script" >&2; exit 1; }
 
 mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR" "$SERVICE_DIR"
-install -m 0755 "$DIR/filescope" "$BIN_DEST"
+install_user_binary "$DIR/filescope"
 install -m 0644 "$DIR/$APP_ID.svg" "$ICON_DEST"
 # Point the launcher at the absolute binary path so it works regardless of PATH.
 sed "s|^Exec=filescope |Exec=$BIN_DEST |" "$DIR/$APP_ID.desktop" > "$DESKTOP_DEST"

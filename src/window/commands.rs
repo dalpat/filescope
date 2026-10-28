@@ -355,6 +355,7 @@ pub(super) fn run_tool(
         });
     }
 
+    let work = super::BackgroundWork::new(app);
     let refs: Vec<&std::ffi::OsStr> = argv.iter().map(|s| s.as_os_str()).collect();
     let launcher = gio::SubprocessLauncher::new(gio::SubprocessFlags::NONE);
     launcher.set_cwd(cwd);
@@ -374,6 +375,7 @@ pub(super) fn run_tool(
 
     let app = app.clone();
     process.wait_check_async(gio::Cancellable::NONE, move |res| {
+        let _work = work;
         running.set(false);
         app.progress_box.remove(&row);
         if app.progress_box.first_child().is_none() {
@@ -680,6 +682,7 @@ pub(super) fn start_job(app: &Rc<super::App>, kind: ops::Kind, sources: Vec<Path
     app.progress_box.append(&row);
     app.progress_revealer.set_reveal_child(true);
 
+    let work = super::BackgroundWork::new(app);
     // Worker thread.
     {
         let cancel = cancel.clone();
@@ -689,6 +692,7 @@ pub(super) fn start_job(app: &Rc<super::App>, kind: ops::Kind, sources: Vec<Path
     // Pump events on the main loop.
     let app = app.clone();
     glib::spawn_future_local(async move {
+        let _work = work;
         let (mut total_bytes, mut total_items) = (0u64, 0u64);
         while let Ok(event) = ev_rx.recv().await {
             match event {
@@ -713,6 +717,11 @@ pub(super) fn start_job(app: &Rc<super::App>, kind: ops::Kind, sources: Vec<Path
                     title.set_label(&format!("{verb} {current} — {items_done}/{total_items}{sizes}"));
                 }
                 ops::Event::Conflict { name } => {
+                    // A closed owner cannot answer; hiding/minimizing keeps its application.
+                    if app.window.application().is_none() {
+                        let _ = dec_tx.send(ops::Decision::Cancel);
+                        continue;
+                    }
                     let dialog = adw::AlertDialog::new(
                         Some(&format!("“{name}” already exists")),
                         Some("An item with the same name is already in the destination."),

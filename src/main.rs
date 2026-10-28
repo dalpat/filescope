@@ -19,6 +19,7 @@ mod search_provider;
 mod thumbnails;
 mod trash;
 mod undo;
+mod update;
 mod window;
 
 use adw::prelude::*;
@@ -26,6 +27,9 @@ use adw::prelude::*;
 const APP_ID: &str = "dev.filescope.Filescope";
 
 fn main() -> gtk::glib::ExitCode {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--update-probe")) {
+        return if update::print_probe() { gtk::glib::ExitCode::SUCCESS } else { gtk::glib::ExitCode::FAILURE };
+    }
     // Single instance: a second launch is delivered here as `open` (with the
     // folder) or `activate` (with nothing). Screenshot mode must stay its own
     // process, or it would raise the running window and capture nothing.

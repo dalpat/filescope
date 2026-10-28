@@ -137,6 +137,10 @@ impl Pane {
         pane
     }
 
+    pub(super) fn has_live_session(&self) -> bool {
+        self.shell.borrow().is_some() && self.session.borrow().as_ref().is_some_and(|session| !session.exited.get())
+    }
+
     pub(super) fn widget(&self) -> gtk::Paned {
         self.split.clone()
     }
