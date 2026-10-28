@@ -12,6 +12,7 @@ use gtk::{gio, glib};
 
 const TEXT_LIMIT: usize = 64 * 1024;
 const WIDTH: i32 = 300;
+const MIN_WIDTH: i32 = 180;
 
 fn property_rows(file: &gio::File, info: &gio::FileInfo) -> Vec<(&'static str, String)> {
     let is_dir = info.file_type() == gio::FileType::Directory;
@@ -170,9 +171,110 @@ enum Loaded {
     Card,
 }
 
+// The shared decoder takes a longest edge; convert pane width for portrait images too.
+async fn image_at_width(
+    path: std::path::PathBuf,
+    width: i32,
+    cancel: Arc<AtomicBool>,
+) -> Option<crate::icon::Pixels> {
+    let header_path = path.clone();
+    let (_, source_width, source_height) =
+        gio::spawn_blocking(move || gtk::gdk_pixbuf::Pixbuf::file_info(header_path))
+            .await
+            .ok()??;
+    if cancel.load(Ordering::Relaxed) || source_width <= 0 {
+        return None;
+    }
+    let edge = (i64::from(source_width.max(source_height)) * i64::from(width.min(source_width))
+        / i64::from(source_width))
+    .clamp(1, i64::from(i32::MAX)) as i32;
+    crate::icon::decode_limited(path, edge, Some(cancel)).await
+}
+
+// GTK Box delegates allocation to its layout manager. This thin container reports
+// actual width changes without polling a frame clock or decoding on every drag.
+mod allocation {
+    use super::*;
+    use gtk::subclass::prelude::*;
+
+    #[derive(Default)]
+    pub struct PreviewBox {
+        pub content: RefCell<Option<gtk::Box>>,
+        pub resized: RefCell<Option<Box<dyn Fn()>>>,
+        width: Cell<i32>,
+    }
+    #[glib::object_subclass]
+    impl ObjectSubclass for PreviewBox {
+        const NAME: &'static str = "FilescopePreviewBox";
+        type Type = super::PreviewBox;
+        type ParentType = gtk::Widget;
+    }
+    impl ObjectImpl for PreviewBox {
+        fn constructed(&self) {
+            self.parent_constructed();
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            content.set_parent(&*self.obj());
+            *self.content.borrow_mut() = Some(content);
+        }
+        fn dispose(&self) {
+            if let Some(content) = self.content.borrow_mut().take() {
+                content.unparent();
+            }
+        }
+    }
+    impl WidgetImpl for PreviewBox {
+        fn request_mode(&self) -> gtk::SizeRequestMode {
+            self.content.borrow().as_ref().unwrap().request_mode()
+        }
+        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            self.content
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .measure(orientation, for_size)
+        }
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            self.content
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .allocate(width, height, baseline, None);
+            if self.width.replace(width) != width {
+                if let Some(resized) = self.resized.borrow().as_ref() {
+                    resized();
+                }
+            }
+        }
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            self.obj()
+                .snapshot_child(self.content.borrow().as_ref().unwrap(), snapshot);
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct PreviewBox(ObjectSubclass<allocation::PreviewBox>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl PreviewBox {
+    fn append(&self, child: &impl IsA<gtk::Widget>) {
+        use gtk::subclass::prelude::ObjectSubclassIsExt;
+        self.imp().content.borrow().as_ref().unwrap().append(child);
+    }
+}
+
 /// One load at a time per tab. Changes replace the pending target, not a queue.
 pub(crate) struct Pane {
-    pub(crate) widget: gtk::Box,
+    pub(crate) widget: PreviewBox,
+    pub(crate) split: gtk::Paned,
+    wrap: gtk::ToggleButton,
+    saved_width: Cell<i32>,
+    restore_width: Cell<bool>,
+    layout_queued: Cell<bool>,
+    image_pixels: Cell<i32>,
+    resize_timer: RefCell<Option<glib::SourceId>>,
     title: gtk::Label,
     body: gtk::ScrolledWindow,
     target: RefCell<Option<(gio::File, gio::FileInfo)>>,
@@ -197,23 +299,47 @@ impl Pane {
         header.set_margin_top(6);
         header.set_margin_bottom(6);
         header.append(&title);
+        let wrap = gtk::ToggleButton::builder()
+            .label("Wrap")
+            .tooltip_text("Wrap text to the preview width")
+            .visible(false)
+            .build();
+        wrap.add_css_class("flat");
+        header.append(&wrap);
         header.append(&close);
         let body = gtk::ScrolledWindow::builder()
             .vexpand(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build();
-        let widget = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .width_request(WIDTH)
-            .hexpand(false)
-            .visible(visible)
+        let widget: PreviewBox = glib::Object::builder()
+            .property("width-request", MIN_WIDTH)
+            .property("hexpand", false)
+            .property("visible", visible)
             .build();
         widget.add_css_class("fs-preview-pane");
         widget.append(&header);
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         widget.append(&body);
+        let split = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .resize_start_child(true)
+            .resize_end_child(false)
+            .shrink_start_child(false)
+            .shrink_end_child(false)
+            .wide_handle(true)
+            .hexpand(true)
+            .vexpand(true)
+            .end_child(&widget)
+            .build();
         let pane = Rc::new(Self {
             widget,
+            split: split.clone(),
+            wrap: wrap.clone(),
+            saved_width: Cell::new(WIDTH),
+            restore_width: Cell::new(true),
+            layout_queued: Cell::new(false),
+            image_pixels: Cell::new(0),
+            resize_timer: RefCell::new(None),
             title,
             body,
             target: RefCell::new(None),
@@ -228,6 +354,8 @@ impl Pane {
         let weak = Rc::downgrade(&pane);
         pane.widget.connect_map(move |_| {
             if let Some(pane) = weak.upgrade() {
+                pane.restore_width.set(true);
+                pane.queue_layout();
                 pane.refresh();
             }
         });
@@ -237,12 +365,139 @@ impl Pane {
                 pane.refresh();
             }
         });
+        let weak = Rc::downgrade(&pane);
+        use gtk::subclass::prelude::ObjectSubclassIsExt;
+        *pane.widget.imp().resized.borrow_mut() = Some(Box::new(move || {
+            if let Some(pane) = weak.upgrade() {
+                pane.queue_layout();
+            }
+        }));
+        let weak = Rc::downgrade(&pane);
+        pane.widget.connect_scale_factor_notify(move |_| {
+            if let Some(pane) = weak.upgrade() {
+                pane.queue_layout();
+            }
+        });
+        let weak = Rc::downgrade(&pane);
+        wrap.connect_toggled(move |_| {
+            if let Some(pane) = weak.upgrade() {
+                pane.apply_wrap();
+            }
+        });
         pane.message("Select one item to preview");
         pane
     }
 
     pub(crate) fn set_visible(self: &Rc<Self>, visible: bool) {
+        if self.widget.is_visible() == visible {
+            return;
+        }
+        if !visible && self.widget.is_mapped() {
+            self.saved_width.set(self.widget.width());
+        }
+        if visible {
+            self.restore_width.set(true);
+        }
         self.widget.set_visible(visible);
+    }
+
+    fn queue_layout(self: &Rc<Self>) {
+        if self.layout_queued.replace(true) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(pane) = weak.upgrade() else {
+                return;
+            };
+            pane.layout_queued.set(false);
+            if !pane.widget.is_mapped() || pane.split.width() <= 0 || pane.widget.width() <= 0 {
+                return;
+            }
+            if pane.restore_width.replace(false) {
+                let start = pane
+                    .split
+                    .start_child()
+                    .map(|child| child.width())
+                    .unwrap_or(0);
+                let handle = (pane.split.width() - start - pane.widget.width()).max(0);
+                pane.split
+                    .set_position((pane.split.width() - pane.saved_width.get() - handle).max(160));
+                return;
+            }
+            if pane.widget.width() > 0 {
+                pane.saved_width.set(pane.widget.width());
+                pane.resize_image();
+            }
+        });
+    }
+
+    fn image_width(&self) -> i32 {
+        (self.widget.width().max(MIN_WIDTH) - 24) * self.widget.scale_factor().max(1)
+    }
+
+    fn resize_image(self: &Rc<Self>) {
+        if preview_kind(1, self.target.borrow().as_ref().map(|(_, info)| info))
+            != PreviewKind::Image
+            || !self.widget.is_mapped()
+        {
+            return;
+        }
+        if let Some(picture) = self
+            .body
+            .child()
+            .and_downcast::<gtk::Box>()
+            .and_then(|content| content.first_child())
+            .and_downcast::<gtk::Picture>()
+        {
+            self.fit_picture(&picture);
+        }
+        let pixels = self.image_width();
+        if self.image_pixels.replace(pixels) == pixels {
+            return;
+        }
+        if let Some(cancel) = self.cancel.borrow_mut().take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.state.borrow_mut().begin(true, PreviewKind::Image);
+        if let Some(timer) = self.resize_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        let weak = Rc::downgrade(self);
+        *self.resize_timer.borrow_mut() = Some(glib::timeout_add_local_once(
+            std::time::Duration::from_millis(120),
+            move || {
+                if let Some(pane) = weak.upgrade() {
+                    pane.resize_timer.borrow_mut().take();
+                    pane.start_pending();
+                }
+            },
+        ));
+    }
+
+    fn fit_picture(&self, picture: &gtk::Picture) {
+        if let Some(paintable) = picture.paintable().filter(|p| p.intrinsic_width() > 0) {
+            let width = (self.widget.width() - 24).max(1);
+            let height = (i64::from(width) * i64::from(paintable.intrinsic_height())
+                / i64::from(paintable.intrinsic_width()))
+            .clamp(1, i64::from(i32::MAX)) as i32;
+            picture.set_height_request(height);
+        }
+    }
+
+    fn apply_wrap(&self) {
+        if let Some(view) = self.body.child().and_downcast::<gtk::TextView>() {
+            view.set_wrap_mode(if self.wrap.is_active() {
+                gtk::WrapMode::WordChar
+            } else {
+                gtk::WrapMode::None
+            });
+            self.body.set_hscrollbar_policy(if self.wrap.is_active() {
+                gtk::PolicyType::Never
+            } else {
+                gtk::PolicyType::Automatic
+            });
+        }
     }
 
     pub(crate) fn set_target(self: &Rc<Self>, target: Option<(gio::File, gio::FileInfo)>) {
@@ -262,6 +517,10 @@ impl Pane {
     }
 
     fn refresh(self: &Rc<Self>) {
+        if let Some(timer) = self.resize_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        self.image_pixels.set(self.image_width());
         if let Some(cancel) = self.cancel.borrow_mut().take() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -277,7 +536,10 @@ impl Pane {
     }
 
     fn start_pending(self: &Rc<Self>) {
-        if self.running.get() || self.state.borrow().phase != Phase::Loading {
+        if self.running.get()
+            || self.resize_timer.borrow().is_some()
+            || self.state.borrow().phase != Phase::Loading
+        {
             return;
         }
         let Some((file, info)) = self.target.borrow().clone() else {
@@ -285,8 +547,7 @@ impl Pane {
         };
         let generation = self.state.borrow().generation;
         let kind = preview_kind(1, Some(&info));
-        let width = self.widget.width().max(WIDTH) - 24;
-        let pixels = width * self.widget.scale_factor().max(1);
+        let pixels = self.image_pixels.get();
         let cancel = Arc::new(AtomicBool::new(false));
         *self.cancel.borrow_mut() = Some(cancel.clone());
         self.running.set(true);
@@ -294,7 +555,7 @@ impl Pane {
         glib::spawn_future_local(async move {
             let loaded = if let Some(path) = file.path() {
                 if kind == PreviewKind::Image {
-                    crate::icon::decode_limited(path, pixels, Some(cancel.clone()))
+                    image_at_width(path, pixels, cancel.clone())
                         .await
                         .map(Loaded::Image)
                 } else {
@@ -350,6 +611,7 @@ impl Pane {
     }
 
     fn message(&self, text: &str) {
+        self.wrap.set_visible(false);
         self.title.set_text("Preview");
         self.title.set_tooltip_text(None);
         self.body.set_hscrollbar_policy(gtk::PolicyType::Never);
@@ -363,6 +625,9 @@ impl Pane {
     }
 
     fn show(&self, file: &gio::File, info: &gio::FileInfo, loaded: Option<Loaded>) {
+        self.wrap
+            .set_visible(matches!(loaded, Some(Loaded::Text(_))));
+        self.body.set_hscrollbar_policy(gtk::PolicyType::Never);
         self.title.set_text(&info.display_name());
         self.title.set_tooltip_text(Some(&info.display_name()));
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -378,9 +643,9 @@ impl Pane {
             Some(Loaded::Image(pixels)) => {
                 let texture = pixels.texture();
                 let picture = gtk::Picture::for_paintable(&texture);
-                picture.set_height_request(texture.height() / self.widget.scale_factor().max(1));
                 picture.set_can_shrink(true);
                 picture.set_content_fit(gtk::ContentFit::Contain);
+                self.fit_picture(&picture);
                 content.append(&picture);
             }
             Some(Loaded::Text(text)) => {
@@ -397,6 +662,7 @@ impl Pane {
                 // Direct scrolling keeps long lines from sizing the whole pane.
                 self.body.set_hscrollbar_policy(gtk::PolicyType::Automatic);
                 self.body.set_child(Some(&view));
+                self.apply_wrap();
                 return;
             }
             details => {

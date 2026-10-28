@@ -1,6 +1,7 @@
 // Tabs and folder navigation: history, breadcrumbs, and refreshing a listing.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -80,10 +81,10 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     content.append(&search_bar);
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     let preview_pane = crate::preview::pane::Pane::new(app.preview_pane_default.get());
-    let browser = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let browser = preview_pane.split.clone();
     view_stack.set_hexpand(true);
-    browser.append(&view_stack);
-    browser.append(&preview_pane.widget);
+    view_stack.set_size_request(160, -1);
+    browser.set_start_child(Some(&view_stack));
     let terminal_pane = super::terminal::Pane::new();
     terminal_pane.widget().set_start_child(Some(&browser));
     content.append(&terminal_pane.widget());
@@ -186,6 +187,8 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     // Drop still targets the whole view: a folder, or the empty space around it.
     grid_view.set_factory(Some(&super::view::grid_factory(Some(&tab), &grid_view, &tab.grid_zoom)));
     super::view::fill_columns(Some(&tab), &column_view, &tab.list_zoom);
+    super::view::watch_metadata(&tab.directory.items, &grid_view);
+    super::view::watch_metadata(&tab.directory.items, &column_view);
     if let Some(sorter) = column_view.sorter() {
         sort_model.set_sorter(Some(&super::view::with_hidden_last(&sorter)));
     }
@@ -315,6 +318,7 @@ pub(super) fn set_dir(app: &Rc<super::App>, tab: &Rc<super::Tab>, file: &gio::Fi
     // A new folder starts unfiltered — close any open search from the last one.
     tab.search_bar.set_search_mode(false);
     tab.dir_list.set_file(Some(file));
+    protect_batch_directory(app, &tab.directory, true);
     if app.view_mode.get() == super::ViewMode::Columns {
         tab.columns.set_location(app, tab, file);
     } else {
@@ -385,15 +389,317 @@ pub(super) fn set_path_visible(tab: &super::Tab, on: bool) {
 pub(super) fn refresh(tab: &Rc<super::Tab>) {
     if tab.search.active.get() { super::search::refresh(tab); return; }
     if tab.view_stack.visible_child_name().as_deref() == Some("columns") { tab.columns.refresh(); return; }
-    if let Some(file) = tab.dir_list.file() {
-        tab.dir_list.set_file(gio::File::NONE);
-        tab.dir_list.set_file(Some(&file));
+    tab.directory.refresh();
+}
+
+pub(super) fn renamed_location(file: &gio::File, from: &gio::File, to: &gio::File) -> Option<gio::File> {
+    if file.equal(from) { Some(to.clone()) }
+    else { from.relative_path(file).map(|relative| to.resolve_relative_path(relative)) }
+}
+
+pub(super) fn mapped_location(file: &gio::File, pairs: &[(gio::File, gio::File)]) -> Option<gio::File> {
+    pairs.iter().find_map(|(from, to)| renamed_location(file, from, to))
+}
+
+pub(super) fn batch_busy(tab: &super::Tab) -> bool {
+    if tab.view_stack.visible_child_name().as_deref() == Some("columns") { tab.columns.held() }
+    else { tab.directory.held() }
+}
+
+/// Pending scopes also protect views opened while their worker is running.
+pub(super) struct RenameScope {
+    holds: RefCell<Vec<super::directory::RenameHold>>,
+    aliases: RefCell<HashMap<(usize, glib::GString), (gio::File, gio::File, bool)>>,
+    requests: Vec<(gio::File, gio::File)>,
+    identities: Vec<super::directory::EntryIdentity>,
+    finishing: Cell<bool>,
+}
+impl RenameScope {
+    fn protect(&self, contents: &Rc<super::directory::Contents>, search: bool, new_choice: bool) {
+        if self.finishing.get() { return; }
+        let Some(file) = contents.file() else { return; };
+        let canonical = file.path().and_then(|p| p.canonicalize().ok()).map(gio::File::for_path).unwrap_or_else(|| file.clone());
+        BatchRename::aliases_for(&file, &canonical, &self.requests, &mut self.aliases.borrow_mut());
+        let related = |location: &gio::File| self.requests.iter().any(|(from, to)| {
+            from.parent().is_some_and(|p| p.equal(location)) || to.parent().is_some_and(|p| p.equal(location))
+                || location.equal(from) || location.has_prefix(from) || (search && from.has_prefix(location))
+        });
+        let affected = related(&file) || related(&canonical) || self.aliases.borrow().values().any(|(from, _, _)| {
+            file.equal(from) || file.has_prefix(from) || from.parent().is_some_and(|p| p.equal(&file))
+        });
+        if !affected { return; }
+        let mut holds = self.holds.borrow_mut();
+        if holds.iter().any(|hold| hold.applies_to(contents) && (!new_choice || hold.same_directory(&file))) { return; }
+        // A same-path navigation may now refer to a replacement directory.
+        holds.retain(|hold| !hold.applies_to(contents));
+        let mut entries: Vec<_> = self.requests.iter().map(|(from, _)| from.clone()).collect();
+        entries.extend(self.aliases.borrow().values().filter(|(_, _, row)| *row).map(|(from, _, _)| from.clone()));
+        entries.retain(|entry| entry.parent().is_some_and(|parent| parent.equal(&file)));
+        holds.push(contents.hold_renames(&entries));
     }
+}
+
+pub(super) fn protect_batch_directory(app: &Rc<super::App>, contents: &Rc<super::directory::Contents>, new_choice: bool) {
+    let scopes: Vec<_> = {
+        let mut pending = app.pending_renames.borrow_mut();
+        pending.retain(|scope| scope.strong_count() > 0);
+        pending.iter().filter_map(std::rc::Weak::upgrade).collect()
+    };
+    for scope in scopes { scope.protect(contents, false, new_choice); }
+}
+
+pub(super) struct BatchRename { scope: Rc<RenameScope> }
+impl BatchRename {
+    pub fn new(app: &Rc<super::App>, requests: &[crate::batch_rename::Rename]) -> Self {
+        let scope = Rc::new(RenameScope {
+            requests: requests.iter().map(|r| (gio::File::for_path(&r.from), gio::File::for_path(&r.to))).collect(),
+            identities: requests.iter().map(crate::batch_rename::Rename::entry_identity).collect(),
+            holds: RefCell::new(Vec::new()), aliases: RefCell::new(HashMap::new()), finishing: Cell::new(false),
+        });
+        app.pending_renames.borrow_mut().retain(|scope| scope.strong_count() > 0);
+        app.pending_renames.borrow_mut().push(Rc::downgrade(&scope));
+        let tabs: Vec<_> = app.tabs.borrow().iter().cloned().collect();
+        for tab in tabs {
+            scope.protect(&tab.directory, tab.search.active.get(), false);
+            for contents in tab.columns.directories() { scope.protect(&contents, false, false); }
+            for history in [&tab.back, &tab.fwd] {
+                for place in history.borrow().iter() {
+                    if let super::Place::Folder(file) | super::Place::Search { root: file, .. } = place {
+                        let canonical = file.path().and_then(|p| p.canonicalize().ok()).map(gio::File::for_path).unwrap_or_else(|| file.clone());
+                        Self::aliases_for(file, &canonical, &scope.requests, &mut scope.aliases.borrow_mut());
+                    }
+                }
+            }
+        }
+        super::update_chrome(app);
+        Self { scope }
+    }
+
+    fn aliases_for(file: &gio::File, canonical: &gio::File, pairs: &[(gio::File, gio::File)], aliases: &mut HashMap<(usize, glib::GString), (gio::File, gio::File, bool)>) {
+        let mut entries = Vec::new();
+        let mut cursor = Some(file.clone());
+        while let Some(entry) = cursor {
+            cursor = entry.parent();
+            if let Some(parent) = cursor.as_ref().and_then(|p| p.path()).and_then(|p| p.canonicalize().ok()).map(gio::File::for_path) {
+                entries.push((entry, parent));
+            }
+        }
+        for (index, (from, to)) in pairs.iter().enumerate() {
+            // Resolve a directory entry's parent, not the symlink entry itself.
+            let lexical = entries.iter().find(|(entry, parent)| entry.basename() == from.basename()
+                && from.parent().is_some_and(|p| p.equal(parent))).map(|(entry, _)| entry.clone());
+            let alias_from = if lexical.is_some() { lexical }
+            else if from.parent().is_some_and(|p| p.equal(canonical)) {
+                from.basename().map(|name| file.child(name))
+            } else if canonical.equal(from) { Some(file.clone()) }
+            else if let Some(relative) = from.relative_path(canonical) {
+                let mut parent = Some(file.clone());
+                for _ in relative.components() { parent = parent.and_then(|p| p.parent()); }
+                parent
+            } else { None };
+            let Some(alias_from) = alias_from else { continue; };
+            let row_mapping = alias_from.basename() == from.basename() && alias_from.parent()
+                .and_then(|p| p.path()).and_then(|p| p.canonicalize().ok()).map(gio::File::for_path)
+                .is_some_and(|parent| from.parent().is_some_and(|p| p.equal(&parent)));
+            let alias_to = if row_mapping {
+                alias_from.parent().zip(to.basename()).map(|(parent, name)| parent.child(name)).unwrap_or_else(|| to.clone())
+            } else { to.clone() };
+            // A link to the folder is a browsing alias, not a renamed directory entry.
+            if !alias_from.equal(from) || !alias_to.equal(to) {
+                aliases.entry((index, alias_from.uri())).or_insert((alias_from, alias_to, row_mapping));
+            }
+        }
+    }
+
+    pub fn finish(self, app: &Rc<super::App>, outcome: Option<&crate::batch_rename::Outcome>) {
+        self.scope.finishing.set(true);
+        let completed: HashSet<_> = outcome.into_iter().flat_map(|o| &o.undo)
+            .map(|inverse| (gio::File::for_path(&inverse.to).uri(), gio::File::for_path(&inverse.from).uri())).collect();
+        let successful: HashSet<_> = self.scope.requests.iter().enumerate()
+            .filter(|(_, (from, to))| completed.contains(&(from.uri(), to.uri()))).map(|(index, _)| index).collect();
+        let mut pairs: Vec<_> = self.scope.requests.iter().enumerate().filter(|(index, _)| successful.contains(index)).map(|(_, pair)| pair.clone()).collect();
+        let aliases: Vec<_> = self.scope.aliases.borrow().iter().filter(|((index, _), _)| successful.contains(index)).map(|((index, _), alias)| (*index, alias.clone())).collect();
+        let mut rows = pairs.clone();
+        let mut identities: HashMap<_, _> = self.scope.requests.iter().enumerate().filter(|(index, _)| successful.contains(index))
+            .map(|(index, (from, _))| (from.uri(), self.scope.identities[index])).collect();
+        for (index, (from, to, row)) in &aliases {
+            pairs.push((from.clone(), to.clone()));
+            if *row {
+                rows.push((from.clone(), to.clone()));
+                identities.insert(from.uri(), self.scope.identities[*index]);
+            }
+        }
+        apply_renames(app, &pairs, &rows, Some(&identities), |contents| self.scope.holds.borrow().iter().any(|hold| {
+            hold.applies_to(contents) && contents.file().is_some_and(|file| {
+                mapped_location(&file, &pairs).is_none_or(|destination| hold.same_directory(&destination))
+            })
+        }));
+        drop(self);
+        super::update_chrome(app);
+    }
+}
+
+/// The filesystem rename already succeeded. Keep open paths and item identities in sync.
+pub(super) fn renamed(app: &Rc<super::App>, origin: &Rc<super::Tab>, from: &std::path::Path, to: &std::path::Path) {
+    let from = gio::File::for_path(from); let to = gio::File::for_path(to);
+    let pairs = [(from, to.clone())];
+    apply_renames(app, &pairs, &pairs, None, |_| true);
+    if !origin.search.active.get() && origin.current_dir().is_some_and(|dir| to.parent().is_some_and(|parent| dir.equal(&parent))) {
+        if let Some(name) = to.basename() {
+            let app = app.clone(); let tab = origin.clone();
+            select_names(origin, &[name.to_string_lossy().into_owned()], move || focus_selection(&app, &tab));
+        }
+    }
+    super::update_chrome(app);
+}
+
+fn apply_renames(app: &Rc<super::App>, pairs: &[(gio::File, gio::File)], rows: &[(gio::File, gio::File)], identities: Option<&HashMap<glib::GString, super::directory::EntryIdentity>>, allowed: impl Fn(&Rc<super::directory::Contents>) -> bool) {
+    if pairs.is_empty() { return; }
+    let tabs: Vec<_> = app.tabs.borrow().iter().cloned().collect();
+    for tab in tabs {
+        let in_scope = |root: &gio::File| pairs.iter().any(|(from, to)| {
+            from.equal(root) || from.has_prefix(root) || to.equal(root) || to.has_prefix(root) || root.has_prefix(from)
+        });
+        let refresh_search = tab.search.active.get() && (
+            tab.dir_list.file().is_some_and(|root| in_scope(&root)
+                || root.path().and_then(|path| path.canonicalize().ok()).is_some_and(|path| in_scope(&gio::File::for_path(path))))
+            || (0..tab.search.model.n_items()).filter_map(|i| tab.search.model.item(i).and_downcast::<gio::FileInfo>())
+                .filter_map(|info| super::commands::file_from_info(&info, None)).any(|file| pairs.iter().any(|(from, _)| file.equal(from) || file.has_prefix(from)))
+        );
+        let own_directory = allowed(&tab.directory);
+        if own_directory { tab.directory.renamed(rows, identities); }
+        let column_location = tab.columns.renamed(pairs, rows, identities, &allowed);
+        let location = if tab.view_stack.visible_child_name().as_deref() == Some("columns") { column_location }
+            else if own_directory { tab.dir_list.file().and_then(|file| mapped_location(&file, pairs)) } else { None };
+        if let Some(file) = location {
+            tab.begin_navigation();
+            tab.directory.relocate(&file);
+            rebuild_breadcrumb(app, &tab, &file);
+            if let Some(page) = tab.page.borrow().as_ref() {
+                page.set_title(&file.basename().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into()));
+            }
+        }
+        if refresh_search { super::search::refresh(&tab); }
+        for history in [&tab.back, &tab.fwd] {
+            for place in history.borrow_mut().iter_mut() {
+                match place {
+                    super::Place::Folder(file) | super::Place::Search { root: file, .. } => {
+                        if let Some(new) = mapped_location(file, pairs) { *file = new; }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        super::update_preview(&tab);
+    }
+    super::places::sync_sidebar(app);
+    super::update_chrome(app);
+}
+
+pub(super) fn focus_selection(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
+    if !Rc::ptr_eq(&active_tab(app), tab) { return; }
+    let selection = super::visible_selection(tab).selection();
+    if selection.is_empty() { return; }
+    let position = selection.minimum();
+    let flags = gtk::ListScrollFlags::FOCUS;
+    match tab.view_stack.visible_child_name().as_deref() {
+        Some("columns") => { if let Some(view) = tab.columns.view() { view.scroll_to(position, None, flags, None); } }
+        Some("list") => tab.column_view.scroll_to(position, None, flags, None),
+        Some("grid") => tab.grid_view.scroll_to(position, flags, None),
+        _ => {}
+    }
+}
+
+pub(super) fn selected_uris(model: &gtk::MultiSelection) -> std::collections::HashSet<glib::GString> {
+    let bits = model.selection();
+    (0..bits.size()).filter_map(|i| model.item(bits.nth(i as u32)).and_downcast::<gio::FileInfo>())
+        .filter_map(|i| i.attribute_object("standard::file").and_downcast::<gio::File>().map(|f| f.uri())).collect()
+}
+fn model_uris(model: &gtk::MultiSelection) -> std::collections::HashSet<glib::GString> {
+    (0..model.n_items()).filter_map(|i| model.item(i).and_downcast::<gio::FileInfo>())
+        .filter_map(|i| i.attribute_object("standard::file").and_downcast::<gio::File>().map(|f| f.uri())).collect()
+}
+
+/// A deletion may select a neighbour only while the original view/user choice is unchanged.
+pub(super) struct RemovalSelection {
+    tab: std::rc::Weak<super::Tab>,
+    model: gtk::MultiSelection,
+    directory: gio::File,
+    generation: u64,
+    removed: std::collections::HashSet<glib::GString>,
+    neighbour: Option<glib::GString>,
+    position: u32,
+    cancelled: Rc<Cell<bool>>,
+    handler: Option<glib::SignalHandlerId>,
+}
+impl RemovalSelection {
+    pub fn capture(app: &Rc<super::App>, paths: &[std::path::PathBuf]) -> Option<Self> {
+        let tab = active_tab(app);
+        let directory = tab.current_dir()?;
+        let model = super::visible_selection(&tab);
+        let original = selected_uris(&model);
+        let removed: std::collections::HashSet<_> = paths.iter().map(|p| gio::File::for_path(p).uri()).collect();
+        let affected: std::collections::HashSet<_> = original.intersection(&removed).cloned().collect();
+        if affected.is_empty() { return None; }
+        let position = model.selection().minimum();
+        let neighbours: Vec<_> = (0..model.n_items()).filter_map(|pos| {
+            let uri = model.item(pos).and_downcast::<gio::FileInfo>()?.attribute_object("standard::file")
+                .and_downcast::<gio::File>()?.uri();
+            (!removed.contains(&uri)).then_some((pos, uri))
+        }).collect();
+        let neighbour = neighbours.iter().find(|(pos, _)| *pos >= position).or_else(|| neighbours.last()).map(|(_, uri)| uri.clone());
+        let cancelled = Rc::new(Cell::new(false));
+        let changed = cancelled.clone();
+        let handler = model.connect_selection_changed(move |model, _, _| {
+            let current = selected_uris(model);
+            let available = model_uris(model);
+            if !current.is_subset(&original)
+                || original.difference(&current).any(|uri| available.contains(uri)) {
+                changed.set(true);
+            }
+        });
+        Some(Self { tab: Rc::downgrade(&tab), model, directory, generation: tab.navigation_generation.get(),
+            removed: affected, neighbour, position, cancelled, handler: Some(handler) })
+    }
+
+    pub fn finish(self, app: &Rc<super::App>) {
+        let app = Rc::downgrade(app);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+            let (Some(app), Some(tab)) = (app.upgrade(), self.tab.upgrade()) else { return glib::ControlFlow::Break; };
+            if self.cancelled.get() || tab.navigation_generation.get() != self.generation
+                || !Rc::ptr_eq(&active_tab(&app), &tab) || super::visible_selection(&tab) != self.model
+                || !tab.current_dir().is_some_and(|f| f.equal(&self.directory))
+                || super::view::focus_is_text_input(app.window.upcast_ref()) {
+                return glib::ControlFlow::Break;
+            }
+            let available = model_uris(&self.model);
+            if self.removed.iter().any(|uri| available.contains(uri)) {
+                return if std::time::Instant::now() < deadline { glib::ControlFlow::Continue } else { glib::ControlFlow::Break };
+            }
+            if !self.model.selection().is_empty() || self.model.n_items() == 0 { return glib::ControlFlow::Break; }
+            let position = self.neighbour.as_ref().and_then(|uri| (0..self.model.n_items()).find(|&pos| {
+                self.model.item(pos).and_downcast::<gio::FileInfo>().and_then(|i| i.attribute_object("standard::file").and_downcast::<gio::File>())
+                    .is_some_and(|f| f.uri() == *uri)
+            })).unwrap_or(self.position.min(self.model.n_items() - 1));
+            self.model.select_item(position, true);
+            focus_selection(&app, &tab);
+            glib::ControlFlow::Break
+        });
+    }
+}
+impl Drop for RemovalSelection {
+    fn drop(&mut self) { if let Some(handler) = self.handler.take() { self.model.disconnect(handler); } }
 }
 
 /// Select `names` in `tab` once the folder listing has them. `then` runs after
 /// a successful selection, so a properties dialog can read that selection.
 pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn() + 'static) {
+    select_names_if(tab, names, || true, then);
+}
+
+/// Operations can additionally cancel when their originating tab/input is no longer current.
+pub(super) fn select_names_if(tab: &Rc<super::Tab>, names: &[String], still_current: impl Fn() -> bool + 'static, then: impl Fn() + 'static) {
     if names.is_empty() {
         return;
     }
@@ -401,9 +707,11 @@ pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn
     let then = Rc::new(RefCell::new(Some(then)));
     let done = Rc::new(Cell::new(false));
     let generation = tab.navigation_generation.get();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let directory = tab.current_dir().map(|file| file.uri());
-    let source = tab.current_source();
     let model = super::visible_selection(tab);
+    let original = selected_uris(&model);
+    let model = model.downgrade();
     let attempt = Rc::new({
         let tab = Rc::downgrade(tab);
         let names = names.clone();
@@ -413,15 +721,29 @@ pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn
             if done.get() {
                 return;
             }
-            let Some(tab) = tab.upgrade() else { return; };
+            let stop = || { done.set(true); then.borrow_mut().take(); };
+            let Some(tab) = tab.upgrade() else { stop(); return; };
+            let Some(model) = model.upgrade() else { stop(); return; };
+            let selection = super::visible_selection(&tab);
             if tab.navigation_generation.get() != generation
-                || tab.current_dir().map(|file| file.uri()) != directory {
-                done.set(true);
-                then.borrow_mut().take();
+                || tab.current_dir().map(|file| file.uri()) != directory
+                || selection != model || !still_current() {
+                stop();
                 return;
             }
-            if tab.view_stack.visible_child_name().as_deref() == Some("columns") && tab.columns.restoring() { return; }
-            let selection = super::visible_selection(&tab);
+            let current = selected_uris(&selection);
+            if current != original {
+                let available = model_uris(&selection);
+                if !current.is_subset(&original) || original.difference(&current).any(|uri| available.contains(uri)) {
+                    stop();
+                    return;
+                }
+            }
+            let expired = std::time::Instant::now() >= deadline;
+            if tab.view_stack.visible_child_name().as_deref() == Some("columns") && tab.columns.restoring() {
+                if expired { stop(); }
+                return;
+            }
             let mut found = Vec::new();
             for i in 0..selection.n_items() {
                 let Some(obj) = selection.item(i) else { continue };
@@ -431,13 +753,7 @@ pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn
                     found.push(i);
                 }
             }
-            let loading = tab.current_source().is_loading();
-            if found.is_empty() && loading {
-                return;
-            }
-            if loading && found.len() < names.len() {
-                return;
-            }
+            if found.len() < names.len() && !expired { return; }
             for (n, pos) in found.iter().enumerate() {
                 selection.select_item(*pos, n == 0);
             }
@@ -447,13 +763,11 @@ pub(super) fn select_names(tab: &Rc<super::Tab>, names: &[String], then: impl Fn
         }
     });
     attempt();
-    {
-        let attempt = attempt.clone();
-        model.connect_items_changed(move |_, _, _, _| attempt());
-    }
-    {
-        let attempt = attempt.clone();
-        source.connect_loading_notify(move |_| attempt());
+    if !done.get() {
+        glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
+            attempt();
+            if done.get() { glib::ControlFlow::Break } else { glib::ControlFlow::Continue }
+        });
     }
 }
 

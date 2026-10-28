@@ -296,6 +296,7 @@ pub(super) fn attach_drop_target(app: &Rc<super::App>, tab: &Rc<super::Tab>, vie
         target.connect_drop(move |target, value, x, y| {
             let (Some(app), Some(tab), Some(view)) = (app.upgrade(), tab.upgrade(), view.upgrade()) else { return false; };
             super::columns::focus_widget(&app, &tab, &view);
+            if super::navigation::batch_busy(&tab) { return false; }
             clear_drop_highlight(&highlighted);
             let Ok(list) = value.get::<gdk::FileList>() else {
                 return false;
@@ -562,13 +563,14 @@ pub(super) fn start_inline_rename(app: &Rc<super::App>, tab: &Rc<super::Tab>) ->
     // Enter commits.
     {
         let app = app.clone();
+        let tab = tab.clone();
         let finish = finish.clone();
         let file = file.clone();
         let old = name.clone();
         let id = entry.connect_activate(move |entry| {
             let new = entry.text().to_string();
             finish();
-            commit_inline_rename(&app, &file, &old, &new);
+            commit_inline_rename(&app, &tab, &file, &old, &new);
         });
         handlers.borrow_mut().push(id);
     }
@@ -595,7 +597,7 @@ pub(super) fn start_inline_rename(app: &Rc<super::App>, tab: &Rc<super::Tab>) ->
 }
 
 /// Apply an inline rename, recording it for undo.
-fn commit_inline_rename(app: &Rc<super::App>, file: &gio::File, old: &str, new: &str) {
+fn commit_inline_rename(app: &Rc<super::App>, tab: &Rc<super::Tab>, file: &gio::File, old: &str, new: &str) {
     if new == old {
         return; // nothing to do
     }
@@ -609,11 +611,85 @@ fn commit_inline_rename(app: &Rc<super::App>, file: &gio::File, old: &str, new: 
         .and_then(|from| fileops::rename(&from, new).map(|to| (from, to)).map_err(|_| ()));
     match renamed {
         Ok((from, to)) => {
+            super::navigation::renamed(app, tab, &from, &to);
             super::commands::push_undo(app, undo::Action::Rename { from, to });
-            super::navigation::refresh(&super::navigation::active_tab(app));
         }
         Err(()) => super::toast(app, "Couldn't rename"),
     }
+}
+
+// GTK can retain a bound cell for the same FileInfo after metadata or sort changes.
+// Refresh its contents explicitly without rebuilding the item or its editor.
+#[derive(Clone, Copy)]
+enum CellContent { Name, Size, Modified }
+#[derive(Clone)]
+struct BoundCell { info: gio::FileInfo, content: CellContent }
+
+pub(super) fn watch_metadata(items: &gio::ListStore, root: &impl IsA<gtk::Widget>) {
+    let root = root.as_ref().downgrade();
+    items.connect_items_changed(move |items, position, removed, added| {
+        if removed == 0 || added == 0 { return; }
+        let Some(root) = root.upgrade() else { return; };
+        let changed: Vec<_> = (position..position + added)
+            .filter_map(|pos| items.item(pos).and_downcast::<gio::FileInfo>()).collect();
+        refresh_bound_cells(&root, &changed);
+    });
+}
+
+fn refresh_bound_cells(widget: &gtk::Widget, changed: &[gio::FileInfo]) {
+    let bound = unsafe { widget.data::<BoundCell>("fs-bound-cell").map(|b| b.as_ref().clone()) };
+    if let Some(bound) = bound && changed.contains(&bound.info) { paint_cell(widget, &bound); }
+    let mut child = widget.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        refresh_bound_cells(&widget, changed);
+    }
+}
+
+fn bind_cell(item: &gtk::ListItem, content: CellContent) {
+    let widget = item.child().unwrap();
+    let bound = BoundCell { info: item.item().and_downcast::<gio::FileInfo>().unwrap(), content };
+    unsafe { widget.set_data("fs-bound-cell", bound.clone()); }
+    paint_cell(&widget, &bound);
+}
+
+fn paint_cell(widget: &gtk::Widget, bound: &BoundCell) {
+    let info = &bound.info;
+    match bound.content {
+        CellContent::Name => {
+            let image = widget.first_child().and_downcast::<gtk::Image>().unwrap();
+            let label = find_name_stack(widget).unwrap().child_by_name("view").and_downcast::<gtk::Label>().unwrap();
+            unsafe { image.set_data("fs-file-info", info.clone()); }
+            if info.icon().is_some() { set_themed_icon(&image, info); } else { image.clear(); }
+            if image.pixel_size() >= 32 { set_thumbnail(&image, info, image.pixel_size()); }
+            else { crate::thumbnails::arm(&image); }
+            label.set_label(&info.display_name());
+            widget.set_tooltip_text(Some(&info.display_name()));
+            mark_drop_folder(widget, info);
+        }
+        CellContent::Size => {
+            let label = widget.downcast_ref::<gtk::Label>().unwrap();
+            if info.file_type() == gio::FileType::Directory {
+                label.set_label("—"); label.add_css_class("dim-label");
+            } else {
+                label.set_label(&format::human_size(info.size().max(0) as u64)); label.remove_css_class("dim-label");
+            }
+        }
+        CellContent::Modified => {
+            let label = widget.downcast_ref::<gtk::Label>().unwrap();
+            label.set_label(&info.modification_date_time().as_ref().map(format::modified).unwrap_or_default());
+        }
+    }
+    mark_hidden(widget, info);
+}
+
+fn track_cell_positions(factory: &gtk::SignalListItemFactory) {
+    factory.connect_setup(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        item.connect_position_notify(|item| {
+            if let Some(child) = item.child() { tag_position(&child, item.position()); }
+        });
+    });
 }
 
 // --- Views ------------------------------------------------------------------
@@ -630,6 +706,7 @@ pub(super) fn fill_columns(tab: Option<&Rc<super::Tab>>, column_view: &gtk::Colu
 
 pub(super) fn name_column(tab: Option<&Rc<super::Tab>>, view: &gtk::ColumnView, zoom: &Rc<Cell<i32>>) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
+    track_cell_positions(&factory);
     let tab_setup = tab.map(Rc::downgrade);
     let zoom_setup = zoom.clone();
     let zoom_bind = zoom.clone();
@@ -651,23 +728,13 @@ pub(super) fn name_column(tab: Option<&Rc<super::Tab>>, view: &gtk::ColumnView, 
     });
     factory.connect_bind(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let info = item.item().and_downcast::<gio::FileInfo>().unwrap();
         let row = item.child().and_downcast::<gtk::Box>().unwrap();
         let image = row.first_child().and_downcast::<gtk::Image>().unwrap();
         let label = bind_name_stack(&row, item.position());
         let icon_px = list_icon(zoom_bind.get());
         image.set_pixel_size(icon_px);
         label.set_attributes(Some(&name_font(icon_px)));
-        unsafe { image.set_data("fs-file-info", info.clone()) };
-        set_themed_icon(&image, &info);
-        if icon_px >= 32 {
-            set_thumbnail(&image, &info, icon_px);
-        }
-        label.set_label(&info.display_name());
-        // The name column ellipsizes; show the full name on hover.
-        row.set_tooltip_text(Some(&info.display_name()));
-        mark_drop_folder(&row, &info);
-        mark_hidden(&row, &info);
+        bind_cell(item, CellContent::Name);
     });
     let col =
         gtk::ColumnViewColumn::builder().title("Name").factory(&factory).expand(true).resizable(true).build();
@@ -679,6 +746,7 @@ pub(super) fn name_column(tab: Option<&Rc<super::Tab>>, view: &gtk::ColumnView, 
 
 fn size_column(tab: Option<&Rc<super::Tab>>, view: &gtk::ColumnView) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
+    track_cell_positions(&factory);
     let tab = tab.map(Rc::downgrade);
     let view = view.clone().upcast::<gtk::Widget>().downgrade();
     factory.connect_setup(move |_, item| {
@@ -691,17 +759,8 @@ fn size_column(tab: Option<&Rc<super::Tab>>, view: &gtk::ColumnView) -> gtk::Col
     });
     factory.connect_bind(|_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let info = item.item().and_downcast::<gio::FileInfo>().unwrap();
-        let label = item.child().and_downcast::<gtk::Label>().unwrap();
-        if info.file_type() == gio::FileType::Directory {
-            label.set_label("—");
-            label.add_css_class("dim-label");
-        } else {
-            label.set_label(&format::human_size(info.size().max(0) as u64));
-            label.remove_css_class("dim-label");
-        }
-        tag_position(&label, item.position());
-        mark_hidden(&label, &info);
+        tag_position(&item.child().unwrap(), item.position());
+        bind_cell(item, CellContent::Size);
     });
     let col = gtk::ColumnViewColumn::builder().title("Size").factory(&factory).resizable(true).build();
     col.set_fixed_width(96);
@@ -711,6 +770,7 @@ fn size_column(tab: Option<&Rc<super::Tab>>, view: &gtk::ColumnView) -> gtk::Col
 
 fn modified_column(tab: Option<&Rc<super::Tab>>, view: &gtk::ColumnView) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
+    track_cell_positions(&factory);
     let tab = tab.map(Rc::downgrade);
     let view = view.clone().upcast::<gtk::Widget>().downgrade();
     factory.connect_setup(move |_, item| {
@@ -722,14 +782,8 @@ fn modified_column(tab: Option<&Rc<super::Tab>>, view: &gtk::ColumnView) -> gtk:
     });
     factory.connect_bind(|_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let info = item.item().and_downcast::<gio::FileInfo>().unwrap();
-        let label = item.child().and_downcast::<gtk::Label>().unwrap();
-        match info.modification_date_time() {
-            Some(dt) => label.set_label(&format::modified(&dt)),
-            None => label.set_label(""),
-        }
-        tag_position(&label, item.position());
-        mark_hidden(&label, &info);
+        tag_position(&item.child().unwrap(), item.position());
+        bind_cell(item, CellContent::Modified);
     });
     let col =
         gtk::ColumnViewColumn::builder().title("Modified").factory(&factory).resizable(true).build();
@@ -743,6 +797,7 @@ fn modified_column(tab: Option<&Rc<super::Tab>>, view: &gtk::ColumnView) -> gtk:
 
 pub(super) fn grid_factory(tab: Option<&Rc<super::Tab>>, view: &gtk::GridView, zoom: &Rc<Cell<i32>>) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
+    track_cell_positions(&factory);
     let tab_setup = tab.map(Rc::downgrade);
     let zoom_setup = zoom.clone();
     let zoom_bind = zoom.clone();
@@ -780,7 +835,6 @@ pub(super) fn grid_factory(tab: Option<&Rc<super::Tab>>, view: &gtk::GridView, z
     });
     factory.connect_bind(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let info = item.item().and_downcast::<gio::FileInfo>().unwrap();
         let cell = item.child().and_downcast::<gtk::Box>().unwrap();
         let image = cell.first_child().and_downcast::<gtk::Image>().unwrap();
         let label = bind_name_stack(&cell, item.position());
@@ -790,15 +844,7 @@ pub(super) fn grid_factory(tab: Option<&Rc<super::Tab>>, view: &gtk::GridView, z
         label.set_width_chars(width);
         label.set_max_width_chars(max);
         label.set_attributes(Some(&name_font(icon_px)));
-        unsafe { image.set_data("fs-file-info", info.clone()) };
-        set_themed_icon(&image, &info);
-        set_thumbnail(&image, &info, icon_px);
-        label.set_label(&info.display_name());
-        // Names are wrapped/ellipsized in the grid, so surface the full name on
-        // hover.
-        cell.set_tooltip_text(Some(&info.display_name()));
-        mark_drop_folder(&cell, &info);
-        mark_hidden(&cell, &info);
+        bind_cell(item, CellContent::Name);
     });
     factory
 }

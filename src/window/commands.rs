@@ -19,7 +19,7 @@ pub(super) fn file_from_info(info: &gio::FileInfo, directory: Option<&gio::File>
 
 
 pub(super) fn selected(tab: &Rc<super::Tab>) -> Vec<(gio::File, gio::FileInfo)> {
-    if tab.view_stack.visible_child_name().as_deref() == Some("trash") {
+    if super::navigation::batch_busy(tab) || tab.view_stack.visible_child_name().as_deref() == Some("trash") {
         return Vec::new();
     }
     let Some(dir) = tab.current_dir() else { return Vec::new() };
@@ -38,6 +38,7 @@ pub(super) fn selected(tab: &Rc<super::Tab>) -> Vec<(gio::File, gio::FileInfo)> 
 }
 
 pub(super) fn activate(app: &Rc<super::App>, tab: &Rc<super::Tab>, position: u32) {
+    if super::navigation::batch_busy(tab) { return; }
     let Some(item) = super::visible_selection(tab).item(position) else { return };
     let info = item.downcast::<gio::FileInfo>().unwrap();
     let Some(dir) = tab.current_dir() else { return };
@@ -517,7 +518,11 @@ pub(super) fn undo(app: &Rc<super::App>) {
             true
         }
         undo::Action::BatchRename { pending } => { batch_history(app, pending, true); return; }
-        undo::Action::Rename { from, to } => undo::move_exact(to, from).is_ok(),
+        undo::Action::Rename { from, to } => {
+            let ok = undo::move_exact(to, from).is_ok();
+            if ok { super::navigation::renamed(app, &super::navigation::active_tab(app), to, from); }
+            ok
+        },
         undo::Action::NewFolder { path } => undo::undo_new_folder(path).is_ok(),
         undo::Action::Trash { originals } => {
             originals.iter().all(|p| undo::restore_from_trash(p))
@@ -554,7 +559,11 @@ pub(super) fn redo(app: &Rc<super::App>) {
             true
         }
         undo::Action::BatchRename { pending } => { batch_history(app, pending, false); return; }
-        undo::Action::Rename { from, to } => undo::move_exact(from, to).is_ok(),
+        undo::Action::Rename { from, to } => {
+            let ok = undo::move_exact(from, to).is_ok();
+            if ok { super::navigation::renamed(app, &super::navigation::active_tab(app), from, to); }
+            ok
+        },
         undo::Action::NewFolder { path } => std::fs::create_dir(path).is_ok(),
         undo::Action::Trash { originals } => originals
             .iter()
@@ -575,6 +584,7 @@ fn batch_history(app: &Rc<super::App>, pending: &[crate::batch_rename::Rename], 
     let redo_index = app.redo_stack.borrow().len();
     let generation = app.history_generation.get();
     let pending = pending.to_vec();
+    let hold = super::navigation::BatchRename::new(app, &pending);
     app.history_busy.set(true);
     super::update_chrome(app);
     super::toast(app, if undoing { "Undoing batch rename…" } else { "Redoing batch rename…" });
@@ -582,6 +592,7 @@ fn batch_history(app: &Rc<super::App>, pending: &[crate::batch_rename::Rename], 
     glib::spawn_future_local(async move {
         let requests = pending.clone();
         let result = gio::spawn_blocking(move || crate::batch_rename::run(&requests)).await;
+        hold.finish(&app, result.as_ref().ok());
         let unchanged = app.history_generation.get() == generation;
         let (origin, opposite, origin_index, opposite_index) = if undoing {
             (&app.undo_stack, &app.redo_stack, undo_index, redo_index)
@@ -643,6 +654,9 @@ pub(super) fn start_job(app: &Rc<super::App>, kind: ops::Kind, sources: Vec<Path
         ops::Kind::Delete => ("Deleting", "Deleted"),
     };
 
+    let mut removal = if matches!(kind, ops::Kind::Delete | ops::Kind::Move) {
+        super::navigation::RemovalSelection::capture(app, &sources)
+    } else { None };
     let cancel = Arc::new(AtomicBool::new(false));
     let (ev_tx, ev_rx) = async_channel::unbounded::<ops::Event>();
     let (dec_tx, dec_rx) = std::sync::mpsc::channel::<ops::Decision>();
@@ -745,6 +759,7 @@ pub(super) fn start_job(app: &Rc<super::App>, kind: ops::Kind, sources: Vec<Path
                     for tab in app.tabs.borrow().iter() {
                         super::navigation::refresh(tab);
                     }
+                    if let Some(removal) = removal.take() { removal.finish(&app); }
                     super::update_chrome(&app);
                     let message = if cancel.load(AtomicOrdering::Relaxed) {
                         format!("{verb} cancelled — {ok} done")
@@ -784,6 +799,7 @@ pub(super) fn trash_selected(app: &Rc<super::App>) {
     if items.is_empty() {
         return;
     }
+    let removal = super::navigation::RemovalSelection::capture(app, &items.iter().filter_map(|(f, _)| f.path()).collect::<Vec<_>>());
     let (mut ok, mut failed) = (0u32, 0u32);
     let mut trashed: Vec<PathBuf> = Vec::new();
     for (file, _) in &items {
@@ -800,6 +816,7 @@ pub(super) fn trash_selected(app: &Rc<super::App>) {
         push_undo(app, undo::Action::Trash { originals: trashed });
     }
     super::navigation::refresh(&tab);
+    if let Some(removal) = removal { removal.finish(app); }
     super::toast(app, &format!("Moved {ok} item{} to Trash{}", super::plural(ok as usize),
         if failed > 0 { format!("; {failed} failed") } else { String::new() }));
 }
@@ -811,6 +828,7 @@ pub(super) fn delete_selected(app: &Rc<super::App>) {
         return;
     }
     let n = items.len();
+    let sources: Vec<PathBuf> = items.iter().filter_map(|(file, _)| file.path()).collect();
     let dialog = adw::AlertDialog::new(
         Some(&format!("Permanently delete {n} item{}?", super::plural(n))),
         Some("This cannot be undone."),
@@ -824,8 +842,6 @@ pub(super) fn delete_selected(app: &Rc<super::App>) {
         if resp != "delete" {
             return;
         }
-        let sources: Vec<PathBuf> =
-            selected(&super::navigation::active_tab(&app)).into_iter().filter_map(|(f, _)| f.path()).collect();
         start_job(&app, ops::Kind::Delete, sources, PathBuf::new(), false);
     });
 }
@@ -883,8 +899,8 @@ pub(super) fn rename_with_dialog(app: &Rc<super::App>) {
             .and_then(|from| fileops::rename(&from, &name).map(|to| (from, to)).map_err(|_| ()));
         match renamed {
             Ok((from, to)) => {
+                super::navigation::renamed(&app, &tab, &from, &to);
                 push_undo(&app, undo::Action::Rename { from, to });
-                super::navigation::refresh(&super::navigation::active_tab(&app));
             }
             Err(()) => super::toast(&app, "Couldn't rename"),
         }
@@ -903,10 +919,19 @@ pub(super) fn new_folder(app: &Rc<super::App>) {
             // A search for something else would hide "New Folder".
             tab.search_bar.set_search_mode(false);
             super::navigation::refresh(&tab);
-            let app = app.clone();
-            let editing = tab.clone();
-            super::navigation::select_names(&tab, &[name], move || {
-                edit_when_loaded(app.clone(), editing.clone());
+            let editing = Rc::downgrade(&tab);
+            let editing_app = Rc::downgrade(app);
+            let guard_tab = editing.clone();
+            let guard_app = editing_app.clone();
+            let initial_focus = gtk::prelude::RootExt::focus(&app.window).map(|w| w.downgrade());
+            super::navigation::select_names_if(&tab, &[name], move || {
+                let (Some(app), Some(tab)) = (guard_app.upgrade(), guard_tab.upgrade()) else { return false; };
+                let focus = gtk::prelude::RootExt::focus(&app.window);
+                Rc::ptr_eq(&super::navigation::active_tab(&app), &tab)
+                    && !(super::view::focus_is_text_input(app.window.upcast_ref())
+                        && focus != initial_focus.as_ref().and_then(|w| w.upgrade()))
+            }, move || {
+                if let (Some(app), Some(tab)) = (editing_app.upgrade(), editing.upgrade()) { edit_when_loaded(app, tab); }
             });
         }
         Err(_) => super::toast(&app, "Couldn't create folder"),
@@ -917,6 +942,7 @@ pub(super) fn new_folder(app: &Rc<super::App>) {
 /// batch does not rebuild the row and close the editor.
 fn edit_when_loaded(app: Rc<super::App>, tab: Rc<super::Tab>) {
     let generation = tab.navigation_generation.get();
+    let intended = super::navigation::selected_uris(&super::visible_selection(&tab));
     let source = tab.current_source();
     if !source.is_loading() {
         open_name_editor(app, tab);
@@ -924,8 +950,8 @@ fn edit_when_loaded(app: Rc<super::App>, tab: Rc<super::Tab>) {
     }
     let handler = Rc::new(Cell::new(None));
     let handler_in_signal = handler.clone();
-    let app_in_signal = app.clone();
-    let tab_in_signal = tab.clone();
+    let app_in_signal = Rc::downgrade(&app);
+    let tab_in_signal = Rc::downgrade(&tab);
     let id = source.connect_loading_notify(move |list| {
         if list.is_loading() {
             return;
@@ -933,8 +959,8 @@ fn edit_when_loaded(app: Rc<super::App>, tab: Rc<super::Tab>) {
         if let Some(id) = handler_in_signal.take() {
             list.disconnect(id);
         }
-        if tab_in_signal.navigation_generation.get() == generation {
-            open_name_editor(app_in_signal.clone(), tab_in_signal.clone());
+        if let (Some(app), Some(tab)) = (app_in_signal.upgrade(), tab_in_signal.upgrade()) {
+            if edit_request_is_current(&app, &tab, generation, &intended) { open_name_editor(app, tab); }
         }
     });
     handler.set(Some(id));
@@ -946,10 +972,19 @@ fn edit_when_loaded(app: Rc<super::App>, tab: Rc<super::Tab>) {
     }
 }
 
+fn edit_request_is_current(app: &Rc<super::App>, tab: &Rc<super::Tab>, generation: u64, intended: &std::collections::HashSet<glib::GString>) -> bool {
+    tab.navigation_generation.get() == generation
+        && Rc::ptr_eq(&super::navigation::active_tab(app), tab)
+        && super::navigation::selected_uris(&super::visible_selection(tab)) == *intended
+        && !(gtk::prelude::RootExt::focus(&app.window).is_some_and(|w| w.is_mapped())
+            && super::view::focus_is_text_input(app.window.upcast_ref()))
+}
+
 /// Scroll the selected row on screen, then open its name editor. One retry
 /// covers the row that was not drawn yet.
 fn open_name_editor(app: Rc<super::App>, tab: Rc<super::Tab>) {
     let generation = tab.navigation_generation.get();
+    let intended = super::navigation::selected_uris(&super::visible_selection(&tab));
     let bitset = super::visible_selection(&tab).selection();
     if bitset.size() == 1 {
         let pos = bitset.nth(0);
@@ -965,14 +1000,14 @@ fn open_name_editor(app: Rc<super::App>, tab: Rc<super::Tab>) {
     let app = app.clone();
     let tab = tab.clone();
     glib::idle_add_local_once(move || {
-        if tab.navigation_generation.get() != generation { return; }
+        if !edit_request_is_current(&app, &tab, generation, &intended) { return; }
         if super::view::start_inline_rename(&app, &tab) {
             return;
         }
         let app = app.clone();
         let tab = tab.clone();
         glib::idle_add_local_once(move || {
-            if tab.navigation_generation.get() != generation { return; }
+            if !edit_request_is_current(&app, &tab, generation, &intended) { return; }
             super::view::start_inline_rename(&app, &tab);
         });
     });

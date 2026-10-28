@@ -91,7 +91,7 @@ mod tests {
 use super::*;
 
 struct Column {
-    file: gio::File,
+    file: RefCell<gio::File>,
     source: gtk::DirectoryList,
     contents: Rc<directory::Contents>,
     filter: gtk::CustomFilter,
@@ -106,6 +106,7 @@ struct Column {
 }
 
 impl Column {
+    fn file(&self) -> gio::File { self.file.borrow().clone() }
     fn select_names(&self, names: &[std::path::PathBuf]) {
         self.selection.unselect_all();
         for pos in 0..self.selection.n_items() {
@@ -153,7 +154,7 @@ impl Pane {
         self.active().map(|c| c.selection.clone())
     }
     pub fn file(&self) -> Option<gio::File> {
-        self.active().map(|c| c.file.clone())
+        self.active().map(|c| c.file())
     }
     pub fn restoring(&self) -> bool {
         self.active()
@@ -180,7 +181,7 @@ impl Pane {
             .borrow()
             .entries
             .iter()
-            .position(|(_, c)| c.file.equal(file));
+            .position(|(_, c)| c.file().equal(file));
         if let Some(index) = existing {
             self.branch.borrow_mut().truncate(index + 1);
         } else {
@@ -189,7 +190,7 @@ impl Pane {
                     .borrow()
                     .entries
                     .iter()
-                    .position(|(_, c)| c.file.equal(&parent))
+                    .position(|(_, c)| c.file().equal(&parent))
             });
             if let Some(index) = parent {
                 self.branch.borrow_mut().truncate(index + 1);
@@ -211,6 +212,8 @@ impl Pane {
         }
         let last = self.branch.borrow().entries.len().saturating_sub(1);
         self.branch.borrow_mut().focus(last);
+        // Explicit navigation chooses the current filesystem identities along its path.
+        for contents in self.directories() { navigation::protect_batch_directory(app, &contents, true); }
         let ancestors: Vec<_> = self
             .branch
             .borrow()
@@ -219,7 +222,7 @@ impl Pane {
             .filter_map(|pair| {
                 pair[1]
                     .1
-                    .file
+                    .file()
                     .basename()
                     .map(|name| (pair[0].1.clone(), name))
             })
@@ -299,7 +302,7 @@ impl Pane {
             .position(260)
             .build();
         let column = Rc::new(Column {
-            file: file.clone(),
+            file: RefCell::new(file.clone()),
             source: source.clone(),
             contents,
             filter,
@@ -333,6 +336,8 @@ impl Pane {
                     glib::idle_add_local_once(move || {
                         if let (Some(app), Some(tab)) = (a.upgrade(), t.upgrade()) {
                             if tab.columns.live(&tab, index, id) {
+                                tab.columns.restore_available(&app, &tab, index);
+                                tab.columns.prune_missing(&app, &tab, index);
                                 tab.columns.selected(&app, &tab, index);
                             }
                         }
@@ -352,6 +357,8 @@ impl Pane {
                     glib::idle_add_local_once(move || {
                         if let (Some(app), Some(tab)) = (a.upgrade(), t.upgrade()) {
                             if tab.columns.live(&tab, index, id) {
+                                tab.columns.restore_available(&app, &tab, index);
+                                tab.columns.prune_missing(&app, &tab, index);
                                 tab.columns.selected(&app, &tab, index);
                             }
                         }
@@ -453,7 +460,9 @@ impl Pane {
         view::attach_view_keys(app, &view);
         view::attach_context_menu(app, &view);
         view::attach_drop_target(app, tab, &view);
+        view::watch_metadata(&column.contents.items, &view);
         source.set_file(Some(&file));
+        navigation::protect_batch_directory(app, &column.contents, false);
     }
 
     fn live(&self, tab: &Tab, index: usize, id: u64) -> bool {
@@ -477,7 +486,7 @@ impl Pane {
             .borrow()
             .entries
             .get(index + 1)
-            .map(|(_, c)| c.file.clone());
+            .map(|(_, c)| c.file());
         let restore = column.restoring.borrow_mut().take();
         let names = restore.or_else(|| next.and_then(|f| f.basename()).map(|name| vec![name]));
         if let Some(names) = names {
@@ -488,6 +497,14 @@ impl Pane {
         if tab.view_stack.visible_child_name().as_deref() == Some("columns") {
             self.selected(app, tab, index);
         }
+    }
+
+    fn restore_available(&self, app: &Rc<App>, tab: &Rc<Tab>, index: usize) {
+        let Some(column) = self.branch.borrow().entries.get(index).map(|(_, c)| c.clone()) else { return; };
+        let ready = !column.source.is_loading() && column.restoring.borrow().as_ref().is_some_and(|names| {
+            names.iter().all(|name| column.contents.contains_file(&column.file().child(name)))
+        });
+        if ready { self.loaded(app, tab, index); }
     }
 
     fn update_message(&self, index: usize) {
@@ -531,14 +548,14 @@ impl Pane {
             self.branch.borrow_mut().focus(index);
             tab.begin_navigation();
         }
-        if !tab.dir_list.file().is_some_and(|f| f.equal(&column.file)) {
-            tab.dir_list.set_file(Some(&column.file));
+        if !tab.dir_list.file().is_some_and(|f| f.equal(&column.file())) {
+            tab.dir_list.set_file(Some(&column.file()));
         }
-        navigation::rebuild_breadcrumb(app, tab, &column.file);
+        navigation::rebuild_breadcrumb(app, tab, &column.file());
         if let Some(page) = tab.page.borrow().as_ref() {
             page.set_title(
                 &column
-                    .file
+                    .file()
                     .basename()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "/".into()),
@@ -554,6 +571,30 @@ impl Pane {
         places::sync_sidebar(app);
         update_chrome(app);
         update_preview(tab);
+    }
+
+    fn prune_missing(&self, app: &Rc<App>, tab: &Rc<Tab>, index: usize) {
+        let pair = {
+            let branch = self.branch.borrow();
+            branch.entries.get(index).zip(branch.entries.get(index + 1))
+                .map(|((_, parent), (_, child))| (parent.clone(), child.file(), branch.focused > index))
+        };
+        let Some((parent, child, focused_removed)) = pair else { return; };
+        if parent.contents.held() || parent.source.is_loading() || parent.contents.items.n_items() == 0 && parent.source.file().is_none() { return; }
+        if (0..parent.contents.items.n_items()).filter_map(|i| parent.contents.items.item(i).and_downcast::<gio::FileInfo>())
+            .any(|info| info.attribute_object("standard::file").and_downcast::<gio::File>().is_some_and(|file| file.equal(&child))) { return; }
+        self.changing.set(true);
+        self.branch.borrow_mut().truncate(index + 1);
+        self.rebuild();
+        self.changing.set(false);
+        if focused_removed {
+            tab.begin_navigation();
+            self.focus(app, tab, index, false);
+            if self.widget.is_mapped() && !view::focus_is_text_input(app.window.upcast_ref()) {
+                parent.view.grab_focus();
+                self.reveal(index);
+            }
+        }
     }
 
     fn selected(&self, app: &Rc<App>, tab: &Rc<Tab>, index: usize) {
@@ -579,13 +620,13 @@ impl Pane {
         let child = info
             .as_ref()
             .filter(|i| i.file_type() == gio::FileType::Directory)
-            .map(|i| column.file.child(i.name()));
+            .map(|i| column.file().child(i.name()));
         let existing = self
             .branch
             .borrow()
             .entries
             .get(index + 1)
-            .map(|(_, c)| c.file.clone());
+            .map(|(_, c)| c.file());
         if child.as_ref().map(|f| f.uri()) != existing.as_ref().map(|f| f.uri()) {
             self.changing.set(true);
             self.branch.borrow_mut().truncate(index + 1);
@@ -678,31 +719,61 @@ impl Pane {
         });
     }
 
-    pub fn refresh(&self) {
-        let columns: Vec<_> = self
-            .branch
-            .borrow()
-            .entries
-            .iter()
-            .map(|(_, c)| c.clone())
-            .collect();
+    pub fn directories(&self) -> Vec<Rc<directory::Contents>> {
+        self.branch.borrow().entries.iter().map(|(_, c)| c.contents.clone()).collect()
+    }
+
+    pub fn held(&self) -> bool { self.active().is_some_and(|c| c.contents.held()) }
+
+    pub fn renamed(&self, pairs: &[(gio::File, gio::File)], rows: &[(gio::File, gio::File)], identities: Option<&std::collections::HashMap<glib::GString, directory::EntryIdentity>>, allowed: impl Fn(&Rc<directory::Contents>) -> bool) -> Option<gio::File> {
         self.changing.set(true);
+        let active = self.active();
+        let mut active_moved = None;
+        let columns: Vec<_> = self.branch.borrow().entries.iter().map(|(_, c)| c.clone()).collect();
         for column in columns {
-            let bits = column.selection.selection();
-            let names = (0..bits.size())
-                .filter_map(|i| {
-                    column
-                        .selection
-                        .item(bits.nth(i as u32))
-                        .and_downcast::<gio::FileInfo>()
-                        .map(|info| info.name())
-                })
-                .collect();
-            *column.restoring.borrow_mut() = Some(names);
-            column.source.set_file(gio::File::NONE);
-            column.source.set_file(Some(&column.file));
+            if !allowed(&column.contents) { continue; }
+            let file = column.file();
+            column.contents.renamed(rows, identities);
+            if let Some(names) = column.restoring.borrow_mut().as_mut() {
+                for name in names {
+                    let old = file.child(&*name);
+                    if let Some(new) = super::navigation::mapped_location(&old, rows).and_then(|f| f.basename()) { *name = new; }
+                }
+            }
+            if let Some(new) = super::navigation::mapped_location(&file, pairs) {
+                *column.file.borrow_mut() = new.clone();
+                column.contents.relocate(&new);
+                if active.as_ref().is_some_and(|c| Rc::ptr_eq(c, &column)) { active_moved = Some(new.clone()); }
+                if let Some(header) = column.view.columns().item(0).and_downcast::<gtk::ColumnViewColumn>() {
+                    header.set_title(new.basename().as_ref().map(|p| p.to_string_lossy()).as_deref());
+                }
+            }
+        }
+        // Inactive ancestor highlights describe the final path, not an old row identity.
+        let ancestors: Vec<_> = {
+            let branch = self.branch.borrow();
+            branch.entries.windows(2).take(branch.focused).map(|pair| (pair[0].1.clone(), pair[1].1.file())).collect()
+        };
+        for (parent, child) in ancestors {
+            if child.parent().is_some_and(|file| file.equal(&parent.file())) {
+                if let Some(name) = child.basename() {
+                    if parent.contents.contains_file(&child) {
+                        parent.restoring.borrow_mut().take();
+                        parent.select_names(&[name]);
+                    } else {
+                        *parent.restoring.borrow_mut() = Some(vec![name]);
+                        parent.selection.unselect_all();
+                    }
+                }
+            }
         }
         self.changing.set(false);
+        active_moved
+    }
+
+    pub fn refresh(&self) {
+        let columns: Vec<_> = self.branch.borrow().entries.iter().map(|(_, c)| c.clone()).collect();
+        for column in columns { column.contents.refresh(); }
     }
 
     pub fn filter_changed(&self) {
@@ -759,7 +830,7 @@ mod gtk_tests {
             }
             glib::timeout_future(Duration::from_millis(10)).await;
         }
-        panic!("folder did not finish loading: {}", column.file.uri());
+        panic!("folder did not finish loading: {}", column.file().uri());
     }
     fn select(column: &Column, name: &str) {
         let pos = (0..column.selection.n_items())
@@ -770,7 +841,7 @@ mod gtk_tests {
                     .and_downcast::<gio::FileInfo>()
                     .is_some_and(|i| i.name() == std::path::Path::new(name))
             })
-            .unwrap_or_else(|| panic!("missing {name} in {}", column.file.uri()));
+            .unwrap_or_else(|| panic!("missing {name} in {}", column.file().uri()));
         column.selection.select_item(pos, true);
     }
     fn column(tab: &Tab, index: usize) -> Rc<Column> {
@@ -823,7 +894,7 @@ mod gtk_tests {
                 || actual.is_ancestor(&column.view),
             "keyboard focus is in {:?}, not the command column {}",
             actual.type_(),
-            column.file.uri()
+            column.file().uri()
         );
     }
 
@@ -1105,13 +1176,13 @@ mod gtk_tests {
             assert!(unsafe { menu.as_ref() }.is_visible());
             unsafe { menu.as_ref() }.popdown();
             assert_eq!(tab.columns.branch.borrow().entries.len(), 4);
-            assert!(column(&tab, 3).file.equal(&file.child("B")));
+            assert!(column(&tab, 3).file().equal(&file.child("B")));
             assert_eq!(tab.columns.branch.borrow().entries[1].0, ancestor_id);
             // A callback from the discarded column must not alter B or command targets.
             child.selection.unselect_all();
             select(&child, "deep");
             settle().await;
-            assert!(column(&tab, 3).file.equal(&file.child("B")));
+            assert!(column(&tab, 3).file().equal(&file.child("B")));
             assert!(
                 commands::selected(&tab)[0].0.equal(&file.child("B")),
                 "focus={} selected={:?}",
@@ -1205,7 +1276,7 @@ mod gtk_tests {
             let removed = tab.columns.active().unwrap();
             loaded(&removed).await;
             assert!(removed.source.error().is_some());
-            navigation::go_up(&app, &tab);
+            // Losing an open ancestor now returns to its surviving parent automatically.
             assert!(tab.current_dir().unwrap().equal(&file));
             let weak = Rc::downgrade(&tab.columns.active().unwrap());
             tab.shutdown();
@@ -1214,4 +1285,31 @@ mod gtk_tests {
         });
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    #[ignore = "requires an isolated graphical session and temporary XDG_CONFIG_HOME"]
+    fn pending_selection_deadline_survives_a_stalled_restore() {
+        let (application, root) = review_fixture();
+        glib::MainContext::default().block_on(async {
+            super::super::open_files(&application, &[gio::File::for_path(&root)]);
+            let app = super::super::app_state(&application).unwrap();
+            let tab = navigation::active_tab(&app);
+            super::super::set_view_mode(&app, ViewMode::Columns);
+            let column = tab.columns.active().unwrap();
+            loaded(&column).await;
+            *column.restoring.borrow_mut() = Some(Vec::new());
+            let token = Rc::new(Cell::new(false));
+            let weak = Rc::downgrade(&token); let callback = token.clone();
+            navigation::select_names(&tab, &["missing".into()], move || callback.set(true));
+            drop(token);
+            let deadline = std::time::Instant::now() + Duration::from_secs(6);
+            while weak.upgrade().is_some() && std::time::Instant::now() < deadline {
+                glib::timeout_future(Duration::from_millis(50)).await;
+            }
+            assert!(weak.upgrade().is_none(), "stalled restoration bypassed request deadline");
+            column.restoring.borrow_mut().take();
+            app.window.close();
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
 }

@@ -73,6 +73,10 @@ Built with **Rust + GTK4 + libadwaita**.
   or a sortable Name / Size / Modified list.
 - **Space to preview** — macOS Quick-Look style: press Space on a file for an
   instant image / text / info preview; Space or Escape dismisses it.
+- **Resizable preview pane** (`Ctrl+Shift+P`) — drag its divider to give text,
+  images and file details more room. Text stays unwrapped unless you turn on
+  **Wrap**; long unwrapped lines scroll horizontally. Images fit the width and
+  reload at a suitable resolution. Each tab keeps its pane width when hidden.
 - **This PC** — a Windows-Explorer-style drives overview with a capacity bar and
   "X free of Y" for each volume.
 - **Mount & unmount drives** — click an unmounted partition to mount it; NTFS

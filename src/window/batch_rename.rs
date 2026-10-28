@@ -416,9 +416,11 @@ impl State {
             window.set_deletable(false);
         }
         self.status.set_text("Renaming…");
+        let hold = super::navigation::BatchRename::new(&app, &plan.requests());
         let state = self.clone();
         glib::spawn_future_local(async move {
             let result = gio::spawn_blocking(move || plan.apply()).await;
+            hold.finish(&app, result.as_ref().ok().and_then(|result| result.as_ref().ok()));
             state.busy.set(false);
             state.controls.set_sensitive(true);
             state.cancel.set_sensitive(true);
@@ -547,6 +549,595 @@ mod tests {
             child = widget.next_sibling();
         }
         None
+    }
+
+    async fn batch_settle() {
+        glib::timeout_future(std::time::Duration::from_millis(200)).await;
+    }
+
+    async fn batch_continuity(mode: super::super::ViewMode) {
+        use super::super::{self as window, commands, navigation};
+        assert!(std::env::var_os("XDG_CONFIG_HOME").is_some());
+        adw::init().unwrap();
+        gtk::Settings::default().unwrap().set_gtk_enable_animations(false);
+        let application = adw::Application::builder().application_id("dev.filescope.BatchContinuity")
+            .flags(gio::ApplicationFlags::NON_UNIQUE).build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let root = std::env::temp_dir().join(format!("filescope-batch-continuity-{}", std::process::id()));
+        for name in ["A", "B"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join("keep.txt"), name).unwrap();
+        }
+        window::open_files(&application, &[gio::File::for_path(&root)]);
+        let app = window::app_state(&application).unwrap();
+        window::set_view_mode(&app, mode);
+        let parent = navigation::active_tab(&app);
+        batch_settle().await;
+        window::visible_selection(&parent).select_all();
+        navigation::new_tab(&app, gio::File::for_path(root.join("A")), true);
+        let child = navigation::active_tab(&app);
+        batch_settle().await;
+        navigation::select_names(&child, &["keep.txt".into()], || {});
+        let model = window::visible_selection(&child);
+        let row = model.item(0).unwrap();
+        let child_widget = if mode == window::ViewMode::Columns { child.columns.view().unwrap().upcast::<gtk::Widget>() }
+            else if mode == window::ViewMode::List { child.column_view.clone().upcast() } else { child.grid_view.clone().upcast() };
+        app.tab_view.set_selected_page(parent.page.borrow().as_ref().unwrap());
+        let state = build(&app, vec![root.join("A"), root.join("B")]);
+        state.template.set_text(&format!("renamed{}", batch::NUMBER_3));
+        preview_ready(&state).await;
+        assert!(state.plan.borrow().as_ref().unwrap().ready());
+        state.apply();
+        while state.busy.get() { batch_settle().await; }
+        batch_settle().await;
+        let check = |name: &str| {
+            assert_eq!(child.current_dir().unwrap().path().unwrap(), root.join(name), "open descendant did not follow batch rename");
+            assert_eq!(window::visible_selection(&child), model);
+            assert_eq!(model.item(0).unwrap(), row, "unchanged child row was replaced");
+            assert_eq!(commands::selected(&child)[0].0.path().unwrap(), root.join(name).join("keep.txt"));
+            if mode == window::ViewMode::Columns { assert_eq!(child.columns.view().unwrap().upcast::<gtk::Widget>(), child_widget); }
+            assert!(Rc::ptr_eq(&navigation::active_tab(&app), &parent), "batch changed active tab");
+        };
+        check("renamed001");
+        assert!(find_label(parent.view_stack.upcast_ref(), "renamed001").is_some(), "batch row label stayed stale");
+        assert!(find_label(parent.view_stack.upcast_ref(), "renamed002").is_some());
+        commands::undo(&app);
+        while app.history_busy.get() { batch_settle().await; }
+        batch_settle().await;
+        check("A");
+        commands::redo(&app);
+        while app.history_busy.get() { batch_settle().await; }
+        batch_settle().await;
+        check("renamed001");
+        app.window.close();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_grid_apply_undo_redo_preserve_open_descendants() {
+        glib::MainContext::default().block_on(batch_continuity(super::super::ViewMode::Grid));
+    }
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_list_apply_undo_redo_preserve_open_descendants() {
+        glib::MainContext::default().block_on(batch_continuity(super::super::ViewMode::List));
+    }
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_columns_apply_undo_redo_preserve_open_descendants() {
+        glib::MainContext::default().block_on(batch_continuity(super::super::ViewMode::Columns));
+    }
+
+    async fn batch_boundary_fixture() -> (adw::Application, Rc<super::super::App>, Rc<super::super::Tab>, PathBuf) {
+        use super::super::{self as window, navigation};
+        assert!(std::env::var_os("XDG_CONFIG_HOME").is_some());
+        adw::init().unwrap();
+        gtk::Settings::default().unwrap().set_gtk_enable_animations(false);
+        let application = adw::Application::builder().application_id("dev.filescope.BatchBoundary")
+            .flags(gio::ApplicationFlags::NON_UNIQUE).build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let root = std::env::temp_dir().join(format!("filescope-batch-boundary-{}", std::process::id()));
+        for name in ["A", "B", "Other"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join("keep.txt"), name).unwrap();
+        }
+        std::os::unix::fs::symlink(&root, root.join("alias")).unwrap();
+        window::open_files(&application, &[gio::File::for_path(&root)]);
+        let app = window::app_state(&application).unwrap();
+        window::set_view_mode(&app, window::ViewMode::Columns);
+        let parent = navigation::active_tab(&app);
+        batch_settle().await;
+        (application, app, parent, root)
+    }
+
+    async fn open_selected_child(app: &Rc<super::super::App>, path: &std::path::Path) -> Rc<super::super::Tab> {
+        use super::super::navigation;
+        navigation::new_tab(app, gio::File::for_path(path), true);
+        let tab = navigation::active_tab(app);
+        batch_settle().await;
+        navigation::select_names(&tab, &["keep.txt".into()], || {});
+        tab
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_history_maps_chains_once_and_preserves_partial_failures() {
+        use super::super::{self as window, commands, navigation};
+        glib::MainContext::default().block_on(async {
+            let (_application, app, parent, root) = batch_boundary_fixture().await;
+            let a = open_selected_child(&app, &root.join("alias/A")).await;
+            let b = open_selected_child(&app, &root.join("alias/B")).await;
+            let a_row = window::visible_selection(&a).item(0).unwrap();
+            let b_row = window::visible_selection(&b).item(0).unwrap();
+            app.tab_view.set_selected_page(parent.page.borrow().as_ref().unwrap());
+            navigation::select_names(&parent, &["A".into(), "B".into()], || {});
+            let items = ["B", "A"].iter().map(|name| Item::read(root.join(name)).unwrap()).collect::<Vec<_>>();
+            let mut plan = batch::prepare(&items, &Rule::Template(format!("unused{}", batch::NUMBER_3)), false);
+            plan.rows[0].name = "C".into();
+            plan.rows[1].name = "B".into();
+            // The existing history worker can execute a vacancy chain with no replacement.
+            commands::push_undo(&app, crate::undo::Action::BatchRename { pending: plan.requests() });
+            commands::undo(&app);
+            while app.history_busy.get() { batch_settle().await; }
+            batch_settle().await;
+            assert_eq!(a.current_dir().unwrap().path().unwrap(), root.join("alias/B"));
+            assert_eq!(b.current_dir().unwrap().path().unwrap(), root.join("alias/C"));
+            assert_eq!(window::visible_selection(&a).item(0).unwrap(), a_row);
+            assert_eq!(window::visible_selection(&b).item(0).unwrap(), b_row);
+            assert_eq!(commands::selected(&a)[0].0.path().unwrap(), root.join("alias/B/keep.txt"));
+            assert_eq!(std::fs::read_to_string(root.join("B/keep.txt")).unwrap(), "A");
+            assert_eq!(std::fs::read_to_string(root.join("C/keep.txt")).unwrap(), "B");
+            assert_eq!(commands::selected(&parent).len(), 2);
+            // C->B fails while B exists; B->A succeeds. Only that success may move the UI.
+            commands::redo(&app);
+            while app.history_busy.get() { batch_settle().await; }
+            batch_settle().await;
+            assert_eq!(a.current_dir().unwrap().path().unwrap(), root.join("alias/A"));
+            assert_eq!(b.current_dir().unwrap().path().unwrap(), root.join("alias/C"));
+            assert!(!app.redo_stack.borrow().is_empty(), "failed history work must remain retryable");
+            commands::redo(&app);
+            while app.history_busy.get() { batch_settle().await; }
+            batch_settle().await;
+            assert_eq!(b.current_dir().unwrap().path().unwrap(), root.join("alias/B"));
+            assert_eq!(commands::selected(&b)[0].0.path().unwrap(), root.join("alias/B/keep.txt"));
+            app.window.close();
+            std::fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_rejected_swaps_release_held_views_without_changes() {
+        use super::super::{self as window, commands};
+        glib::MainContext::default().block_on(async {
+            let (_application, app, parent, root) = batch_boundary_fixture().await;
+            for destinations in [["B", "A"], ["B", "Other"]] {
+                let state = build(&app, vec![root.join("A"), root.join("B")]);
+                state.template.set_text(&format!("unused{}", batch::NUMBER_3));
+                preview_ready(&state).await;
+                for (row, destination) in state.plan.borrow_mut().as_mut().unwrap().rows.iter_mut().zip(destinations) {
+                    row.name = destination.into();
+                }
+                state.apply();
+                while state.busy.get() { batch_settle().await; }
+                batch_settle().await;
+                assert!(state.status.text().contains("No files changed"));
+                assert!(!window::navigation::batch_busy(&parent));
+                assert!(app.undo_stack.borrow().is_empty());
+                assert_eq!(std::fs::read_to_string(root.join("A/keep.txt")).unwrap(), "A");
+                assert_eq!(std::fs::read_to_string(root.join("B/keep.txt")).unwrap(), "B");
+                window::navigation::select_names(&parent, &["A".into()], || {});
+                assert_eq!(commands::selected(&parent)[0].1.name(), std::path::Path::new("A"));
+                state.window.upgrade().unwrap().close();
+            }
+            app.window.close();
+            std::fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_holds_preserve_newer_navigation_and_rebase_history() {
+        use super::super::{self as window, commands, navigation};
+        glib::MainContext::default().block_on(async {
+            let (_application, app, parent, root) = batch_boundary_fixture().await;
+            let child = open_selected_child(&app, &root.join("A")).await;
+            let items = ["A", "B"].iter().map(|name| Item::read(root.join(name)).unwrap()).collect::<Vec<_>>();
+            let plan = batch::prepare(&items, &Rule::Template(format!("renamed{}", batch::NUMBER_3)), false);
+            let hold = navigation::BatchRename::new(&app, &plan.requests());
+            assert!(navigation::batch_busy(&child));
+            assert!(commands::selected(&child).is_empty(), "held paths remain actionable");
+            assert!(!app.window.lookup_action("new-folder").unwrap().is_enabled());
+            let nested = navigation::BatchRename::new(&app, &plan.requests());
+            nested.finish(&app, None);
+            assert!(navigation::batch_busy(&child), "one completion released another batch's hold");
+            navigation::navigate(&app, &child, gio::File::for_path(root.join("Other")));
+            batch_settle().await;
+            assert!(!navigation::batch_busy(&child));
+            navigation::select_names(&child, &["keep.txt".into()], || {});
+            let keep = commands::selected(&child)[0].0.clone();
+            let outcome = gio::spawn_blocking(move || plan.apply().unwrap()).await.unwrap();
+            hold.finish(&app, Some(&outcome));
+            batch_settle().await;
+            assert_eq!(child.current_dir().unwrap().path().unwrap(), root.join("Other"));
+            assert!(commands::selected(&child)[0].0.equal(&keep));
+            assert!(matches!(child.back.borrow().last(), Some(window::Place::Folder(file)) if file.path() == Some(root.join("renamed001"))));
+            assert!(!navigation::batch_busy(&parent));
+            navigation::go_back(&app, &child);
+            batch_settle().await;
+            assert_eq!(child.current_dir().unwrap().path().unwrap(), root.join("renamed001"));
+            let items = ["renamed001", "renamed002"].iter().map(|name| Item::read(root.join(name)).unwrap()).collect::<Vec<_>>();
+            let plan = batch::prepare(&items, &Rule::Template(format!("next{}", batch::NUMBER_3)), false);
+            let hold = navigation::BatchRename::new(&app, &plan.requests());
+            let weak = Rc::downgrade(&child);
+            app.tab_view.close_page(child.page.borrow().as_ref().unwrap());
+            drop(child);
+            hold.finish(&app, None);
+            batch_settle().await;
+            assert!(weak.upgrade().is_none(), "batch hold retained a closed tab");
+            assert!(!navigation::batch_busy(&parent));
+            app.window.close();
+            std::fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_alias_navigation_and_search_scope_follow_successful_renames() {
+        use super::super::{self as window, commands, navigation};
+        glib::MainContext::default().block_on(async {
+            let (_application, app, parent, root) = batch_boundary_fixture().await;
+            std::os::unix::fs::symlink(root.join("A"), root.join("shortcut")).unwrap();
+            let alias = open_selected_child(&app, &root.join("alias/A")).await;
+            let shortcut = open_selected_child(&app, &root.join("shortcut")).await;
+            navigation::new_tab(&app, gio::File::for_path(root.join("A")), true);
+            let search = navigation::active_tab(&app);
+            batch_settle().await;
+            search.search_bar.set_search_mode(true);
+            search.search_entry.set_text("keep");
+            window::search::changed(&app, &search, true);
+            app.tab_view.set_selected_page(parent.page.borrow().as_ref().unwrap());
+            let state = build(&app, vec![root.join("alias/A"), root.join("alias/B")]);
+            state.template.set_text(&format!("renamed{}", batch::NUMBER_3));
+            preview_ready(&state).await;
+            state.apply();
+            while state.busy.get() { batch_settle().await; }
+            batch_settle().await;
+            assert_eq!(alias.current_dir().unwrap().path().unwrap(), root.join("alias/renamed001"));
+            assert_eq!(commands::selected(&alias)[0].0.path().unwrap(), root.join("alias/renamed001/keep.txt"));
+            assert_eq!(shortcut.current_dir().unwrap().path().unwrap(), root.join("renamed001"));
+            assert_eq!(commands::selected(&shortcut)[0].0.path().unwrap(), root.join("renamed001/keep.txt"));
+            assert_eq!(search.dir_list.file().unwrap().path().unwrap(), root.join("renamed001"));
+            assert!(search.search.active.get());
+            assert_eq!(&*search.search.query.borrow(), "keep");
+            assert!(std::fs::symlink_metadata(root.join("shortcut")).unwrap().file_type().is_symlink());
+            let names: Vec<_> = (0..window::visible_selection(&parent).n_items()).filter_map(|i| window::visible_selection(&parent).item(i)
+                .and_downcast::<gio::FileInfo>().map(|info| info.name())).collect();
+            assert_eq!(names.iter().filter(|name| **name == PathBuf::from("shortcut")).count(), 1, "the symlink itself was renamed in the model");
+            assert_eq!(names.iter().filter(|name| **name == PathBuf::from("renamed001")).count(), 1, "alias mapping duplicated a directory row");
+            commands::undo(&app);
+            while app.history_busy.get() { batch_settle().await; }
+            batch_settle().await;
+            assert_eq!(alias.current_dir().unwrap().path().unwrap(), root.join("alias/A"));
+            assert_eq!(search.dir_list.file().unwrap().path().unwrap(), root.join("A"));
+            app.window.close();
+            std::fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_completion_keeps_newer_selection_and_rendered_rows() {
+        use super::super::{self as window, commands, navigation};
+        glib::MainContext::default().block_on(async {
+            let (_application, app, parent, root) = batch_boundary_fixture().await;
+            navigation::select_names(&parent, &["A".into(), "B".into()], || {});
+            let model = window::visible_selection(&parent);
+            let row_a = (0..model.n_items()).filter_map(|i| model.item(i).and_downcast::<gio::FileInfo>())
+                .find(|i| i.name() == std::path::Path::new("A")).unwrap();
+            let items = ["A", "B"].iter().map(|name| Item::read(root.join(name)).unwrap()).collect::<Vec<_>>();
+            let plan = batch::prepare(&items, &Rule::Template(format!("renamed{}", batch::NUMBER_3)), false);
+            let hold = navigation::BatchRename::new(&app, &plan.requests());
+            let other = (0..model.n_items()).find(|&i| model.item(i).and_downcast::<gio::FileInfo>()
+                .is_some_and(|info| info.name() == std::path::Path::new("Other"))).unwrap();
+            model.select_item(other, true);
+            batch_settle().await;
+            let outcome = gio::spawn_blocking(move || plan.apply().unwrap()).await.unwrap();
+            hold.finish(&app, Some(&outcome));
+            batch_settle().await;
+            assert_eq!(commands::selected(&parent)[0].0.path().unwrap(), root.join("Other"));
+            let renamed = (0..model.n_items()).filter_map(|i| model.item(i).and_downcast::<gio::FileInfo>())
+                .find(|i| i.name() == std::path::Path::new("renamed001")).unwrap();
+            assert_eq!(renamed, row_a, "batch replaced a selected item's identity");
+            assert!(find_label(parent.view_stack.upcast_ref(), "renamed001").is_some());
+            assert!(find_label(parent.view_stack.upcast_ref(), "renamed002").is_some());
+            assert!(Rc::ptr_eq(&navigation::active_tab(&app), &parent));
+            app.window.close();
+            std::fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_renamed_symlink_keeps_open_descendants_through_history() {
+        use super::super::{self as window, commands};
+        glib::MainContext::default().block_on(async {
+            let (_application, app, parent, root) = batch_boundary_fixture().await;
+            std::os::unix::fs::symlink(root.join("A"), root.join("shortcut")).unwrap();
+            let child = open_selected_child(&app, &root.join("shortcut")).await;
+            let alias = open_selected_child(&app, &root.join("alias/shortcut")).await;
+            app.tab_view.set_selected_page(parent.page.borrow().as_ref().unwrap());
+            let state = build(&app, vec![root.join("shortcut"), root.join("B")]);
+            state.template.set_text(&format!("renamed{}", batch::NUMBER_3));
+            preview_ready(&state).await;
+            state.apply();
+            while state.busy.get() { batch_settle().await; }
+            batch_settle().await;
+            let check = |name: &str| {
+                assert_eq!(child.current_dir().unwrap().path().unwrap(), root.join(name));
+                assert_eq!(commands::selected(&child)[0].0.path().unwrap(), root.join(name).join("keep.txt"));
+                assert_eq!(alias.current_dir().unwrap().path().unwrap(), root.join("alias").join(name));
+                assert_eq!(commands::selected(&alias)[0].0.path().unwrap(), root.join("alias").join(name).join("keep.txt"));
+                assert_eq!(std::fs::read_link(root.join(name)).unwrap(), root.join("A"));
+                assert!(root.join("A/keep.txt").exists());
+            };
+            check("renamed001");
+            commands::undo(&app);
+            while app.history_busy.get() { batch_settle().await; }
+            batch_settle().await;
+            check("shortcut");
+            commands::redo(&app);
+            while app.history_busy.get() { batch_settle().await; }
+            batch_settle().await;
+            check("renamed001");
+            assert_eq!(window::visible_selection(&child).selection().size(), 1);
+            app.window.close();
+            std::fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    async fn batch_new_descendant(mode: super::super::ViewMode) {
+        use super::super::{self as window, commands, navigation};
+        let (_application, app, _parent, root) = batch_boundary_fixture().await;
+        window::set_view_mode(&app, mode);
+        std::fs::create_dir(root.join("A/deep")).unwrap();
+        std::fs::write(root.join("A/deep/keep.txt"), "deep").unwrap();
+        let child = open_selected_child(&app, &root.join("A")).await;
+        let items = ["A", "B"].iter().map(|name| Item::read(root.join(name)).unwrap()).collect::<Vec<_>>();
+        let plan = batch::prepare(&items, &Rule::Template(format!("renamed{}", batch::NUMBER_3)), false);
+        let hold = navigation::BatchRename::new(&app, &plan.requests());
+        navigation::go_up(&app, &child);
+        batch_settle().await;
+        navigation::navigate(&app, &child, gio::File::for_path(root.join("A/deep")));
+        batch_settle().await;
+        navigation::select_names(&child, &["keep.txt".into()], || {});
+        let outcome = gio::spawn_blocking(move || plan.apply().unwrap()).await.unwrap();
+        batch_settle().await; // Let monitor events arrive before applying the successful map.
+        hold.finish(&app, Some(&outcome));
+        batch_settle().await;
+        assert_eq!(child.current_dir().unwrap().path().unwrap(), root.join("renamed001/deep"));
+        assert_eq!(commands::selected(&child)[0].0.path().unwrap(), root.join("renamed001/deep/keep.txt"));
+        app.window.close();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_grid_new_descendant_navigation_follows_rename() {
+        glib::MainContext::default().block_on(batch_new_descendant(super::super::ViewMode::Grid));
+    }
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_list_new_descendant_navigation_follows_rename() {
+        glib::MainContext::default().block_on(batch_new_descendant(super::super::ViewMode::List));
+    }
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_columns_new_descendant_navigation_follows_rename() {
+        glib::MainContext::default().block_on(batch_new_descendant(super::super::ViewMode::Columns));
+    }
+
+    async fn batch_replacement_navigation(mode: super::super::ViewMode) {
+        use super::super::{self as window, commands, navigation};
+        let (_application, app, _parent, root) = batch_boundary_fixture().await;
+        window::set_view_mode(&app, mode);
+        std::fs::create_dir(root.join("A/deep")).unwrap();
+        std::fs::write(root.join("A/deep/keep.txt"), "original").unwrap();
+        let child = open_selected_child(&app, &root.join("A")).await;
+        let items = ["A", "B"].iter().map(|name| Item::read(root.join(name)).unwrap()).collect::<Vec<_>>();
+        let plan = batch::prepare(&items, &Rule::Template(format!("renamed{}", batch::NUMBER_3)), false);
+        let hold = navigation::BatchRename::new(&app, &plan.requests());
+        let outcome = gio::spawn_blocking(move || plan.apply().unwrap()).await.unwrap();
+        std::fs::create_dir_all(root.join("A/deep")).unwrap();
+        std::fs::write(root.join("A/deep/replacement.txt"), "replacement").unwrap();
+        navigation::navigate(&app, &child, gio::File::for_path(root.join("A/deep")));
+        batch_settle().await;
+        navigation::select_names(&child, &["replacement.txt".into()], || {});
+        hold.finish(&app, Some(&outcome));
+        batch_settle().await;
+        assert_eq!(child.current_dir().unwrap().path().unwrap(), root.join("A/deep"), "new replacement location was remapped");
+        assert_eq!(commands::selected(&child)[0].0.path().unwrap(), root.join("A/deep/replacement.txt"));
+        if mode == window::ViewMode::Columns {
+            let mut pending = vec![child.columns.widget.clone().upcast::<gtk::Widget>()];
+            let mut headers = Vec::new();
+            while let Some(widget) = pending.pop() {
+                if let Some(view) = widget.downcast_ref::<gtk::ColumnView>() {
+                    let title = view.columns().item(0).and_downcast::<gtk::ColumnViewColumn>().unwrap().title().unwrap().to_string();
+                    if title == root.file_name().unwrap().to_string_lossy() {
+                        let model = view.model().unwrap();
+                        assert_eq!(model.selection().size(), 1);
+                        assert_eq!(model.item(model.selection().minimum()).and_downcast::<gio::FileInfo>().unwrap().name(), std::path::Path::new("A"), "ancestor highlight followed the moved original");
+                    }
+                    headers.push(title);
+                }
+                let mut next = widget.first_child();
+                while let Some(widget) = next { next = widget.next_sibling(); pending.push(widget); }
+            }
+            assert!(headers.contains(&"A".to_string()) && !headers.contains(&"renamed001".to_string()), "replacement ancestors point at original folder: {headers:?}");
+        }
+        assert_eq!(std::fs::read_to_string(root.join("renamed001/deep/keep.txt")).unwrap(), "original");
+        app.window.close();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_grid_keeps_newly_navigated_replacement_directory() {
+        glib::MainContext::default().block_on(batch_replacement_navigation(super::super::ViewMode::Grid));
+    }
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_list_keeps_newly_navigated_replacement_directory() {
+        glib::MainContext::default().block_on(batch_replacement_navigation(super::super::ViewMode::List));
+    }
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_columns_keeps_newly_navigated_replacement_directory() {
+        glib::MainContext::default().block_on(batch_replacement_navigation(super::super::ViewMode::Columns));
+    }
+
+    fn bound_name(root: &gtk::Widget, info: &gio::FileInfo) -> Option<String> {
+        if let Some(image) = root.downcast_ref::<gtk::Image>() {
+            let matches = unsafe { image.data::<gio::FileInfo>("fs-file-info") }.is_some_and(|bound| unsafe { bound.as_ref() } == info);
+            if matches {
+                let mut child = image.parent()?.first_child();
+                while let Some(widget) = child {
+                    if let Some(stack) = widget.downcast_ref::<gtk::Stack>() {
+                        return stack.child_by_name("view").and_downcast::<gtk::Label>().map(|label| label.text().to_string());
+                    }
+                    child = widget.next_sibling();
+                }
+            }
+        }
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            if let Some(text) = bound_name(&widget, info) { return Some(text); }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    async fn batch_row_identity(mode: super::super::ViewMode, symlink: bool, replacement: bool) {
+        use super::super::{self as window, commands, navigation};
+        let (_application, app, _parent, root) = batch_boundary_fixture().await;
+        window::set_view_mode(&app, mode);
+        let source = if symlink {
+            std::os::unix::fs::symlink(root.join("A"), root.join("shortcut")).unwrap();
+            "shortcut"
+        } else { "A" };
+        let items = [source, "B"].iter().map(|name| Item::read(root.join(name)).unwrap()).collect::<Vec<_>>();
+        let plan = batch::prepare(&items, &Rule::Template(format!("renamed{}", batch::NUMBER_3)), false);
+        let requests = plan.requests();
+        let hold = navigation::BatchRename::new(&app, &requests);
+        let mut outcome = batch::Outcome { undo: Vec::new(), failed: Vec::new() };
+        if replacement {
+            let first = vec![requests[0].clone()];
+            outcome = gio::spawn_blocking(move || batch::run(&first)).await.unwrap();
+            assert_eq!(outcome.undo.len(), 1);
+            if symlink { std::os::unix::fs::symlink(root.join("A"), root.join(source)).unwrap(); }
+            else {
+                std::fs::create_dir(root.join(source)).unwrap();
+                std::fs::write(root.join(source).join("replacement.txt"), "replacement").unwrap();
+            }
+        }
+        navigation::new_tab(&app, gio::File::for_path(&root), true);
+        let fresh = navigation::active_tab(&app);
+        batch_settle().await;
+        while fresh.current_source().is_loading() { batch_settle().await; }
+        let model = window::visible_selection(&fresh);
+        let position = (0..model.n_items()).find(|&i| model.item(i).and_downcast::<gio::FileInfo>().is_some_and(|info| info.name() == std::path::Path::new(source))).unwrap();
+        let chosen = model.item(position).and_downcast::<gio::FileInfo>().unwrap();
+        model.select_item(position, true);
+        let remaining = requests[usize::from(replacement)..].to_vec();
+        let later = gio::spawn_blocking(move || batch::run(&remaining)).await.unwrap();
+        outcome.undo.extend(later.undo); outcome.failed.extend(later.failed);
+        hold.finish(&app, Some(&outcome));
+        batch_settle().await; batch_settle().await;
+        let expected = if replacement { source } else { "renamed001" };
+        let selected: Vec<_> = commands::selected(&fresh).iter().map(|(file, _)| file.path().unwrap()).collect();
+        assert_eq!(selected, [root.join(expected)], "batch selected the wrong directory entry");
+        assert_eq!(chosen.display_name(), expected);
+        assert_eq!(bound_name(fresh.view_stack.upcast_ref(), &chosen).as_deref(), Some(expected));
+        commands::set_clipboard(&app, false);
+        let copied = Rc::new(RefCell::new(None)); let received = copied.clone();
+        commands::read_clipboard_files(&app.window.clipboard(), move |cut, paths| { assert!(!cut); *received.borrow_mut() = Some(paths); });
+        batch_settle().await;
+        assert_eq!(*copied.borrow(), Some(vec![root.join(expected)]));
+        assert!(root.join("renamed001/keep.txt").is_file());
+        if replacement {
+            if symlink {
+                assert!(std::fs::symlink_metadata(root.join(source)).unwrap().file_type().is_symlink());
+                assert_eq!(std::fs::read_link(root.join(source)).unwrap(), root.join("A"));
+            } else { assert_eq!(std::fs::read_to_string(root.join("A/replacement.txt")).unwrap(), "replacement"); }
+        }
+        app.window.close(); std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_grid_replacement_row_is_not_retargeted() {
+        glib::MainContext::default().block_on(batch_row_identity(super::super::ViewMode::Grid, false, true));
+    }
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_list_replacement_row_is_not_retargeted() {
+        glib::MainContext::default().block_on(batch_row_identity(super::super::ViewMode::List, false, true));
+    }
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_columns_replacement_row_is_not_retargeted() {
+        glib::MainContext::default().block_on(batch_row_identity(super::super::ViewMode::Columns, false, true));
+    }
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_replacement_symlink_uses_entry_not_target_identity() {
+        glib::MainContext::default().block_on(batch_row_identity(super::super::ViewMode::List, true, true));
+    }
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_late_original_rows_keep_identity_and_labels() {
+        glib::MainContext::default().block_on(batch_row_identity(super::super::ViewMode::List, false, false));
+    }
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_late_original_symlink_keeps_identity_and_labels() {
+        glib::MainContext::default().block_on(batch_row_identity(super::super::ViewMode::Columns, true, false));
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG directories"]
+    fn batch_unknown_entry_identity_does_not_authorize_remapping() {
+        use super::super::{self as window, commands, navigation};
+        glib::MainContext::default().block_on(async {
+            let (_application, app, _parent, root) = batch_boundary_fixture().await;
+            window::set_view_mode(&app, window::ViewMode::List);
+            let items = ["A", "B"].iter().map(|name| Item::read(root.join(name)).unwrap()).collect::<Vec<_>>();
+            let requests = batch::prepare(&items, &Rule::Template(format!("renamed{}", batch::NUMBER_3)), false).requests();
+            let hold = navigation::BatchRename::new(&app, &requests);
+            let first = vec![requests[0].clone()];
+            let mut outcome = gio::spawn_blocking(move || batch::run(&first)).await.unwrap();
+            std::fs::create_dir(root.join("A")).unwrap();
+            std::fs::write(root.join("A/replacement.txt"), "replacement").unwrap();
+            navigation::new_tab(&app, gio::File::for_path(&root), true);
+            let fresh = navigation::active_tab(&app);
+            batch_settle().await;
+            while fresh.current_source().is_loading() { batch_settle().await; }
+            let model = window::visible_selection(&fresh);
+            let position = (0..model.n_items()).find(|&i| model.item(i).and_downcast::<gio::FileInfo>().is_some_and(|info| info.name() == std::path::Path::new("A"))).unwrap();
+            let unknown = model.item(position).and_downcast::<gio::FileInfo>().unwrap();
+            unknown.remove_attribute("unix::device"); unknown.remove_attribute("unix::inode");
+            model.select_item(position, true);
+            let rest = requests[1..].to_vec();
+            let later = gio::spawn_blocking(move || batch::run(&rest)).await.unwrap();
+            outcome.undo.extend(later.undo); outcome.failed.extend(later.failed);
+            hold.finish(&app, Some(&outcome));
+            batch_settle().await;
+            assert!(commands::selected(&fresh).is_empty(), "ambiguous identity retained an actionable selection");
+            assert_eq!(unknown.display_name(), "A", "unknown row was renamed by URI alone");
+            assert_eq!(std::fs::read_to_string(root.join("A/replacement.txt")).unwrap(), "replacement");
+            assert!(root.join("renamed001/keep.txt").is_file());
+            app.window.close(); std::fs::remove_dir_all(root).unwrap();
+        });
     }
 
     #[test]

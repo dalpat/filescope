@@ -258,6 +258,9 @@ impl Plan {
 }
 
 impl Rename {
+    /// The directory entry captured by the plan, including a symlink's own inode.
+    pub(crate) fn entry_identity(&self) -> (u64, u64) { (self.expected.dev, self.expected.ino) }
+
     fn check(&self) -> Result<(), String> {
         let now = Stamp::read(&self.from)?;
         if !self.expected.same_file(&now) || (self.snapshot && now != self.expected) {

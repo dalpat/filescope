@@ -22,6 +22,10 @@ mod search;
 mod terminal;
 mod trash_view;
 mod view;
+#[cfg(test)]
+mod preview_tests;
+#[cfg(test)]
+mod operation_tests;
 
 
 const CSS: &str = "
@@ -75,7 +79,7 @@ row:hover .bookmark-x,
 .fs-terminal-bar button { min-height: 0; min-width: 0; padding: 4px; }
 ";
 
-const ATTRS: &str = "standard::*,time::modified,unix::mode,thumbnail::path,thumbnail::is-valid";
+const ATTRS: &str = "standard::*,time::modified,unix::mode,unix::device,unix::inode,thumbnail::path,thumbnail::is-valid";
 
 /// Zoom bounds for the grid icon size (pixels); list scales at a quarter.
 const ZOOM_MIN: i32 = 48;
@@ -207,6 +211,7 @@ struct App {
     history_busy: Cell<bool>,
     /// New actions invalidate Redo even when a history worker is still running.
     history_generation: Cell<u64>,
+    pending_renames: RefCell<Vec<std::rc::Weak<navigation::RenameScope>>>,
 }
 
 const STATE_KEY: &str = "filescope-state";
@@ -422,6 +427,7 @@ fn build(app: &adw::Application) {
         redo_stack: RefCell::new(Vec::new()),
         history_busy: Cell::new(false),
         history_generation: Cell::new(0),
+        pending_renames: RefCell::new(Vec::new()),
     });
 
     install_actions(app, &state);
@@ -952,11 +958,12 @@ fn update_chrome(app: &Rc<App>) {
 
 fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
     let trash = tab.view_stack.visible_child_name().as_deref() == Some("trash");
-    let count = visible_selection(tab).selection().size();
+    let busy = navigation::batch_busy(tab);
+    let count = if busy { 0 } else { visible_selection(tab).selection().size() };
     let has_sel = count > 0 && !trash;
     let one = count == 1 && !trash;
     let has_clip = clipboard_has_files(app);
-    let folder = !tab.search.active.get() && !trash;
+    let folder = !tab.search.active.get() && !trash && !busy;
     // "Extract Here" only makes sense when everything selected is an archive.
     // Open With and Preview only apply to a single file, not a folder.
     let sel = commands::selected(tab);
@@ -973,6 +980,7 @@ fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
         ("delete", has_sel), ("properties", one),
         ("extract", all_archives && folder), ("compress", has_sel && folder),
         ("new-folder", folder), ("open-containing-folder", one && !folder),
+        ("bookmark", !busy), ("open-terminal", !busy),
         ("sort", folder), ("sort-descending", folder),
         ("undo", !app.history_busy.get() && !app.undo_stack.borrow().is_empty()),
         ("redo", !app.history_busy.get() && !app.redo_stack.borrow().is_empty()),
