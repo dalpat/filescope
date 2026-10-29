@@ -259,6 +259,24 @@ pub(super) fn set_clipboard(app: &Rc<super::App>, cut: bool) {
     super::toast(app, &format!("{} {n} item{}", if cut { "Cut" } else { "Copied" }, super::plural(n)));
 }
 
+/// Copy plain paths, one per line, for the selection or the current folder.
+pub(super) fn copy_path(app: &Rc<super::App>, current_folder: bool) {
+    let tab = super::navigation::active_tab(app);
+    let files: Vec<gio::File> = if current_folder {
+        tab.current_dir().into_iter().collect()
+    } else {
+        selected(&tab).into_iter().map(|(file, _)| file).collect()
+    };
+    let paths: Vec<String> = files.iter().map(|file| {
+        file.path().and_then(|path| path.to_str().map(str::to_owned))
+            .unwrap_or_else(|| file.uri().to_string())
+    }).collect();
+    if paths.is_empty() { return; }
+    app.window.clipboard().set_text(&paths.join("\n"));
+    super::update_chrome(app);
+    super::toast(app, &format!("Copied {} path{}", paths.len(), super::plural(paths.len())));
+}
+
 /// Read file URIs (and the cut/copy intent) currently on the clipboard, then
 /// invoke `done`. Reads GNOME's format if present (for the intent), else the URI
 /// list. Everything is async — the clipboard read never blocks the UI.

@@ -762,6 +762,8 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     action!("open-containing-folder", commands::open_containing_folder);
     action!("preview", commands::toggle_preview);
     action!("copy", |s: &Rc<App>| commands::set_clipboard(s, false));
+    action!("copy-path", |s: &Rc<App>| commands::copy_path(s, false));
+    action!("copy-folder-path", |s: &Rc<App>| commands::copy_path(s, true));
     action!("cut", |s: &Rc<App>| commands::set_clipboard(s, true));
     action!("paste", commands::paste);
     action!("rename", commands::rename_selected);
@@ -1038,6 +1040,8 @@ fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
     for (name, enabled) in [
         ("open", has_sel), ("open-with", single_file), ("preview", single_file), ("cut", has_sel),
         ("copy", has_sel), ("paste", has_clip && folder), ("rename", has_sel && tab.view_stack.visible_child_name().as_deref() != Some("computer")), ("trash", has_sel),
+        ("copy-path", has_sel),
+        ("copy-folder-path", folder && tab.current_dir().is_some() && tab.view_stack.visible_child_name().as_deref() != Some("computer")),
         ("delete", has_sel), ("properties", one),
         ("extract", all_archives && folder), ("compress", has_sel && folder),
         ("new-folder", folder), ("open-containing-folder", one && !folder),
@@ -1094,6 +1098,7 @@ fn context_menu_for(app: &Rc<App>, on_item: bool) -> gio::Menu {
         }
         primary.append(Some("Cut"), Some("win.cut"));
         primary.append(Some("Copy"), Some("win.copy"));
+        primary.append(Some("Copy Path"), Some("win.copy-path"));
         if has_clip {
             primary.append(Some("Paste"), Some("win.paste"));
         }
@@ -1121,6 +1126,7 @@ fn context_menu_for(app: &Rc<App>, on_item: bool) -> gio::Menu {
         menu.append_section(None, &folder);
 
         let place = gio::Menu::new();
+        place.append(Some("Copy Path"), Some("win.copy-folder-path"));
         place.append(Some("Open Terminal Here"), Some("win.open-terminal"));
         place.append(Some("Bookmark This Folder"), Some("win.bookmark"));
         menu.append_section(None, &place);

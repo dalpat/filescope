@@ -93,6 +93,8 @@ Built with **Rust + GTK4 + libadwaita**.
 - **File operations** — copy, cut, paste, rename, new folder, move-to-Trash,
   permanent delete, properties, open, open-with, and **Open Terminal Here**
   (`Ctrl+.`) — from the toolbar, right-click menu, or keyboard.
+  Right-click → **Copy Path** copies full paths as text, one per selected item;
+  right-click empty space to copy the current folder's path.
 - **Background operations** — copy / move / delete run on a worker thread with a
   live **progress bar** and **Cancel**, so the window never freezes on a big
   transfer. Name clashes raise a **conflict dialog** (Replace / Skip / Keep Both,

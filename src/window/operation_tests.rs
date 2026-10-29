@@ -215,6 +215,133 @@ async fn operation_continuity(mode: ViewMode) {
 
 #[test]
 #[ignore = "requires isolated GTK and temporary XDG directories"]
+fn copy_path_uses_selection_or_background_folder_in_every_view() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    fn menu_contains(model: &gio::MenuModel, action: &str) -> bool {
+        (0..model.n_items()).any(|index| {
+            model.item_attribute_value(index, "action", None)
+                .and_then(|value| value.get::<String>()).as_deref() == Some(action)
+                || model.item_link(index, "section")
+                    .is_some_and(|section| menu_contains(&section, action))
+        })
+    }
+    assert!(std::env::var_os("XDG_CONFIG_HOME").is_some());
+    adw::init().unwrap();
+    gtk::Settings::default().unwrap().set_gtk_enable_animations(false);
+    let application = adw::Application::builder()
+        .application_id("dev.filescope.CopyPathTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    application.register(gio::Cancellable::NONE).unwrap();
+    let root = std::env::temp_dir().join(format!("filescope-copy-path-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("folder with spaces")).unwrap();
+    std::fs::write(root.join("notes résumé #1.txt"), "notes").unwrap();
+    let raw_dir = root.join("folder with spaces").join(OsString::from_vec(b"folder-\xff".to_vec()));
+    std::fs::create_dir(&raw_dir).unwrap();
+    let raw_files = [b"report-\xff.txt", b"report-\xfe.txt"].map(|name| raw_dir.join(OsString::from_vec(name.to_vec())));
+    for file in &raw_files { std::fs::write(file, "raw filename").unwrap(); }
+
+    glib::MainContext::default().block_on(async {
+        open_files(&application, &[gio::File::for_path(&root)]);
+        let app = app_state(&application).unwrap();
+        let tab = navigation::active_tab(&app);
+        let clipboard = app.window.clipboard();
+        for mode in [ViewMode::Grid, ViewMode::List, ViewMode::Columns] {
+            set_view_mode(&app, mode);
+            let model = visible_selection(&tab);
+            until(|| !tab.current_source().is_loading() && model.n_items() == 2).await;
+            model.select_item(pos(&model, "notes résumé #1.txt"), true);
+            update_chrome(&app);
+
+            let menu = context_menu_for(&app, true);
+            assert!(menu_contains(menu.upcast_ref(), "win.copy-path"));
+            assert!(!menu_contains(menu.upcast_ref(), "win.copy-folder-path"));
+            commands::set_clipboard(&app, false);
+            assert!(clipboard_has_files(&app));
+            let copy_path = app.window.lookup_action("copy-path").unwrap();
+            assert!(copy_path.is_enabled());
+            copy_path.activate(None);
+            assert_eq!(
+                clipboard.read_text_future().await.unwrap().unwrap().as_str(),
+                root.join("notes résumé #1.txt").to_str().unwrap()
+            );
+            assert!(!clipboard_has_files(&app), "Copy Path must replace file-copy data with text");
+            assert!(!app.window.lookup_action("paste").unwrap().is_enabled());
+
+            model.select_all();
+            update_chrome(&app);
+            copy_path.activate(None);
+            assert_eq!(
+                clipboard.read_text_future().await.unwrap().unwrap().as_str(),
+                format!("{}\n{}", root.join("folder with spaces").display(), root.join("notes résumé #1.txt").display())
+            );
+
+            let menu = context_menu_for(&app, false);
+            assert!(menu_contains(menu.upcast_ref(), "win.copy-folder-path"));
+            assert!(!menu_contains(menu.upcast_ref(), "win.copy-path"));
+            let folder_path = app.window.lookup_action("copy-folder-path").unwrap();
+            assert!(folder_path.is_enabled());
+            folder_path.activate(None);
+            assert_eq!(
+                clipboard.read_text_future().await.unwrap().unwrap().as_str(),
+                root.to_str().unwrap(), "background must ignore the selection"
+            );
+
+            model.select_item(pos(&model, "folder with spaces"), true);
+            update_chrome(&app);
+            copy_path.activate(None);
+            assert_eq!(
+                clipboard.read_text_future().await.unwrap().unwrap().as_str(),
+                root.join("folder with spaces").to_str().unwrap()
+            );
+            model.unselect_all();
+            update_chrome(&app);
+            assert!(!copy_path.is_enabled());
+            assert!(folder_path.is_enabled());
+            folder_path.activate(None);
+            assert_eq!(clipboard.read_text_future().await.unwrap().unwrap().as_str(), root.to_str().unwrap());
+
+            navigation::navigate(&app, &tab, gio::File::for_path(&raw_dir));
+            let raw_model = visible_selection(&tab);
+            until(|| !tab.current_source().is_loading() && raw_model.n_items() == 2).await;
+            for file in &raw_files {
+                let position = (0..raw_model.n_items()).find(|&i| {
+                    raw_model.item(i).and_downcast::<gio::FileInfo>()
+                        .is_some_and(|info| raw_dir.join(info.name()) == *file)
+                }).unwrap();
+                raw_model.select_item(position, true);
+                update_chrome(&app);
+                assert!(copy_path.is_enabled());
+                copy_path.activate(None);
+                let copied = clipboard.read_text_future().await.unwrap().unwrap();
+                assert_eq!(copied.as_str(), gio::File::for_path(file).uri().as_str(), "Copy Path must preserve raw filename bytes");
+                assert_eq!(gio::File::for_uri(&copied).path().as_ref(), Some(file));
+            }
+            assert!(folder_path.is_enabled());
+            folder_path.activate(None);
+            let copied = clipboard.read_text_future().await.unwrap().unwrap();
+            assert_eq!(copied.as_str(), gio::File::for_path(&raw_dir).uri().as_str(), "Copy Path must preserve raw folder bytes");
+            assert_eq!(gio::File::for_uri(&copied).path().as_ref(), Some(&raw_dir));
+            navigation::navigate(&app, &tab, gio::File::for_path(&root));
+        }
+        places::show_computer(&app, &tab);
+        update_chrome(&app);
+        assert!(!app.window.lookup_action("copy-path").unwrap().is_enabled());
+        assert!(!app.window.lookup_action("copy-folder-path").unwrap().is_enabled());
+        places::show_trash(&app, &tab);
+        update_chrome(&app);
+        assert!(!app.window.lookup_action("copy-path").unwrap().is_enabled());
+        assert!(!app.window.lookup_action("copy-folder-path").unwrap().is_enabled());
+        assert!(!menu_contains(context_menu_for(&app, false).upcast_ref(), "win.copy-folder-path"));
+        app.window.close();
+    });
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "requires isolated GTK and temporary XDG directories"]
 fn grid_operations_preserve_position_focus_and_selection() {
     glib::MainContext::default().block_on(operation_continuity(ViewMode::Grid));
 }
