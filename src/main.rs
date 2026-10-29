@@ -13,6 +13,7 @@ mod fileops;
 mod format;
 mod icon;
 mod ops;
+mod picker;
 mod preview;
 mod settings;
 mod search_provider;
@@ -29,6 +30,16 @@ const APP_ID: &str = "dev.filescope.Filescope";
 fn main() -> gtk::glib::ExitCode {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--update-probe")) {
         return if update::print_probe() { gtk::glib::ExitCode::SUCCESS } else { gtk::glib::ExitCode::FAILURE };
+    }
+    match std::env::args_os().nth(1).as_deref().and_then(std::ffi::OsStr::to_str) {
+        Some("--file-picker-portal") => return picker::run(),
+        Some(option @ ("--enable-file-picker" | "--disable-file-picker")) => {
+            return match gtk::glib::MainContext::default().block_on(picker::config::set_enabled(option == "--enable-file-picker")) {
+                Ok(note) => { println!("{note}"); gtk::glib::ExitCode::SUCCESS }
+                Err(error) => { eprintln!("filescope: {error}"); gtk::glib::ExitCode::FAILURE }
+            };
+        }
+        _ => {}
     }
     // Single instance: a second launch is delivered here as `open` (with the
     // folder) or `activate` (with nothing). Screenshot mode must stay its own

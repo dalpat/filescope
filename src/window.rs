@@ -18,6 +18,7 @@ mod columns;
 mod directory;
 mod navigation;
 mod places;
+pub(crate) mod picker;
 mod search;
 mod terminal;
 mod trash_view;
@@ -858,6 +859,36 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     }
     state.window.add_action(&default_fm);
 
+    let preference = crate::picker::config::is_enabled();
+    let picker = gio::SimpleAction::new_stateful("file-picker", None, &preference.as_ref().is_ok_and(|on| *on).to_variant());
+    if let Err(error) = preference {
+        picker.set_enabled(false);
+        toast(state, &format!("Could not read the Open/Save dialog setting: {error}"));
+    }
+    {
+        let state = Rc::downgrade(state);
+        picker.connect_change_state(move |action, value| {
+            let (Some(state), Some(on)) = (state.upgrade(), value.and_then(|value| value.get::<bool>())) else { return; };
+            action.set_enabled(false);
+            let action = action.clone();
+            let work = BackgroundWork::new(&state);
+            toast(&state, "Applying file picker setting…");
+            glib::MainContext::default().spawn_local(async move {
+                let _work = work;
+                let result = crate::picker::config::set_enabled(on).await;
+                action.set_enabled(true);
+                match result {
+                    Ok(note) => {
+                        action.set_state(&on.to_variant());
+                        toast(&state, &note);
+                    }
+                    Err(error) => toast(&state, &error),
+                }
+            });
+        });
+    }
+    state.window.add_action(&picker);
+
     let toggle = gio::SimpleAction::new_stateful("toggle-hidden", None, &false.to_variant());
     {
         let s = state.clone();
@@ -1229,6 +1260,7 @@ fn primary_menu() -> gio::Menu {
     menu.append_section(None, &b);
     let defaults = gio::Menu::new();
     defaults.append(Some("Default File Manager"), Some("win.default-file-manager"));
+    defaults.append(Some("Use Filescope for Open/Save Dialogs"), Some("win.file-picker"));
     menu.append_section(None, &defaults);
     let c = gio::Menu::new();
     c.append(Some("Check for Updates…"), Some("win.check-updates"));
@@ -1275,6 +1307,91 @@ pub(crate) fn permission_string(mode: u32) -> String {
 mod tests {
     use super::commands::parse_clipboard;
     use super::{ACCELS, GNOME_COPIED, URI_LIST};
+
+    #[test]
+    #[ignore = "requires isolated GTK and temporary XDG configuration/data directories"]
+    fn picker_menu_toggle_persists_restores_and_handles_failure() {
+        use super::*;
+        fn checked(app: &Rc<App>) -> bool { app.window.lookup_action("file-picker").unwrap().state().unwrap().get().unwrap() }
+        fn toggle(app: &Rc<App>) {
+            let action = app.window.lookup_action("file-picker").unwrap();
+            action.activate(None);
+            assert!(!action.is_enabled(), "an apply must not overlap another toggle");
+            assert!(BackgroundWork::active(), "app exit and update restart must wait for the apply");
+            let context = glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while !action.is_enabled() {
+                while context.pending() { context.iteration(false); }
+                assert!(std::time::Instant::now() < deadline, "setting apply timed out");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(app.window.visible_dialog().is_none(), "changing the picker must not ask the user to log out");
+            assert!(!BackgroundWork::active());
+        }
+        fn menu_contains(model: &gio::MenuModel) -> bool {
+            (0..model.n_items()).any(|index| {
+                model.item_attribute_value(index, "action", None).and_then(|value| value.get::<String>()).as_deref() == Some("win.file-picker")
+                    && model.item_attribute_value(index, "label", None).and_then(|value| value.get::<String>()).as_deref() == Some("Use Filescope for Open/Save Dialogs")
+                    || model.item_link(index, "section").is_some_and(|section| menu_contains(&section))
+            })
+        }
+        let config = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").expect("temporary config directory"));
+        let data = PathBuf::from(std::env::var_os("XDG_DATA_HOME").expect("temporary data directory"));
+        assert!(config.starts_with(std::env::temp_dir()) && data.starts_with(std::env::temp_dir()));
+        let descriptors = data.join("xdg-desktop-portal/portals");
+        unsafe {
+            std::env::set_var("XDG_CURRENT_DESKTOP", "FilescopeTest");
+            std::env::set_var("XDG_DESKTOP_PORTAL_DIR", &descriptors);
+            std::env::set_var("GDK_DEBUG", "no-portals");
+            std::env::set_var("ADW_DISABLE_PORTAL", "1");
+        }
+        std::fs::create_dir_all(&descriptors).unwrap();
+        let descriptor = descriptors.join("zz-filescope.portal");
+        std::fs::write(&descriptor, "[portal]\nDBusName=org.freedesktop.impl.portal.desktop.filescope\nInterfaces=org.freedesktop.impl.portal.FileChooser;\n").unwrap();
+        let services = data.join("dbus-1/services"); std::fs::create_dir_all(&services).unwrap();
+        std::fs::write(services.join("org.freedesktop.impl.portal.desktop.filescope.service"), "[D-BUS Service]\nName=org.freedesktop.impl.portal.desktop.filescope\nExec=/tmp/filescope --file-picker-portal\n").unwrap();
+        let portal_dir = config.join("xdg-desktop-portal"); std::fs::create_dir_all(&portal_dir).unwrap();
+        let portal = portal_dir.join("filescopetest-portals.conf");
+        let original = "# keep\n[preferred]\ndefault=gtk;\norg.freedesktop.impl.portal.FileChooser=gtk;\norg.freedesktop.impl.portal.ScreenCast=gnome;\n";
+        std::fs::write(&portal, original).unwrap();
+        std::fs::create_dir_all(config.join("filescope")).unwrap();
+        std::fs::write(config.join("filescope/settings"), "automatic_updates=false\n").unwrap();
+        adw::init().unwrap(); gtk::Settings::default().unwrap().set_gtk_enable_animations(false);
+        let application = adw::Application::builder().application_id("dev.filescope.PickerSettingTest").flags(gio::ApplicationFlags::NON_UNIQUE).build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        open_files(&application, &[gio::File::for_path(&config)]);
+        let app = app_state(&application).unwrap();
+        assert!(menu_contains(primary_menu().upcast_ref()));
+        assert!(!checked(&app));
+        toggle(&app);
+        assert!(checked(&app)); assert!(crate::picker::config::is_enabled().unwrap());
+        app.window.close(); open_files(&application, &[gio::File::for_path(&config)]);
+        let app = app_state(&application).unwrap(); assert!(checked(&app));
+        toggle(&app);
+        assert!(!checked(&app)); assert!(!crate::picker::config::is_enabled().unwrap());
+        assert_eq!(std::fs::read_to_string(&portal).unwrap(), original);
+        toggle(&app);
+        let edited = original.replace("FileChooser=gtk;", "FileChooser=gtk;zz-filescope;").replace("ScreenCast=gnome;", "ScreenCast=kde;");
+        std::fs::write(&portal, &edited).unwrap();
+        app.window.close(); open_files(&application, &[gio::File::for_path(&config)]);
+        let app = app_state(&application).unwrap(); assert!(!checked(&app));
+        toggle(&app);
+        assert!(checked(&app));
+        toggle(&app);
+        assert!(!checked(&app));
+        assert_eq!(std::fs::read_to_string(&portal).unwrap(), edited);
+        std::fs::remove_file(descriptor).unwrap();
+        toggle(&app);
+        assert!(!checked(&app)); assert!(!crate::picker::config::is_enabled().unwrap());
+        assert!(app.window.visible_dialog().is_none()); assert_eq!(std::fs::read_to_string(&portal).unwrap(), edited);
+        let manual = original.replace("FileChooser=gtk;", "FileChooser=zz-filescope;gtk;");
+        std::fs::write(&portal, manual).unwrap();
+        app.window.close(); open_files(&application, &[gio::File::for_path(&config)]);
+        let app = app_state(&application).unwrap(); assert!(checked(&app));
+        toggle(&app);
+        assert!(checked(&app), "a no-op disable must not claim the desktop choice changed");
+        assert!(app.window.visible_dialog().is_none()); app.window.close();
+    }
 
     #[test]
     #[ignore = "requires an isolated graphical session and temporary XDG_CONFIG_HOME"]

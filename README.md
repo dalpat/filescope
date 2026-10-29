@@ -43,6 +43,10 @@ Built with **Rust + GTK4 + libadwaita**.
   are restored next launch.
 - **Tabs** — each tab is an independent folder with its own history and
   breadcrumb (Ctrl+T new, Ctrl+W close).
+- **Optional Open/Save dialogs** — turn on **Use Filescope for Open/Save Dialogs**
+  in the main menu to use Filescope in applications that support the FileChooser
+  portal. Changes apply automatically; turning it off restores your previous
+  chooser. Finish active desktop dialogs or screen sharing before changing it.
 - **GNOME Overview search** — find visible file and folder names under your home
   directory using GNOME's LocalSearch/Tracker index, then open their parent folder
   with the result selected. Results show file-type icons and readable parent paths.
@@ -144,7 +148,7 @@ the VTE runtime package is `libvte-2.91-gtk4-0`; GTK3-only VTE does not satisfy 
 ```sh
 tar -xzf filescope-*-x86_64-linux.tar.gz
 cd filescope-*-x86_64-linux
-./install.sh          # run as yourself; authenticates for GNOME search registration
+./install.sh          # run as yourself; authenticates for shared desktop registrations
 ```
 
 Then search **filescope** in the Activities Overview, or run `filescope`. Prefer
@@ -179,12 +183,15 @@ cargo build --release
 
 This builds the release binary and drops it, a `.desktop` launcher, and the app
 icon under your per-user XDG directories (`~/.local/bin`,
-`~/.local/share/applications`, `~/.local/share/icons`). Only the GNOME search
-registration goes in `/usr/local/share/gnome-shell/search-providers`, because
-GNOME ignores the per-user data directory for providers. Installation and
-uninstallation request administrator authentication for that shared file;
+`~/.local/share/applications`, `~/.local/share/icons`). GNOME search registration
+goes in `/usr/local/share/gnome-shell/search-providers`, because GNOME ignores
+the per-user data directory for providers. Optional file picker discovery goes
+in `/usr/share/xdg-desktop-portal/portals`; installation does not enable it.
+These shared registrations require administrator authentication;
 run the installer as yourself, not with `sudo`. Updates with unchanged
-registration need no authentication. The D-Bus service stays under
+registrations need no authentication. Uninstall restores chooser preferences
+before removing per-user files, and keeps shared portal discovery for other users.
+The D-Bus services stay under
 `$XDG_DATA_HOME/dbus-1/services` (normally `~/.local/share/dbus-1/services`). The
 launcher uses the app's own ID (`dev.filescope.Filescope`) and registers
 filescope as a folder handler, so you can also *Open With → filescope* on a
@@ -196,6 +203,9 @@ folder.
 cargo test
 # Installer regression checks (requires bubblewrap and system Python with PyGObject):
 python3 tests/install.py
+# Automatic chooser switching and recovery on a private bus (requires xdg-desktop-portal and PyGObject):
+cargo build
+/usr/bin/python3 tests/picker_reload.py target/debug/filescope
 # Real index queries against a disposable endpoint (requires tinysparql):
 FILESCOPE_TEST_INDEX=1 GIO_USE_VFS=local dbus-run-session -- cargo test indexed_query_integration -- --ignored --test-threads=1
 # Real thumbnailers and GIO cache pickup (requires glycin, gst-video-thumbnailer, ffmpeg):

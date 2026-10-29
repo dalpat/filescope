@@ -12,7 +12,7 @@
 #   ./install.sh --uninstall  remove it again
 #
 # You can also skip installing entirely and just run ./filescope from here.
-# Only GNOME's search-provider registration needs administrator access.
+# Shared GNOME search and portal discovery registrations need administrator access.
 set -eu
 
 APP_ID="dev.filescope.Filescope"
@@ -33,6 +33,8 @@ ICON_DEST="$ICON_DIR/$APP_ID.svg"
 BIN_DEST="$BIN_DIR/$UPDATE_BINARY"
 SEARCH_DEST="$SEARCH_DIR/$APP_ID.search-provider.ini"
 SERVICE_DEST="$SERVICE_DIR/$APP_ID.service"
+PICKER_SERVICE_DEST="$SERVICE_DIR/org.freedesktop.impl.portal.desktop.filescope.service"
+PICKER_PORTAL_DEST="/usr/share/xdg-desktop-portal/portals/zz-filescope.portal"
 LEGACY_SEARCH_DEST="$DATA_HOME/gnome-shell/search-providers/$APP_ID.search-provider.ini"
 
 # Elevate only the shared registration, never the build or per-user files.
@@ -60,10 +62,22 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "-u" ]; then
         exec 9>> "$BIN_DIR/$UPDATE_LOCK"
         flock -x 9
     fi
+    # Legacy binaries need no picker flag when this user never enabled it.
+    case "${XDG_CONFIG_HOME:-}" in /*) PICKER_CONFIG_HOME="$XDG_CONFIG_HOME" ;; *) PICKER_CONFIG_HOME="$HOME/.config" ;; esac
+    PICKER_RECORD="$PICKER_CONFIG_HOME/filescope/file-picker.json"
+    if [ -e "$PICKER_RECORD" ] || [ -L "$PICKER_RECORD" ]; then
+        [ -x "$BIN_DEST" ] || { echo "Cannot restore file picker preferences: reinstall Filescope before uninstalling." >&2; exit 1; }
+        "$BIN_DEST" --disable-file-picker
+        if [ -e "$PICKER_RECORD" ] || [ -L "$PICKER_RECORD" ]; then
+            echo "File picker preferences were not restored; keeping Filescope installed." >&2
+            exit 1
+        fi
+    fi
     if [ -e "$SEARCH_DEST" ]; then
         as_admin rm -f "$SEARCH_DEST"
     fi
-    rm -f "$DESKTOP_DEST" "$ICON_DEST" "$BIN_DEST" "$LEGACY_SEARCH_DEST" "$SERVICE_DEST"
+    # Shared portal discovery stays for other users; this user's activation is removed.
+    rm -f "$DESKTOP_DEST" "$ICON_DEST" "$BIN_DEST" "$LEGACY_SEARCH_DEST" "$SERVICE_DEST" "$PICKER_SERVICE_DEST"
     rm -f "$BIN_DIR/$UPDATE_RECEIPT" "$BIN_DIR/$UPDATE_BACKUP"
     refresh_caches
     echo "Removed filescope."
@@ -79,7 +93,8 @@ install -m 0644 "$DIR/$APP_ID.svg" "$ICON_DEST"
 sed "s|^Exec=filescope |Exec=$BIN_DEST |" "$DIR/$APP_ID.desktop" > "$DESKTOP_DEST"
 chmod 0644 "$DESKTOP_DEST"
 SEARCH_TEMP=$(mktemp)
-trap 'rm -f "$SEARCH_TEMP"' EXIT HUP INT TERM
+PORTAL_TEMP=$(mktemp)
+trap 'rm -f "$SEARCH_TEMP" "$PORTAL_TEMP"' EXIT HUP INT TERM
 cat > "$SEARCH_TEMP" <<EOF
 [Shell Search Provider]
 DesktopId=$APP_ID.desktop
@@ -89,10 +104,23 @@ Version=2
 EOF
 printf '[D-BUS Service]\nName=%s\nExec="%s" --gapplication-service\n' "$APP_ID" "$BIN_DEST" > "$SERVICE_DEST"
 chmod 0644 "$SERVICE_DEST"
+printf '[D-BUS Service]\nName=org.freedesktop.impl.portal.desktop.filescope\nExec="%s" --file-picker-portal\n' "$BIN_DEST" > "$PICKER_SERVICE_DEST"
+chmod 0644 "$PICKER_SERVICE_DEST"
+cat > "$PORTAL_TEMP" <<EOF
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.filescope
+Interfaces=org.freedesktop.impl.portal.FileChooser;
+UseIn=filescope;
+EOF
 # GNOME scans system data dirs only; XDG_DATA_HOME is ignored for providers.
 if ! cmp -s "$SEARCH_TEMP" "$SEARCH_DEST"; then
     echo "Registering GNOME search (administrator authentication required)…"
     as_admin install -D -m 0644 "$SEARCH_TEMP" "$SEARCH_DEST"
+fi
+# Prefix keeps existing gnome/gtk backends first in legacy alphabetical fallback.
+if ! cmp -s "$PORTAL_TEMP" "$PICKER_PORTAL_DEST"; then
+    echo "Registering file picker (administrator authentication required)…"
+    as_admin install -D -m 0644 "$PORTAL_TEMP" "$PICKER_PORTAL_DEST"
 fi
 rm -f "$LEGACY_SEARCH_DEST"
 refresh_caches
@@ -105,6 +133,7 @@ echo "  service  $SERVICE_DEST"
 echo
 echo "Launch it from the Activities Overview (search \"filescope\"), or run: filescope"
 echo "Reopen Settings → Search, then toggle filescope off/on to reload Overview search."
+echo "Optional file picker: turn on 'Use Filescope for Open/Save Dialogs' in the main menu."
 case ":${PATH:-}:" in
     *":$BIN_DIR:"*) : ;;
     *) echo "Note: $BIN_DIR is not on your PATH — add it to run \"filescope\" from a terminal." ;;

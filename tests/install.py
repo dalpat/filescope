@@ -18,13 +18,17 @@ def check_installers():
     service = data / "dbus-1/services" / f"{app_id}.service"
     launcher = data / "applications" / f"{app_id}.desktop"
     binary = Path.home() / ".local/bin/filescope"
+    picker_name = "org.freedesktop.impl.portal.desktop.filescope"
+    picker_service = data / "dbus-1/services" / f"{picker_name}.service"
+    picker_portal = Path("/usr/share/xdg-desktop-portal/portals/zz-filescope.portal")
+    portal_calls = root / "picker-calls.log"
     auth_log = root / "auth.log"
 
-    def run(script, *args, denied=False):
+    def run(script, *args, denied=False, failed=False, environment=None):
         before = auth_log.read_text() if auth_log.exists() else ""
-        result = subprocess.run(["sh", str(script), *args], env={**os.environ, "DENY_AUTH": str(int(denied))},
+        result = subprocess.run(["sh", str(script), *args], env={**os.environ, "DENY_AUTH": str(int(denied)), **(environment or {})},
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        assert (result.returncode != 0) == denied, result.stdout
+        assert (result.returncode != 0) == (denied or failed), result.stdout
         if denied:
             assert auth_log.read_text() != before, "Failure did not reach authentication"
 
@@ -36,6 +40,12 @@ def check_installers():
         run(script)
         assert not legacy.exists()
         assert binary.exists() and launcher.exists() and service.exists()
+        assert picker_service.exists() and picker_portal.exists(), "Picker activation is not installed"
+        assert f'Exec="{binary}" --file-picker-portal' in picker_service.read_text()
+        assert "UseIn=filescope;" in picker_portal.read_text()
+        assert f"DBusName={picker_name}" in picker_portal.read_text()
+        assert "Interfaces=org.freedesktop.impl.portal.FileChooser;" in picker_portal.read_text()
+        assert not (Path.home() / ".config/xdg-desktop-portal").exists(), "Installing must not enable the picker"
         import hashlib
         receipt = binary.with_name(".filescope-install")
         assert hashlib.sha256(binary.read_bytes()).hexdigest() in receipt.read_text().splitlines()
@@ -52,8 +62,45 @@ def check_installers():
         assert auth_log.read_text() == calls
         run(script, "--uninstall", denied=True)
         assert all(p.exists() for p in [provider, service, launcher, binary])
+
+        # Old binaries have no picker flags; an unused picker must not block removal.
+        binary.write_text('#!/bin/sh\n[ "$#" = 0 ] || exit 64\n')
+        binary.chmod(0o755)
         run(script, "--uninstall")
-        assert not any(p.exists() for p in [provider, legacy, service, launcher, binary])
+        assert not any(p.exists() for p in [provider, legacy, service, launcher, binary, picker_service])
+        assert picker_portal.exists(), "One user's uninstall removed shared portal discovery"
+        run(script)
+
+        record = Path.home() / ".config/filescope/file-picker.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text("valid")
+        installed = binary.read_bytes()
+        binary.unlink()
+        run(script, "--uninstall", failed=True)
+        assert all(p.exists() for p in [record, provider, picker_service, service, launcher])
+        binary.write_bytes(installed)
+        binary.chmod(0o644)
+        run(script, "--uninstall", failed=True)
+        assert all(p.exists() for p in [record, provider, picker_service, service, launcher, binary])
+        binary.chmod(0o755)
+        record.write_text("corrupt")
+        run(script, "--uninstall", failed=True)
+        assert all(p.exists() for p in [record, provider, picker_service, service, launcher, binary])
+        record.unlink()
+        record.symlink_to(record.with_name("missing"))
+        run(script, "--uninstall", failed=True)
+        assert record.is_symlink() and binary.exists() and picker_service.exists()
+        record.unlink()
+        record.write_text("valid")
+
+        other_service = root / "other-user" / picker_service.name
+        other_service.parent.mkdir(exist_ok=True)
+        other_service.write_text("other user's activation")
+        descriptor = picker_portal.read_text()
+        run(script, "--uninstall", environment={"XDG_CONFIG_HOME": "relative-config-is-ignored"})
+        assert not any(p.exists() for p in [record, provider, legacy, service, launcher, binary, picker_service])
+        assert picker_portal.read_text() == descriptor and other_service.read_text() == "other user's activation"
+        assert "disable" in portal_calls.read_text(), "Uninstall did not restore the previous chooser"
         run(script, "--uninstall")
         print(f"PASS {script.parent.name}: discovery, migration, reinstall, uninstall, denied authentication")
 
@@ -65,7 +112,7 @@ if __name__ == "__main__":
         repo = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(prefix="filescope-install-") as directory:
             work = Path(directory)
-            for name in ["home", "share", "data", "bin", "source/data/icons", "source/target/release", "source/packaging", "bundle"]:
+            for name in ["home", "share", "portals", "data", "bin", "source/data/icons", "source/target/release", "source/packaging", "bundle"]:
                 (work / name).mkdir(parents=True)
             shutil.copy(__file__, work / "check.py")
             shutil.copy(repo / "install.sh", work / "source/install.sh")
@@ -79,7 +126,16 @@ if __name__ == "__main__":
             for dest in ["source/data/icons", "bundle"]:
                 shutil.copy(repo / f"data/icons/{app_id}.svg", work / dest)
             for dest in ["source/target/release/filescope", "bundle/filescope", "bin/cargo"]:
-                (work / dest).write_text("#!/bin/sh\nexit 0\n")
+                (work / dest).write_text('''#!/bin/sh
+if [ "${1:-}" = --disable-file-picker ]; then
+    echo disable >> picker-calls.log
+    case "${XDG_CONFIG_HOME:-}" in /*) config_root="$XDG_CONFIG_HOME" ;; *) config_root="$HOME/.config" ;; esac
+    record="$config_root/filescope/file-picker.json"
+    [ ! -L "$record" ] && [ "$(cat "$record")" = valid ] || exit 1
+    rm "$record"
+fi
+exit 0
+''')
                 (work / dest).chmod(0o755)
             # Substitute only authentication, and restrict the elevated command scope.
             for tool in ["pkexec", "sudo"]:
@@ -89,7 +145,7 @@ set -eu
 echo "$*" >> auth.log
 [ "$DENY_AUTH" = 0 ] || exit 1
 case "$*" in
-  "install -D -m 0644 "*" /usr/local/share/gnome-shell/search-providers/dev.filescope.Filescope.search-provider.ini"|"rm -f /usr/local/share/gnome-shell/search-providers/dev.filescope.Filescope.search-provider.ini") exec "$@" ;;
+  "install -D -m 0644 "*" /usr/local/share/gnome-shell/search-providers/dev.filescope.Filescope.search-provider.ini"|"rm -f /usr/local/share/gnome-shell/search-providers/dev.filescope.Filescope.search-provider.ini"|"install -D -m 0644 "*" /usr/share/xdg-desktop-portal/portals/zz-filescope.portal"|"rm -f /usr/share/xdg-desktop-portal/portals/zz-filescope.portal") exec "$@" ;;
   *) echo "unexpected privileged command: $*" >&2; exit 2 ;;
 esac
 ''')
@@ -98,9 +154,11 @@ esac
                 "bwrap", "--ro-bind", "/", "/", "--dev", "/dev",
                 "--bind", str(work), str(work), "--bind", str(work / "home"), str(Path.home()),
                 "--bind", str(work / "share"), "/usr/local/share", "--chdir", str(work),
+                "--bind", str(work / "portals"), "/usr/share/xdg-desktop-portal/portals",
                 "--setenv", "FILESCOPE_INSTALL_TEST", "1",
                 "--setenv", "TMPDIR", str(work),
                 "--setenv", "XDG_DATA_HOME", str(work / "data"),
+                "--setenv", "XDG_CONFIG_HOME", str(Path.home() / ".config"),
                 "--setenv", "XDG_DATA_DIRS", "/usr/local/share:/usr/share",
                 "--setenv", "PATH", f"{work}/bin:/usr/bin:/bin",
                 "/usr/bin/python3", str(work / "check.py"),
