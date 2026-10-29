@@ -38,6 +38,9 @@ def package(binary: Path, output: Path):
             "update-layout": root / "packaging/update-layout",
             "dev.filescope.Filescope.desktop": root / "data/dev.filescope.Filescope.desktop",
             "dev.filescope.Filescope.svg": root / "data/icons/dev.filescope.Filescope.svg",
+            "README.md": root / "README.md",
+            "CHANGELOG.md": root / "CHANGELOG.md",
+            "LICENSE": root / "LICENSE",
         }
         try:
             with archive.open("xb") as destination:

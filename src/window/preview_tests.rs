@@ -5,7 +5,6 @@ use std::time::Duration;
 async fn settle() {
     glib::timeout_future(Duration::from_millis(200)).await;
     // Broadway can defer frames without a visible client; still exercise native GTK allocation.
-    let context = glib::MainContext::default();
     for _ in 0..3 {
         for widget in gtk::Window::list_toplevels() {
             if widget.is_visible() && widget.width() > 0 {
@@ -13,12 +12,8 @@ async fn settle() {
                 widget.allocate(widget.width(), widget.height(), -1, None);
             }
         }
-        for _ in 0..25 {
-            if !context.pending() {
-                break;
-            }
-            context.iteration(false);
-        }
+        // Let queued work run after this future leaves the executor.
+        glib::timeout_future(Duration::from_millis(10)).await;
     }
 }
 

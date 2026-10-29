@@ -85,6 +85,10 @@ Built with **Rust + GTK4 + libadwaita**.
   images and file details more room. Text stays unwrapped unless you turn on
   **Wrap**; long unwrapped lines scroll horizontally. Images fit the width and
   reload at a suitable resolution. Each tab keeps its pane width when hidden.
+- **Terminal pane** (`Ctrl+Backtick`) — keep a shell inside each tab. Ctrl+click
+  paths and web links in its output, or use their context menu. Paths open in
+  the owning tab while the shell keeps its working directory. Hiding the pane
+  retains the session; closing the tab stops it.
 - **This PC** — a Windows-Explorer-style drives overview with a capacity bar and
   "X free of Y" for each volume.
 - **Mount & unmount drives** — click an unmounted partition to mount it; NTFS
@@ -95,6 +99,10 @@ Built with **Rust + GTK4 + libadwaita**.
   (`Ctrl+.`) — from the toolbar, right-click menu, or keyboard.
   Right-click → **Copy Path** copies full paths as text, one per selected item;
   right-click empty space to copy the current folder's path.
+- **Batch rename** — select several files and press F2 for a live naming preview.
+  Use numbering, literal find/replace, or text around the original-name token;
+  extensions are preserved by default. Conflicts are checked before applying,
+  and one Undo restores the successful changes together.
 - **Background operations** — copy / move / delete run on a worker thread with a
   live **progress bar** and **Cancel**, so the window never freezes on a big
   transfer. Name clashes raise a **conflict dialog** (Replace / Skip / Keep Both,
@@ -126,6 +134,7 @@ Built with **Rust + GTK4 + libadwaita**.
 | `Enter` / double-click | Open |
 | `Space` | Preview (Quick Look) |
 | `Ctrl+Shift+P` | Toggle preview pane |
+| `Ctrl+Backtick` | Toggle terminal pane |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / Cut / Paste |
 | `F2` | Rename (in place, on the item) |
 | `Delete` / `Shift+Delete` | Trash / Delete permanently |
@@ -144,7 +153,7 @@ Built with **Rust + GTK4 + libadwaita**.
 
 Grab the latest tarball from the [**Releases**](../../releases) page and run its
 installer. The x86_64 Linux build requires glibc 2.39+, GTK 4.16+, libadwaita 1.5+,
-and VTE's GTK4 library (VTE 0.65+) — **no compiler, no Rust, no `-dev` packages**. On Debian/Ubuntu,
+and VTE's GTK4 library (VTE 0.70+) — **no compiler, no Rust, no `-dev` packages**. On Debian/Ubuntu,
 the VTE runtime package is `libvte-2.91-gtk4-0`; GTK3-only VTE does not satisfy it:
 
 ```sh
@@ -156,6 +165,10 @@ cd filescope-*-x86_64-linux
 Then search **filescope** in the Activities Overview, or run `filescope`. Prefer
 not to install? Just run `./filescope` from the extracted folder. Remove it with
 `./install.sh --uninstall`.
+
+Upgrading from the published 0.6.0 build? Run the new tarball's installer once
+to gain in-app updates and optional file-picker registration. The picker stays
+disabled until you enable it from the main menu. In-app updates require `curl`.
 
 > Mounting **NTFS** drives via the fallback path uses `ntfs-3g` (and `pkexec` for
 > the auth prompt) — install the `ntfs-3g` package if your distro doesn't ship it.

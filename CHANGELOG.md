@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.7.0] - 2026-10-29
+
+Column browsing, batch rename, optional Open/Save dialogs, and verified updates.
+
+### Added
+- **Columns view** with resizable columns, keyboard navigation, and file actions
+  tied to the focused column. View choice is remembered across launches.
+- **Batch rename** for multiple selections with live previews, numbering,
+  literal find/replace, extension preservation, and grouped Undo/Redo.
+  Invalid names, occupied destinations, and changed files are checked before
+  renaming; partial failures remain retryable.
+- **Optional Open/Save dialogs** through the FileChooser portal. Enable
+  **Use Filescope for Open/Save Dialogs** from the main menu; changes apply
+  without a logout and disabling restores the previous chooser. Compatible
+  applications can select files or folders and save with overwrite confirmation.
+- **In-app update checks** with release notes and installation approval.
+  Downloads are verified before replacing registered per-user installations;
+  restart waits for transfers, background jobs, and retained terminal shells.
+- **Copy Path** in file and folder context menus, including background-folder
+  paths and multiple selected files.
+
+### Changed
+- **Trash** uses the shared grid/list appearance, zoom, and rectangle selection.
+  Restore acts on selected entries and preserves the identity of duplicate names.
+- **Terminal interactions** support Ctrl+click and context-menu actions on
+  paths and web links, including quoted and Unicode filenames. File paths open
+  in the owning tab without changing the shell's working directory.
+- **Preview pane** has a draggable divider and optional text wrapping.
+  Each tab retains its preview width; images reload at a suitable resolution.
+
+### Fixed
+- Rename, batch rename, and Undo/Redo preserve open descendants, column paths,
+  search scopes, and newer navigation or selection, including symlinked paths.
+- Directory updates refresh rendered metadata without discarding inline edits
+  or retaining closed views.
+- Closed-window background work still blocks update restart; late conflict
+  dialogs cancel safely instead of leaving their workers waiting.
+- Failed Trash restores retain their source and metadata. Partial copies keep
+  private permissions, and unsupported special files are rejected safely.
+- Terminal shutdown releases shells, including sessions still starting or
+  ignoring normal shutdown signals.
+
+### Installation
+- Published **0.6.0 builds need the new tarball installer once** to gain in-app
+  updates and optional file-picker registration. Installing does not enable the
+  picker; choose it from the menu when wanted.
+- Runtime requirements: **glibc 2.39+, GTK 4.16+, libadwaita 1.5+, and VTE GTK4
+  0.70+**. `curl` is required for in-app update downloads.
+- The release remains an x86_64 Linux tarball. Network/cloud drives and
+  deb/rpm/Flatpak distribution are deferred to 0.8.0.
+
 ## [0.6.0] - 2026-10-21
 
 Indexed search, a preview pane, and a terminal inside each tab.
