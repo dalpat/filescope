@@ -21,9 +21,30 @@ pub struct Entry {
 
 /// The user's home trash: `$XDG_DATA_HOME/Trash` (i.e. `~/.local/share/Trash`).
 pub fn home_trash() -> PathBuf {
+    if let Some(host) = flatpak_host_data() { return host.join("Trash"); }
     let mut dir = gtk::glib::user_data_dir();
     dir.push("Trash");
     dir
+}
+
+pub(crate) fn is_flatpak() -> bool {
+    std::env::var_os("FLATPAK_ID").as_deref() == Some(std::ffi::OsStr::new(crate::APP_ID))
+}
+
+fn flatpak_host_data() -> Option<PathBuf> {
+    if !is_flatpak() { return None; }
+    std::env::var_os("HOST_XDG_DATA_HOME").map(PathBuf::from).filter(|path| path.is_absolute())
+}
+
+/// Run on a worker before portal Trash: revoked host access must not hide Undo data.
+pub fn home_trash_available() -> bool {
+    if !is_flatpak() { return true; }
+    let Some(data) = flatpak_host_data() else { return false };
+    let root = data.join("Trash");
+    let Ok(meta) = fs::symlink_metadata(&root) else { return false };
+    if !meta.is_dir() || std::os::unix::fs::MetadataExt::uid(&meta) != unsafe { libc::getuid() } { return false; }
+    let Ok(path) = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()) else { return false };
+    unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK | libc::X_OK) == 0 }
 }
 
 /// Everything currently in the trash at `root`, newest-recorded first.
@@ -182,6 +203,37 @@ fn percent_decode(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flatpak_home_trash_uses_custom_host_data() {
+        if let Some(expected) = std::env::var_os("FILESCOPE_EXPECTED_TRASH") {
+            assert_eq!(home_trash(), PathBuf::from(expected));
+            if let Ok(available) = std::env::var("FILESCOPE_EXPECTED_TRASH_ACCESS") {
+                assert_eq!(home_trash_available(), available == "true");
+            }
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("filescope-trash-mapping-{}", gtk::glib::uuid_string_random()));
+        let local = root.join("app-data");
+        let host = root.join("custom-host-data");
+        fs::create_dir_all(&local).unwrap();
+        fs::create_dir_all(host.join("Trash")).unwrap();
+        for (flatpak, host_data, expected, available) in [
+            (Some(crate::APP_ID), Some(host.as_path()), host.join("Trash"), true),
+            (None, Some(host.as_path()), local.join("Trash"), true),
+            (Some(crate::APP_ID), Some(Path::new("relative-host-data")), local.join("Trash"), false),
+            (Some(crate::APP_ID), None, local.join("Trash"), false),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "trash::tests::flatpak_home_trash_uses_custom_host_data"])
+                .env("XDG_DATA_HOME", &local).env("FILESCOPE_EXPECTED_TRASH", expected).env("FILESCOPE_EXPECTED_TRASH_ACCESS", available.to_string());
+            if let Some(data) = host_data { child.env("HOST_XDG_DATA_HOME", data); } else { child.env_remove("HOST_XDG_DATA_HOME"); }
+            if let Some(id) = flatpak { child.env("FLATPAK_ID", id); } else { child.env_remove("FLATPAK_ID"); }
+            let result = child.output().unwrap();
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stdout));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     /// Build a trash root containing `name` trashed from `original`.
     fn fake_trash(dir: &Path, name: &str, original: &str, date: &str, body: &[u8]) {
@@ -446,22 +498,29 @@ mod tests {
     }
 
     // Limits and potentially blocking file types must stay out of the test runner.
-    fn isolated_copy_test(name: &str, root: &Path) -> bool {
+    fn isolated_copy_test(name: &str, root: &Path) -> Result<(), String> {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &format!("trash::tests::{name}"), "--nocapture"])
             .env("FILESCOPE_COPY_TEST_ROOT", root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            if let Some(status) = child.try_wait().unwrap() { return status.success(); }
+        // Starting a second copy of this binary can take longer than the copy when the suite is loaded.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() { break status; }
             if std::time::Instant::now() >= deadline {
                 child.kill().unwrap();
-                child.wait().unwrap();
-                eprintln!("{name}: copy blocked instead of returning an error");
-                return false;
+                let _ = child.wait();
+                return Err(format!("{name}: copy blocked instead of returning an error"));
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        };
+        use std::io::Read;
+        let mut output = Vec::new();
+        if let Some(mut stdout) = child.stdout.take() { let _ = stdout.read_to_end(&mut output); }
+        if let Some(mut stderr) = child.stderr.take() { let _ = stderr.read_to_end(&mut output); }
+        if status.success() { Ok(()) } else { Err(format!("{name} child {status}: {}", String::from_utf8_lossy(&output))) }
     }
 
     #[test]
@@ -487,9 +546,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("secret"), vec![b'x'; 8192]).unwrap();
         fs::set_permissions(root.join("secret"), fs::Permissions::from_mode(0o600)).unwrap();
-        let passed = isolated_copy_test("failed_copy_keeps_private_permissions", &root);
+        let result = isolated_copy_test("failed_copy_keeps_private_permissions", &root);
         fs::remove_dir_all(root).unwrap();
-        assert!(passed, "failed copy exposed private contents");
+        result.unwrap_or_else(|error| panic!("{error}"));
     }
 
     #[test]
@@ -508,10 +567,10 @@ mod tests {
         fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(root.join("private/secret"), b"private directory contents").unwrap();
         let socket = std::os::unix::net::UnixListener::bind(root.join("private/socket")).unwrap();
-        let passed = isolated_copy_test("failed_directory_copy_keeps_private_permissions", &root);
+        let result = isolated_copy_test("failed_directory_copy_keeps_private_permissions", &root);
         drop(socket);
         fs::remove_dir_all(root).unwrap();
-        assert!(passed, "failed copy exposed a private directory");
+        result.unwrap_or_else(|error| panic!("{error}"));
     }
 
     #[test]
@@ -531,8 +590,8 @@ mod tests {
         fs::remove_file(root.join("files/events")).unwrap();
         let fifo = std::ffi::CString::new(root.join("files/events").to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        let passed = isolated_copy_test("copy_rejects_named_pipes_without_opening_them", &root);
+        let result = isolated_copy_test("copy_rejects_named_pipes_without_opening_them", &root);
         fs::remove_dir_all(root).unwrap();
-        assert!(passed, "named pipe was opened or converted to a regular file");
+        result.unwrap_or_else(|error| panic!("{error}"));
     }
 }

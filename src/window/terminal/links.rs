@@ -785,7 +785,7 @@ mod gtk_tests {
     #[test]
     #[ignore = "requires an isolated graphical session and temporary XDG_CONFIG_HOME"]
     fn terminal_selection_cancels_after_navigation_and_broken_links_are_revealed() {
-        use super::super::super::{self as window, navigation};
+        use crate::window::{self as window, navigation};
         adw::init().unwrap();
         let application = adw::Application::builder()
             .application_id("dev.filescope.TerminalSelectionTest")
@@ -901,7 +901,7 @@ mod gtk_tests {
     #[test]
     #[ignore = "requires an isolated graphical session and temporary XDG_CONFIG_HOME"]
     fn terminal_reveals_hidden_files_and_cancels_stale_opens() {
-        use super::super::super::{self as window, navigation};
+        use crate::window::{self as window, navigation};
         adw::init().unwrap();
         let application = adw::Application::builder()
             .application_id("dev.filescope.TerminalNavigationTest")
@@ -1094,7 +1094,7 @@ mod gtk_tests {
     #[test]
     #[ignore = "requires an isolated graphical session with SHELL=/bin/sh and temporary XDG_CONFIG_HOME"]
     fn terminal_paths_open_in_the_owning_tab_without_changing_the_shell() {
-        use super::super::super::{self as window, navigation};
+        use crate::window::{self as window, navigation};
         assert!(std::env::var_os("XDG_CONFIG_HOME").is_some());
         adw::init().unwrap();
         let application = adw::Application::builder()

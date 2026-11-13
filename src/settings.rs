@@ -35,6 +35,9 @@ pub struct Settings {
     pub view_mode: ViewMode,
     pub preview_pane: bool,
     pub automatic_updates: bool,
+    pub restore_session: bool,
+    /// Compact recovery data; the recovery module owns its schema.
+    pub session: String,
     pub zoom: i32,
     /// 0 = name, 1 = size, 2 = modified.
     pub sort_key: u8,
@@ -51,6 +54,8 @@ impl Default for Settings {
             view_mode: ViewMode::Grid,
             preview_pane: false,
             automatic_updates: true,
+            restore_session: false,
+            session: String::new(),
             zoom: 80,
             sort_key: 0,
             sort_desc: false,
@@ -96,6 +101,8 @@ impl Settings {
                     }
                 }
                 "automatic_updates" => set(&mut settings.automatic_updates, value.parse().ok()),
+                "restore_session" => set(&mut settings.restore_session, value.parse().ok()),
+                "session" => settings.session = value.to_string(),
                 "preview_pane" => set(&mut settings.preview_pane, value.parse().ok()),
                 "zoom" => set(
                     &mut settings.zoom,
@@ -126,6 +133,8 @@ impl Settings {
             format!("view_mode={}", self.view_mode.name()),
             format!("preview_pane={}", self.preview_pane),
             format!("automatic_updates={}", self.automatic_updates),
+            format!("restore_session={}", self.restore_session),
+            format!("session={}", self.session),
             format!("zoom={}", self.zoom),
             format!("sort_key={}", self.sort_key),
             format!("sort_desc={}", self.sort_desc),
@@ -167,6 +176,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_preferences_round_trip_without_opt_in_default() {
+        assert!(Settings::default().serialize().contains("restore_session=false\n"));
+        let text = "restore_session=true\nsession={\"active\":0,\"tabs\":[{\"place\":\"folder\",\"uri\":\"smb://offline/share/report%20files\",\"preview\":true,\"preview_width\":348}]}\n";
+        let saved = Settings::parse(text).serialize();
+        assert!(saved.contains("restore_session=true\n"));
+        assert!(saved.contains("smb://offline/share/report%20files"));
+        assert!(saved.contains("348"));
+        assert_eq!(Settings::parse(&saved).serialize(), saved);
+    }
+
+    #[test]
     fn old_view_preferences_still_load() {
         assert_eq!(Settings::parse("is_list=true\n").view_mode, ViewMode::List);
         assert_eq!(Settings::parse("is_list=false\n").view_mode, ViewMode::Grid);
@@ -206,6 +226,8 @@ mod tests {
             view_mode: ViewMode::List,
             preview_pane: true,
             automatic_updates: false,
+            restore_session: true,
+            session: String::new(),
             zoom: 128,
             sort_key: 2,
             sort_desc: true,

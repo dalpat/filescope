@@ -401,6 +401,20 @@ impl Pane {
         self.widget.set_visible(visible);
     }
 
+    pub(crate) fn width(&self) -> i32 {
+        if self.widget.is_mapped() && self.widget.width() > 0 {
+            self.widget.width()
+        } else {
+            self.saved_width.get()
+        }
+    }
+
+    pub(crate) fn set_width(self: &Rc<Self>, width: i32) {
+        self.saved_width.set(width.max(MIN_WIDTH));
+        self.restore_width.set(true);
+        self.queue_layout();
+    }
+
     fn queue_layout(self: &Rc<Self>) {
         if self.layout_queued.replace(true) {
             return;

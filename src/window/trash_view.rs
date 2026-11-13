@@ -57,6 +57,10 @@ pub(super) struct Pane {
     grid: gtk::GridView,
     list: gtk::ColumnView,
     zoom: Rc<Cell<i32>>,
+    available: Cell<Option<bool>>,
+    generation: Cell<u64>,
+    restore: gio::SimpleAction,
+    empty_button: gtk::Button,
 }
 
 impl Pane {
@@ -88,6 +92,11 @@ impl Pane {
             .description("Items you delete land here, and can be put back.").build();
         crate::icon::show_status(&empty, "user-trash-symbolic", 128);
         stack.add_named(&empty, Some("empty"));
+        let unavailable = adw::StatusPage::builder().title("Trash Unavailable")
+            .description("Restore access to the host Trash in the application permissions, then reopen Filescope. Files are kept while this access is unavailable.").build();
+        crate::icon::show_status(&unavailable, "dialog-warning-symbolic", 96);
+        stack.add_named(&unavailable, Some("unavailable"));
+        stack.add_named(&adw::StatusPage::builder().title("Checking Trash").build(), Some("loading"));
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let bar = gtk::Box::builder().spacing(12).halign(gtk::Align::End)
             .margin_top(12).margin_bottom(8).margin_start(12).margin_end(12).build();
@@ -95,6 +104,7 @@ impl Pane {
         restore_button.set_action_name(Some("trash.restore"));
         bar.append(&restore_button);
         let empty_button = gtk::Button::with_label("Empty Trash");
+        empty_button.set_sensitive(false);
         empty_button.add_css_class("destructive-action");
         let weak = Rc::downgrade(app);
         empty_button.connect_clicked(move |_| {
@@ -103,9 +113,10 @@ impl Pane {
         bar.append(&empty_button);
         widget.append(&bar);
         widget.append(&stack);
-        let pane = Rc::new(Self { widget, selection: selection.clone(), model, stack, grid, list, zoom });
         let restore = gio::SimpleAction::new("restore", None);
         restore.set_enabled(false);
+        let pane = Rc::new(Self { widget, selection: selection.clone(), model, stack, grid, list, zoom,
+            available: Cell::new(None), generation: Cell::new(0), restore: restore.clone(), empty_button });
         let a = Rc::downgrade(app);
         let t = Rc::downgrade(tab);
         let p = Rc::downgrade(&pane);
@@ -118,9 +129,10 @@ impl Pane {
         actions.add_action(&restore);
         pane.widget.insert_action_group("trash", Some(&actions));
         let weak = Rc::downgrade(app);
+        let current = Rc::downgrade(&pane);
         selection.connect_selection_changed(move |selection, _, _| {
             let count = selection.selection().size();
-            restore.set_enabled(count > 0);
+            restore.set_enabled(count > 0 && current.upgrade().is_some_and(|pane| pane.available.get() == Some(true)));
             restore_button.set_label(&if count == 0 { "Restore".into() } else { format!("Restore ({count})") });
             if let Some(app) = weak.upgrade() { super::update_chrome(&app); }
         });
@@ -131,17 +143,52 @@ impl Pane {
         pane
     }
 
-    pub fn refresh(&self, app: &Rc<super::App>) {
+    pub fn refresh(self: &Rc<Self>, app: &Rc<super::App>) {
         let root = trash::home_trash();
-        let items: Vec<_> = trash::entries_in(&root).iter().map(|entry| item_info(&root, entry)).collect();
+        if !trash::is_flatpak() {
+            let items = trash::entries_in(&root).iter().map(|entry| item_info(&root, entry)).collect();
+            self.finish_refresh(app, Some(items));
+            return;
+        }
+        let generation = self.generation.get().wrapping_add(1);
+        self.generation.set(generation);
+        self.available.set(None);
+        self.restore.set_enabled(false);
+        self.empty_button.set_sensitive(false);
+        self.selection.unselect_all();
+        self.model.remove_all();
+        self.show_mode(app);
+        let pane = Rc::downgrade(self);
+        let app = Rc::downgrade(app);
+        glib::spawn_future_local(async move {
+            let inspected_root = root.clone();
+            let result = gio::spawn_blocking(move || {
+                if !trash::home_trash_available() { return None; }
+                Some(trash::entries_in(&inspected_root))
+            }).await;
+            let (Some(pane), Some(app)) = (pane.upgrade(), app.upgrade()) else { return };
+            if pane.generation.get() != generation || pane.widget.root().is_none() { return; }
+            let items = result.ok().flatten().map(|entries| entries.iter().map(|entry| item_info(&root, entry)).collect());
+            pane.finish_refresh(&app, items);
+            if app.window.is_visible() { super::update_chrome(&app); }
+        });
+    }
+
+    fn finish_refresh(&self, app: &super::App, items: Option<Vec<gio::FileInfo>>) {
+        self.available.set(Some(items.is_some()));
+        self.empty_button.set_sensitive(items.is_some());
         // Storage names can be reused by another file manager between refreshes.
         self.selection.unselect_all();
-        self.model.splice(0, self.model.n_items(), &items);
+        self.model.splice(0, self.model.n_items(), &items.unwrap_or_default());
         self.show_mode(app);
     }
 
     pub fn show_mode(&self, app: &super::App) {
         self.set_zoom(app.zoom.get());
+        if self.available.get() != Some(true) {
+            self.stack.set_visible_child_name(if self.available.get().is_none() { "loading" } else { "unavailable" });
+            return;
+        }
         self.stack.set_visible_child_name(if self.model.n_items() == 0 { "empty" } else if app.view_mode.get() == super::ViewMode::List { "list" } else { "grid" });
     }
 

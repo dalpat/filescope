@@ -13,6 +13,7 @@ mod fileops;
 mod format;
 mod icon;
 mod ops;
+mod path_completion;
 mod picker;
 mod preview;
 mod settings;
@@ -28,6 +29,10 @@ use adw::prelude::*;
 const APP_ID: &str = "dev.filescope.Filescope";
 
 fn main() -> gtk::glib::ExitCode {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--installation-info")) {
+        update::print_installation_info();
+        return gtk::glib::ExitCode::SUCCESS;
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--update-probe")) {
         return if update::print_probe() { gtk::glib::ExitCode::SUCCESS } else { gtk::glib::ExitCode::FAILURE };
     }

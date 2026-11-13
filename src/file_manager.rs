@@ -90,7 +90,7 @@ pub fn release(app: &adw::Application) {
         "/org/freedesktop/DBus",
         "org.freedesktop.DBus",
         "ReleaseName",
-        Some(&BUS_NAME.to_variant()),
+        Some(&(BUS_NAME,).to_variant()),
         None,
         gio::DBusCallFlags::NONE,
         -1,
@@ -115,9 +115,9 @@ fn export_object(app: &adw::Application, bus: &gio::DBusConnection) -> Result<()
             match method {
                 "ShowFolders" => {
                     if let Some((uris, _)) = uris_of(&params) {
-                        let targets = folders_from_uris(&uris);
+                        let files = folders_from_uris(&uris);
                         let app = app.clone();
-                        glib::idle_add_local_once(move || crate::window::open_targets(&app, &targets));
+                        glib::idle_add_local_once(move || crate::window::open_files(&app, &files));
                     }
                     invocation.return_value(Some(&().to_variant()));
                 }
@@ -183,16 +183,19 @@ fn uris_of(params: &glib::Variant) -> Option<(Vec<String>, String)> {
 }
 
 /// Folders to open for `ShowFolders`. A file URI opens its parent.
-pub fn folders_from_uris(uris: &[String]) -> Vec<Target> {
+pub fn folders_from_uris(uris: &[String]) -> Vec<gio::File> {
     uris.iter()
-        .filter_map(|uri| file_uri_to_path(uri))
-        .map(|path| {
-            let dir = if path.is_file() {
-                path.parent().map(Path::to_path_buf).unwrap_or(path)
+        .map(|uri| {
+            let file = if uri.starts_with('/') {
+                gio::File::for_path(uri)
             } else {
-                path
+                gio::File::for_uri(uri)
             };
-            Target { dir, names: Vec::new(), properties: false }
+            if file.path().is_some_and(|path| path.is_file()) {
+                file.parent().unwrap_or(file)
+            } else {
+                file
+            }
         })
         .collect()
 }
@@ -321,8 +324,17 @@ mod tests {
     #[test]
     fn show_folders_opens_a_file_parent() {
         let folders = folders_from_uris(&["file:///etc/hosts".into(), "file:///tmp".into()]);
-        assert_eq!(folders[0].dir, PathBuf::from("/etc"));
-        assert!(folders[0].names.is_empty());
-        assert_eq!(folders[1].dir, PathBuf::from("/tmp"));
+        assert_eq!(folders[0].path(), Some(PathBuf::from("/etc")));
+        assert_eq!(folders[1].path(), Some(PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn show_folders_keeps_virtual_locations() {
+        let uris = ["trash:///".into(), "trash://".into(), "smb://host/share".into()];
+        let files = folders_from_uris(&uris);
+        assert_eq!(files.len(), uris.len());
+        for (file, uri) in files.iter().zip(&uris) {
+            assert!(file.equal(&gio::File::for_uri(uri)), "lost location {uri}");
+        }
     }
 }

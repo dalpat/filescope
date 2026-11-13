@@ -1,19 +1,16 @@
-// Background file-operation engine: copy, move, and delete run on a worker
-// thread and report progress to the UI, stay cancellable, and ask the UI how to
-// resolve name conflicts. No GTK here — the worker only talks over channels.
-
+//! Background file operations and their exact outcomes. No GTK in the worker.
+use crate::fileops;
+use async_channel::Sender;
+use std::cell::Cell;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 
-use async_channel::Sender;
-
-use crate::fileops;
-
-/// Which operation a job performs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Copy,
@@ -21,47 +18,145 @@ pub enum Kind {
     Delete,
 }
 
-/// A message from the worker to the UI.
 pub enum Event {
-    /// The measured size of the whole job, sent once up front.
-    Total { bytes: u64, items: u64 },
-    /// Progress so far, sent as work proceeds.
-    Advance { bytes_done: u64, items_done: u64, current: String },
-    /// `name` already exists at the destination — the worker now blocks until
-    /// the UI sends back a [`Decision`].
-    Conflict { name: String },
-    /// The job has ended (possibly cancelled or with some failures). `pairs`
-    /// lists what actually happened as (source, destination) — after conflict
-    /// resolution, so the destination is the real final path — which is what
-    /// lets the UI record a precise undo. Empty for deletes (not undoable) and
-    /// for entries that were skipped or replaced.
-    Finished { ok: u64, failed: u64, pairs: Vec<(PathBuf, PathBuf)> },
+    Total {
+        bytes: u64,
+        items: u64,
+    },
+    Advance {
+        bytes_done: u64,
+        items_done: u64,
+        current: String,
+    },
+    Conflict {
+        name: String,
+    },
+    Finished {
+        ok: u64,
+        failed: u64,
+        pairs: Vec<(PathBuf, PathBuf)>,
+        failures: Vec<Failure>,
+        cancelled: bool,
+    },
 }
 
-/// The UI's answer to a [`Event::Conflict`].
 pub enum Decision {
     Replace,
     Skip,
-    /// Keep both by copying to a non-colliding "(copy)" name.
     Rename,
     ReplaceAll,
     SkipAll,
     Cancel,
 }
 
-/// Live counters shared through the copy/delete recursion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Identity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: i64,
+    nanos: i64,
+    kind: u32,
+}
+impl Identity {
+    fn from(meta: &fs::Metadata) -> Self {
+        Self {
+            device: meta.dev(),
+            inode: meta.ino(),
+            size: meta.len(),
+            modified: meta.mtime(),
+            nanos: meta.mtime_nsec(),
+            kind: meta.mode() & libc::S_IFMT,
+        }
+    }
+    fn read(path: &Path) -> io::Result<Self> {
+        Ok(Self::from(&fs::symlink_metadata(path)?))
+    }
+    fn same_entry(&self, other: &Self) -> bool {
+        (self.device, self.inode, self.kind) == (other.device, other.inode, other.kind)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Failure {
+    pub source: PathBuf,
+    pub message: String,
+    /// Cancellation is classified by the error kind, never its message.
+    stopped: bool,
+    identity: Option<Identity>,
+}
+impl Failure {
+    pub fn can_retry(&self) -> bool {
+        self.identity.is_some() && !self.stopped
+    }
+    pub(crate) fn stopped(&self) -> bool {
+        self.stopped
+    }
+}
+
+fn record_failure(source: PathBuf, error: io::Error, identity: Option<Identity>) -> Failure {
+    Failure {
+        source,
+        message: error.to_string(),
+        stopped: error.kind() == io::ErrorKind::Interrupted,
+        identity,
+    }
+}
+
+
+struct Request {
+    source: PathBuf,
+    expected: Option<Identity>,
+    retry: bool,
+}
+
+#[cfg(test)]
+type CopyPause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+#[cfg(test)]
+static NEXT_COPY_PAUSE: std::sync::Mutex<Option<CopyPause>> = std::sync::Mutex::new(None);
+
+/// Deterministically hold a supported regular copy after its first written chunk.
+#[cfg(test)]
+pub(crate) fn pause_next_copy() -> (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>) {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    assert!(
+        NEXT_COPY_PAUSE
+            .lock()
+            .unwrap()
+            .replace((ready_tx, release_rx))
+            .is_none()
+    );
+    (release_tx, ready_rx)
+}
+
 struct Prog<'a> {
     tx: &'a Sender<Event>,
     cancel: &'a AtomicBool,
     bytes_done: u64,
     items_done: u64,
     current: String,
+    capture: bool,
+    copied: Vec<(PathBuf, Identity)>,
+    destinations: Vec<(PathBuf, Identity)>,
+    last_tick: Cell<Option<std::time::Instant>>,
+    #[cfg(test)]
+    pause: Option<CopyPause>,
 }
-
 impl Prog<'_> {
-    /// Push the current counters to the UI. Returns `false` if the UI has gone
-    /// away (channel closed) so the worker can stop early.
     fn tick(&self) -> bool {
+        if self.tx.is_closed() || self.cancelled() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .last_tick
+            .get()
+            .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(50))
+        {
+            return true;
+        }
+        self.last_tick.set(Some(now));
         self.tx
             .send_blocking(Event::Advance {
                 bytes_done: self.bytes_done,
@@ -70,14 +165,18 @@ impl Prog<'_> {
             })
             .is_ok()
     }
-
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
+    fn check(&self) -> io::Result<()> {
+        if self.cancelled() {
+            Err(io::ErrorKind::Interrupted.into())
+        } else {
+            Ok(())
+        }
+    }
 }
 
-/// Run a job to completion on the calling (worker) thread. `dest` is the target
-/// directory for Copy/Move and is ignored for Delete.
 pub fn run(
     kind: Kind,
     sources: Vec<PathBuf>,
@@ -86,182 +185,508 @@ pub fn run(
     tx: Sender<Event>,
     decisions: Receiver<Decision>,
 ) {
-    // Measure everything first so the progress bar has a denominator.
-    let measured: Vec<(PathBuf, u64, u64)> =
-        sources.iter().map(|s| { let (b, i) = measure(s); (s.clone(), b, i) }).collect();
-    let total_bytes: u64 = measured.iter().map(|(_, b, _)| b).sum();
-    let total_items: u64 = measured.iter().map(|(_, _, i)| i).sum();
-    let _ = tx.send_blocking(Event::Total { bytes: total_bytes, items: total_items });
+    let requests = sources
+        .into_iter()
+        .map(|source| Request {
+            source,
+            expected: None,
+            retry: false,
+        })
+        .collect();
+    run_requests(kind, requests, dest, cancel, tx, decisions);
+}
 
-    let mut prog = Prog { tx: &tx, cancel: &cancel, bytes_done: 0, items_done: 0, current: String::new() };
-    let (mut ok, mut failed) = (0u64, 0u64);
-    // What actually happened, for the UI's undo stack.
-    let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
-    // Sticky "apply to all" choice.
-    let mut sticky: Option<Decision> = None;
+pub fn retry(
+    kind: Kind,
+    failures: Vec<Failure>,
+    dest: PathBuf,
+    cancel: Arc<AtomicBool>,
+    tx: Sender<Event>,
+    decisions: Receiver<Decision>,
+) {
+    let requests = failures
+        .into_iter()
+        .map(|failure| Request {
+            source: failure.source,
+            expected: failure.identity,
+            retry: true,
+        })
+        .collect();
+    run_requests(kind, requests, dest, cancel, tx, decisions);
+}
 
-    for (src, sbytes, sitems) in measured {
+fn run_requests(
+    kind: Kind,
+    requests: Vec<Request>,
+    dest: PathBuf,
+    cancel: Arc<AtomicBool>,
+    tx: Sender<Event>,
+    decisions: Receiver<Decision>,
+) {
+    let mut failures = Vec::new();
+    let mut measured = Vec::new();
+    let destination_error = if kind == Kind::Delete {
+        None
+    } else {
+        fs::metadata(&dest).and_then(|metadata| {
+            if metadata.is_dir() { Ok(()) }
+            else { Err(io::Error::other("The destination is not a folder")) }
+        })
+            .err()
+            .map(|error| (error.kind(), error.to_string()))
+    };
+    for request in requests {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let identity = Identity::read(&request.source).ok();
+        if request.retry && (request.expected.is_none() || request.expected != identity) {
+            failures.push(Failure {
+                source: request.source,
+                message: "The source changed or could not be verified; start a new operation"
+                    .into(),
+                stopped: false,
+                identity: None,
+            });
+            continue;
+        }
+        if let Some(error) = destination_error.clone().map(|(kind, message)| io::Error::new(kind, message)) {
+            failures.push(record_failure(request.source, error, identity));
+            continue;
+        }
+        let identity = Identity::read(&request.source).ok();
+        let (bytes, items) = measure(&request.source, &cancel);
+        measured.push((request.source, bytes, items, identity));
+    }
+    let bytes = measured
+        .iter()
+        .fold(0u64, |sum, (_, n, _, _)| sum.saturating_add(*n));
+    let items = measured
+        .iter()
+        .fold(0u64, |sum, (_, _, n, _)| sum.saturating_add(*n));
+    let _ = tx.send_blocking(Event::Total {
+        bytes,
+        items,
+    });
+    let mut prog = Prog {
+        tx: &tx,
+        cancel: &cancel,
+        bytes_done: 0,
+        items_done: 0,
+        current: String::new(),
+        capture: kind == Kind::Move,
+        copied: Vec::new(),
+        destinations: Vec::new(),
+        last_tick: Cell::new(None),
+        #[cfg(test)]
+        pause: NEXT_COPY_PAUSE.lock().unwrap().take(),
+    };
+    let mut pairs = Vec::new();
+    let mut ok = 0;
+    let mut sticky = None;
+
+    for (src, sbytes, sitems, identity) in measured {
         if prog.cancelled() {
             break;
         }
-        prog.current = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-
-        if kind == Kind::Delete {
-            match remove_tree(&src, &mut prog) {
-                Ok(()) => ok += 1,
-                Err(_) => failed += 1,
-            }
-            continue;
-        }
-
-        // Copy / Move: resolve any destination-name conflict.
-        let name = prog.current.clone();
-        let mut target = dest.join(&name);
-        // A replace destroys whatever was there, so it can't be undone cleanly —
-        // such entries are left out of `pairs`.
+        prog.current = src
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        prog.copied.clear();
+        prog.destinations.clear();
         let mut replaced = false;
-        if target.exists() {
-            let decision = match &sticky {
-                Some(Decision::ReplaceAll) => Decision::Replace,
-                Some(Decision::SkipAll) => Decision::Skip,
-                _ => {
-                    if tx.send_blocking(Event::Conflict { name: name.clone() }).is_err() {
-                        break;
+        let mut target = None;
+        let mut performed = false;
+        let result = (|| -> io::Result<()> {
+            let approved = identity
+                .as_ref()
+                .ok_or_else(|| io::Error::other("The source is no longer available"))?;
+            verify_source(&src, approved)?;
+            if kind == Kind::Delete {
+                remove_tree(&src, &mut prog, Some(approved))?;
+                performed = true;
+                return Ok(());
+            }
+            let name = src.file_name().ok_or_else(|| io::Error::other("The source has no filename"))?;
+            let mut dst = dest.join(name);
+            validate_target(&src, &dst, true)?;
+            if occupied(&dst)? {
+                let conflict_identity = Identity::read(&dst)?;
+                let decision = match sticky {
+                    Some(true) => Decision::Replace,
+                    Some(false) => Decision::Skip,
+                    None => {
+                        tx.send_blocking(Event::Conflict {
+                            name: name.to_string_lossy().into_owned(),
+                        })
+                        .map_err(|_| io::Error::from(io::ErrorKind::Interrupted))?;
+                        decisions.recv().unwrap_or(Decision::Cancel)
                     }
-                    decisions.recv().unwrap_or(Decision::Cancel)
-                }
-            };
-            match decision {
-                Decision::Cancel => {
-                    cancel.store(true, Ordering::Relaxed);
-                    break;
-                }
-                Decision::Skip => {
-                    prog.bytes_done += sbytes;
-                    prog.items_done += sitems;
-                    prog.tick();
-                    continue;
-                }
-                Decision::SkipAll => {
-                    sticky = Some(Decision::SkipAll);
-                    prog.bytes_done += sbytes;
-                    prog.items_done += sitems;
-                    prog.tick();
-                    continue;
-                }
-                Decision::Rename => target = fileops::unique_destination(&dest, &name),
-                Decision::Replace => {
-                    replaced = true;
-                    let _ = fileops::remove(&target);
-                }
-                Decision::ReplaceAll => {
-                    sticky = Some(Decision::ReplaceAll);
-                    replaced = true;
-                    let _ = fileops::remove(&target);
+                };
+                match decision {
+                    Decision::Cancel => {
+                        cancel.store(true, Ordering::Relaxed);
+                        return Err(io::ErrorKind::Interrupted.into());
+                    }
+                    Decision::Skip | Decision::SkipAll => {
+                        if matches!(decision, Decision::SkipAll) {
+                            sticky = Some(false);
+                        }
+                        prog.bytes_done = prog.bytes_done.saturating_add(sbytes);
+                        prog.items_done = prog.items_done.saturating_add(sitems);
+                        prog.tick();
+                        return Ok(());
+                    }
+                    Decision::Rename => {
+                        dst = unique_target(&dest, name, &cancel)?
+                    }
+                    Decision::Replace | Decision::ReplaceAll => {
+                        if matches!(decision, Decision::ReplaceAll) {
+                            sticky = Some(true);
+                        }
+                        verify_source(&src, approved)?;
+                        if Identity::read(&dst).ok().as_ref() != Some(&conflict_identity) {
+                            return Err(io::Error::other(
+                                "The destination changed while confirmation was open; review the conflict again",
+                            ));
+                        }
+                        validate_target(&src, &dst, false)?;
+                        fileops::remove(&dst)?;
+                        replaced = true;
+                    }
                 }
             }
-        }
-
-        let result = match kind {
-            Kind::Copy => copy_tree(&src, &target, &mut prog),
-            Kind::Move => move_entry(&src, &target, sbytes, sitems, &mut prog),
-            Kind::Delete => unreachable!(),
-        };
+            validate_target(&src, &dst, false)?;
+            verify_source(&src, approved)?;
+            if kind == Kind::Copy {
+                copy_tree(&src, &dst, &mut prog, Some(approved))?;
+                verify_destinations(&prog)?;
+            } else {
+                move_entry(&src, &dst, sbytes, sitems, &mut prog, approved)?;
+            }
+            performed = true;
+            if !replaced {
+                target = Some(dst);
+            }
+            Ok(())
+        })();
         match result {
-            Ok(()) => {
+            Ok(()) if target.is_some() => {
                 ok += 1;
-                if !replaced {
-                    pairs.push((src, target));
+                pairs.push((src, target.unwrap()));
+            }
+            Ok(()) => {
+                // Skipped entries are processed, but are not successful transfers.
+                if performed {
+                    ok += 1;
                 }
             }
-            Err(_) => failed += 1,
+            Err(error) => {
+                failures.push(record_failure(
+                    src,
+                    error,
+                    if kind == Kind::Delete { None } else { identity },
+                ));
+            }
         }
     }
-
-    let _ = tx.send_blocking(Event::Finished { ok, failed, pairs });
+    prog.last_tick.set(None);
+    prog.tick();
+    let _ = tx.send_blocking(Event::Finished {
+        ok,
+        failed: failures.len() as u64,
+        pairs,
+        failures,
+        cancelled: cancel.load(Ordering::Relaxed),
+    });
 }
 
-/// Move one entry: try a rename (instant, same filesystem), else copy + delete.
-fn move_entry(src: &Path, dst: &Path, sbytes: u64, sitems: u64, prog: &mut Prog) -> io::Result<()> {
-    match fs::rename(src, dst) {
-        Ok(()) => {
-            prog.bytes_done += sbytes;
-            prog.items_done += sitems;
-            prog.tick();
-            Ok(())
-        }
-        Err(_) => {
-            copy_tree(src, dst, prog)?;
-            fileops::remove(src)?;
-            Ok(())
-        }
+fn occupied(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
-/// Recursively copy `src` to `dst`, updating `prog` and honouring cancellation.
-fn copy_tree(src: &Path, dst: &Path, prog: &mut Prog) -> io::Result<()> {
-    if prog.cancelled() {
-        return Err(io::Error::from(io::ErrorKind::Interrupted));
+
+fn validate_target(src: &Path, dst: &Path, allow_same: bool) -> io::Result<()> {
+    let source = Identity::read(src)?;
+    if let Ok(target) = Identity::read(dst) {
+        if source.same_entry(&target) {
+            return if allow_same {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "Source and destination refer to the same item",
+                ))
+            };
+        }
     }
-    let meta = fs::symlink_metadata(src)?;
-    if meta.file_type().is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
-        prog.items_done += 1;
-    } else if meta.is_dir() {
-        fs::create_dir(dst)?;
-        prog.items_done += 1;
-        if !prog.tick() {
-            return Err(io::Error::from(io::ErrorKind::Interrupted));
+    if !allow_same && fs::symlink_metadata(dst).is_ok_and(|meta| meta.is_dir()) {
+        let parent = src
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let source_entry = fs::canonicalize(parent)?.join(
+            src.file_name()
+                .ok_or_else(|| io::Error::other("No source name"))?,
+        );
+        if source_entry.starts_with(fs::canonicalize(dst)?) {
+            return Err(io::Error::other(
+                "A folder containing the source cannot be replaced",
+            ));
         }
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            copy_tree(&entry.path(), &dst.join(entry.file_name()), prog)?;
+    }
+    if source.kind == libc::S_IFDIR {
+        let source = fs::canonicalize(src)?;
+        let target = match fs::canonicalize(dst) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::canonicalize(
+                dst.parent()
+                    .ok_or_else(|| io::Error::other("No destination folder"))?,
+            )?
+            .join(
+                dst.file_name()
+                    .ok_or_else(|| io::Error::other("No destination name"))?,
+            ),
+            Err(error) => return Err(error),
+        };
+        if target.starts_with(source) {
+            return Err(io::Error::other(
+                "A folder cannot be copied or moved inside itself",
+            ));
         }
-        let _ = fs::set_permissions(dst, meta.permissions());
-    } else {
-        copy_file(src, dst, &meta, prog)?;
     }
     Ok(())
 }
 
-/// Copy a single file in chunks so a large file still advances the bar and stays
-/// cancellable mid-copy.
-fn copy_file(src: &Path, dst: &Path, meta: &fs::Metadata, prog: &mut Prog) -> io::Result<()> {
-    let mut reader = fs::File::open(src)?;
-    let mut writer = fs::File::create(dst)?;
-    let mut buf = vec![0u8; 1 << 20]; // 1 MiB
-    loop {
-        if prog.cancelled() {
-            return Err(io::Error::from(io::ErrorKind::Interrupted));
+fn unique_target(
+    dir: &Path,
+    name: &OsStr,
+    cancel: &AtomicBool,
+) -> io::Result<PathBuf> {
+    let original = Path::new(name);
+    for number in 1u64.. {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(io::ErrorKind::Interrupted.into());
         }
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+        let mut candidate = original.file_stem().unwrap_or(name).to_os_string();
+        candidate.push(if number == 1 {
+            " (copy)".into()
+        } else {
+            format!(" (copy {number})")
+        });
+        if let Some(extension) = original.extension() {
+            candidate.push(".");
+            candidate.push(extension);
         }
-        writer.write_all(&buf[..n])?;
-        prog.bytes_done += n as u64;
-        if !prog.tick() {
-            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        let path = dir.join(candidate);
+        if !occupied(&path)? {
+            return Ok(path);
         }
     }
-    let _ = fs::set_permissions(dst, meta.permissions());
+    unreachable!()
+}
+
+
+fn verify_source(path: &Path, approved: &Identity) -> io::Result<()> {
+    if Identity::read(path).ok().as_ref() == Some(approved) {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "The source changed; start a new operation",
+        ))
+    }
+}
+
+fn move_entry(
+    src: &Path,
+    dst: &Path,
+    sbytes: u64,
+    sitems: u64,
+    prog: &mut Prog,
+    approved: &Identity,
+) -> io::Result<()> {
+    prog.check()?;
+    verify_source(src, approved)?;
+    if fileops::rename_no_replace(src, dst).is_ok() {
+        prog.bytes_done = prog.bytes_done.saturating_add(sbytes);
+        prog.items_done = prog.items_done.saturating_add(sitems);
+        prog.tick();
+        return Ok(());
+    }
+    copy_tree(src, dst, prog, Some(approved))?;
+    prog.check()?;
+    remove_copied(prog)
+}
+
+fn remove_copied(prog: &mut Prog) -> io::Result<()> {
+    verify_destinations(prog)?;
+    for (path, identity) in &prog.copied {
+        if Identity::read(path).ok().as_ref() != Some(identity) {
+            return Err(io::Error::other(
+                "The source changed during transfer; it was not removed",
+            ));
+        }
+    }
+    // Only remove copied identities. A newly added directory child makes
+    // remove_dir fail; it is never recursively deleted as an unseen entry.
+    for (path, identity) in prog.copied.iter().rev() {
+        prog.check()?;
+        let current = Identity::read(path)?;
+        let unchanged = if identity.kind == libc::S_IFDIR {
+            identity.same_entry(&current)
+        } else {
+            *identity == current
+        };
+        if !unchanged {
+            return Err(io::Error::other("The source changed before removal"));
+        }
+        if identity.kind == libc::S_IFDIR {
+            fs::remove_dir(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_tree(
+    src: &Path,
+    dst: &Path,
+    prog: &mut Prog,
+    approved: Option<&Identity>,
+) -> io::Result<()> {
+    prog.check()?;
+    let meta = fs::symlink_metadata(src).map_err(|error| error_at(src, error))?;
+    if approved.is_some_and(|approved| *approved != Identity::from(&meta)) {
+        return Err(io::Error::other("The source changed before copying"));
+    }
+    if prog.capture {
+        prog.copied.push((src.to_path_buf(), Identity::from(&meta)));
+    }
+    if meta.file_type().is_symlink() {
+        std::os::unix::fs::symlink(
+            fs::read_link(src).map_err(|error| error_at(src, error))?,
+            dst,
+        )
+        .map_err(|error| error_at(dst, error))?;
+        prog.bytes_done = prog.bytes_done.saturating_add(meta.len());
+        prog.items_done += 1;
+        if !prog.tick() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+    } else if meta.is_dir() {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dst)
+            .map_err(|error| error_at(dst, error))?;
+        prog.items_done += 1;
+        if !prog.tick() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let entries = fs::read_dir(src).map_err(|error| error_at(src, error))?;
+        verify_source(src, &Identity::from(&meta))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| error_at(src, error))?;
+            copy_tree(&entry.path(), &dst.join(entry.file_name()), prog, None)?;
+        }
+        verify_source(src, &Identity::from(&meta))?;
+        fs::set_permissions(dst, meta.permissions())?;
+    } else if meta.is_file() {
+        copy_file(src, dst, &meta, prog).map_err(|error| error_at(src, error))?;
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{src:?}: this file type cannot be copied safely"),
+        ));
+    }
+    verify_source(src, &Identity::from(&meta))?;
+    prog.destinations
+        .push((dst.to_path_buf(), Identity::read(dst)?));
+    Ok(())
+}
+
+fn verify_destinations(prog: &Prog) -> io::Result<()> {
+    for (path, approved) in &prog.destinations {
+        prog.check()?;
+        if Identity::read(path).ok().as_ref() != Some(approved) {
+            return Err(io::Error::other(format!(
+                "{path:?}: destination changed before completion; the source was kept"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn error_at(path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{path:?}: {error}"))
+}
+
+fn copy_file(src: &Path, dst: &Path, meta: &fs::Metadata, prog: &mut Prog) -> io::Result<()> {
+    let mut reader = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(src)?;
+    if Identity::from(&reader.metadata()?) != Identity::from(meta) {
+        return Err(io::Error::other("The source changed before copying"));
+    }
+    let mut writer = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dst)?;
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        prog.check()?;
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..count])?;
+        prog.bytes_done = prog.bytes_done.saturating_add(count as u64);
+        if !prog.tick() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        #[cfg(test)]
+        if let Some((ready, release)) = prog.pause.take() {
+            let _ = ready.send(());
+            release
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "test copy pause released or expired",
+                    )
+                })?;
+        }
+    }
+    writer.flush()?;
+    drop(writer);
+    if Identity::read(src)? != Identity::from(meta) {
+        return Err(io::Error::other("The source changed during copying"));
+    }
+    fs::set_permissions(dst, meta.permissions())?;
     prog.items_done += 1;
     Ok(())
 }
 
-/// Recursively delete `path`, updating `prog`.
-fn remove_tree(path: &Path, prog: &mut Prog) -> io::Result<()> {
-    if prog.cancelled() {
-        return Err(io::Error::from(io::ErrorKind::Interrupted));
-    }
+fn remove_tree(path: &Path, prog: &mut Prog, approved: Option<&Identity>) -> io::Result<()> {
+    prog.check()?;
     let meta = fs::symlink_metadata(path)?;
+    if approved.is_some_and(|approved| *approved != Identity::from(&meta)) {
+        return Err(io::Error::other("The source changed before deletion"));
+    }
     if meta.is_dir() && !meta.file_type().is_symlink() {
         for entry in fs::read_dir(path)? {
-            remove_tree(&entry?.path(), prog)?;
+            remove_tree(&entry?.path(), prog, None)?;
         }
         fs::remove_dir(path)?;
     } else {
-        prog.bytes_done += meta.len();
+        prog.bytes_done = prog.bytes_done.saturating_add(meta.len());
         fs::remove_file(path)?;
     }
     prog.items_done += 1;
@@ -269,9 +694,10 @@ fn remove_tree(path: &Path, prog: &mut Prog) -> io::Result<()> {
     Ok(())
 }
 
-/// Total (bytes, items) of `path`, counting the entry itself as one item and
-/// recursing into directories (symlinks counted, never followed).
-fn measure(path: &Path) -> (u64, u64) {
+fn measure(path: &Path, cancel: &AtomicBool) -> (u64, u64) {
+    if cancel.load(Ordering::Relaxed) {
+        return (0, 0);
+    }
     let Ok(meta) = fs::symlink_metadata(path) else {
         return (0, 0);
     };
@@ -279,9 +705,12 @@ fn measure(path: &Path) -> (u64, u64) {
         let (mut bytes, mut items) = (0u64, 1u64);
         if let Ok(entries) = fs::read_dir(path) {
             for entry in entries.flatten() {
-                let (b, i) = measure(&entry.path());
-                bytes += b;
-                items += i;
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let (b, i) = measure(&entry.path(), cancel);
+                bytes = bytes.saturating_add(b);
+                items = items.saturating_add(i);
             }
         }
         (bytes, items)
@@ -289,6 +718,10 @@ fn measure(path: &Path) -> (u64, u64) {
         (meta.len(), 1)
     }
 }
+
+#[cfg(test)]
+#[path = "ops/regression_tests.rs"]
+mod regression_tests;
 
 #[cfg(test)]
 mod tests {
@@ -307,13 +740,22 @@ mod tests {
 
         let (tx, rx) = async_channel::unbounded();
         let (_dec_tx, dec_rx) = mpsc::channel();
-        run(Kind::Copy, vec![src.clone()], dest.clone(), Arc::new(AtomicBool::new(false)), tx, dec_rx);
+        run(
+            Kind::Copy,
+            vec![src.clone()],
+            dest.clone(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            dec_rx,
+        );
 
         let (mut total, mut finished) = (None, None);
         while let Ok(event) = rx.try_recv() {
             match event {
-                Event::Total { bytes, items } => total = Some((bytes, items)),
-                Event::Finished { ok, failed, pairs } => finished = Some((ok, failed, pairs)),
+                Event::Total { bytes, items, .. } => total = Some((bytes, items)),
+                Event::Finished {
+                    ok, failed, pairs, ..
+                } => finished = Some((ok, failed, pairs)),
                 _ => {}
             }
         }
@@ -344,7 +786,14 @@ mod tests {
         let (dec_tx, dec_rx) = mpsc::channel();
         let dest2 = dest.clone();
         let worker = std::thread::spawn(move || {
-            run(Kind::Copy, vec![src], dest2, Arc::new(AtomicBool::new(false)), tx, dec_rx);
+            run(
+                Kind::Copy,
+                vec![src],
+                dest2,
+                Arc::new(AtomicBool::new(false)),
+                tx,
+                dec_rx,
+            );
         });
         // Answer the conflict with "Keep Both".
         loop {
@@ -370,7 +819,14 @@ mod tests {
         fs::write(tmp.join("d/inner/f"), b"data").unwrap();
         let (tx, rx) = async_channel::unbounded();
         let (_dec_tx, dec_rx) = mpsc::channel();
-        run(Kind::Delete, vec![tmp.join("d")], PathBuf::new(), Arc::new(AtomicBool::new(false)), tx, dec_rx);
+        run(
+            Kind::Delete,
+            vec![tmp.join("d")],
+            PathBuf::new(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            dec_rx,
+        );
         while rx.try_recv().is_ok() {}
         assert!(!tmp.join("d").exists());
         let _ = fs::remove_dir_all(&tmp);

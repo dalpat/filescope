@@ -3,8 +3,6 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -19,7 +17,7 @@ pub(super) fn file_from_info(info: &gio::FileInfo, directory: Option<&gio::File>
 
 
 pub(super) fn selected(tab: &Rc<super::Tab>) -> Vec<(gio::File, gio::FileInfo)> {
-    if super::navigation::batch_busy(tab) || tab.view_stack.visible_child_name().as_deref() == Some("trash") {
+    if super::navigation::batch_busy(tab) || super::location_access(tab) == super::LocationAccess::Unavailable {
         return Vec::new();
     }
     let Some(dir) = tab.current_dir() else { return Vec::new() };
@@ -38,7 +36,7 @@ pub(super) fn selected(tab: &Rc<super::Tab>) -> Vec<(gio::File, gio::FileInfo)> 
 }
 
 pub(super) fn activate(app: &Rc<super::App>, tab: &Rc<super::Tab>, position: u32) {
-    if super::navigation::batch_busy(tab) { return; }
+    if super::navigation::batch_busy(tab) || super::location_access(tab) == super::LocationAccess::Unavailable { return; }
     let Some(item) = super::visible_selection(tab).item(position) else { return };
     let info = item.downcast::<gio::FileInfo>().unwrap();
     let Some(dir) = tab.current_dir() else { return };
@@ -46,7 +44,7 @@ pub(super) fn activate(app: &Rc<super::App>, tab: &Rc<super::Tab>, position: u32
     let Some(child) = file_from_info(&info, directory) else { return; };
     if info.file_type() == gio::FileType::Directory {
         super::navigation::navigate(app, tab, child);
-    } else {
+    } else if super::location_access(tab) != super::LocationAccess::Checking {
         launch(app, &child);
     }
 }
@@ -71,7 +69,7 @@ pub(super) fn open_selected(app: &Rc<super::App>) {
         return;
     }
     for (file, info) in items {
-        if info.file_type() != gio::FileType::Directory {
+        if info.file_type() != gio::FileType::Directory && super::location_access(&tab) != super::LocationAccess::Checking {
             launch(app, &file);
         }
     }
@@ -82,6 +80,7 @@ pub(super) fn open_selected(app: &Rc<super::App>) {
 /// every app that handles the type plus an "Other Application…" escape hatch.
 pub(super) fn open_with(app: &Rc<super::App>) {
     let tab = super::navigation::active_tab(app);
+    if super::location_access(&tab) == super::LocationAccess::Checking { return; }
     let items = selected(&tab);
     let [(file, info)] = items.as_slice() else {
         return;
@@ -112,6 +111,7 @@ pub(super) fn toggle_preview(app: &Rc<super::App>) {
         return;
     }
     let tab = super::navigation::active_tab(app);
+    if super::location_access(&tab) == super::LocationAccess::Checking { return; }
     let items = selected(&tab);
     let [(file, info)] = items.as_slice() else { return };
     if info.file_type() == gio::FileType::Directory {
@@ -169,10 +169,22 @@ pub(super) fn launch(app: &Rc<super::App>, file: &gio::File) {
 /// Open a terminal in the active tab's folder (Ctrl+.). Only meaningful for a
 /// real on-disk directory (not the "This PC" view).
 pub(super) fn open_terminal(app: &Rc<super::App>) {
-    let Some(dir) = super::navigation::active_tab(app).current_dir().and_then(|f| f.path()) else { return };
-    if !open_terminal_at(&dir) {
-        super::toast(app, "No terminal emulator found");
-    }
+    let tab = super::navigation::active_tab(app);
+    if super::location_access(&tab) != super::LocationAccess::Local { return; }
+    let Some(dir) = tab.current_dir().and_then(|f| f.path()) else { return };
+    let app = Rc::downgrade(app);
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || {
+            std::fs::canonicalize(&dir)?;
+            Ok::<_, std::io::Error>(open_terminal_at(&dir))
+        }).await;
+        let Some(app) = app.upgrade() else { return; };
+        match result {
+            Ok(Ok(false)) => super::toast(&app, "No terminal emulator found"),
+            Ok(Err(error)) => super::toast(&app, &error.to_string()),
+            _ => {},
+        }
+    });
 }
 
 /// Spawn a terminal emulator opening `dir`. Honours `$TERMINAL` first, then tries
@@ -409,8 +421,12 @@ pub(super) fn run_tool(
 /// Extract each selected archive into a new folder named after it.
 pub(super) fn extract_selected(app: &Rc<super::App>) {
     let tab = super::navigation::active_tab(app);
+    if super::location_access(&tab) != super::LocationAccess::Local { return; }
     let Some(dir) = tab.current_dir().and_then(|f| f.path()) else { return };
-    for (file, info) in selected(&tab) {
+    let mut paths: Vec<_> = selected(&tab).iter().filter_map(|(file, _)| file.path()).collect();
+    paths.push(dir.clone());
+    with_local_paths(app, &tab, paths, move |app, tab| {
+    for (file, info) in selected(tab) {
         let name = info.display_name().to_string();
         let Some(format) = archive::Format::from_name(&name) else { continue };
         let Some(path) = file.path() else { continue };
@@ -440,17 +456,22 @@ pub(super) fn extract_selected(app: &Rc<super::App>) {
             },
         );
     }
+    });
 }
 
 /// Ask for a name and format, then compress the selection into the current folder.
 pub(super) fn compress_selected(app: &Rc<super::App>) {
     let tab = super::navigation::active_tab(app);
+    if super::location_access(&tab) != super::LocationAccess::Local { return; }
     let Some(dir) = tab.current_dir().and_then(|f| f.path()) else { return };
     let items: Vec<String> =
         selected(&tab).iter().map(|(_, i)| i.name().to_string_lossy().into_owned()).collect();
     if items.is_empty() {
         return;
     }
+    let mut paths: Vec<_> = selected(&tab).iter().filter_map(|(file, _)| file.path()).collect();
+    paths.push(dir.clone());
+    with_local_paths(app, &tab, paths, move |app, tab| {
 
     let entry = gtk::Entry::builder()
         .text(archive::default_archive_name(&items))
@@ -471,11 +492,15 @@ pub(super) fn compress_selected(app: &Rc<super::App>) {
     dialog.set_default_response(Some("create"));
     dialog.set_close_response("cancel");
 
+    let checked_paths: Vec<_> = items.iter().map(|name| dir.join(name)).chain(std::iter::once(dir.clone())).collect();
+    let tab = Rc::downgrade(tab);
     let app = app.clone();
     dialog.choose(&app.window.clone(), gio::Cancellable::NONE, move |resp| {
         if resp != "create" {
             return;
         }
+        let Some(tab) = tab.upgrade() else { return; };
+        with_local_paths(&app, &tab, checked_paths, move |app, _| {
         let format = match formats.selected() {
             1 => archive::Compress::TarGz,
             2 => archive::Compress::TarXz,
@@ -507,24 +532,89 @@ pub(super) fn compress_selected(app: &Rc<super::App>) {
                 }
             },
         );
+        });
+    });
     });
 }
 
 /// Record a new reversible action. Doing something new invalidates the redo side.
 pub(super) fn push_undo(app: &Rc<super::App>, action: undo::Action) {
-    app.undo_stack.borrow_mut().push(action);
+    if history_is_local(&action) { app.undo_stack.borrow_mut().push(action); }
     app.redo_stack.borrow_mut().clear();
     app.history_generation.set(app.history_generation.get().wrapping_add(1));
     super::update_chrome(app);
 }
 
-/// Reverse the most recent action.
-pub(super) fn undo(app: &Rc<super::App>) {
+pub(super) fn history_is_local(action: &undo::Action) -> bool {
+    history_targets_match(action, |path| path.is_absolute())
+}
+
+fn history_targets_match(action: &undo::Action, local: impl Fn(&Path) -> bool) -> bool {
+    match action {
+        undo::Action::Move { pairs } | undo::Action::Copy { pairs } => pairs.iter().all(|(from, to)| local(from) && local(to)),
+        undo::Action::Rename { from, to } => local(from) && local(to),
+        undo::Action::NewFolder { path } => local(path),
+        undo::Action::BatchRename { pending } => pending.iter().all(|request| local(&request.from) && local(&request.to)),
+        undo::Action::Trash { originals } => originals.iter().all(|path| local(path)),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HistoryScope { generation: u64, undo_index: usize, redo_index: usize }
+
+fn with_local_history(app: &Rc<super::App>, undoing: bool, apply: fn(&Rc<super::App>, undo::Action, HistoryScope)) {
     if app.history_busy.get() { return; }
-    let Some(action) = app.undo_stack.borrow_mut().pop() else {
-        super::toast(app, "Nothing to undo");
+    let stack = if undoing { &app.undo_stack } else { &app.redo_stack };
+    let action = stack.borrow_mut().pop();
+    let Some(action) = action else {
+        super::toast(app, if undoing { "Nothing to undo" } else { "Nothing to redo" });
         return;
     };
+    if !history_is_local(&action) { stack.borrow_mut().push(action); return; }
+    let scope = HistoryScope {
+        generation: app.history_generation.get(),
+        undo_index: app.undo_stack.borrow().len(),
+        redo_index: app.redo_stack.borrow().len(),
+    };
+    app.history_busy.set(true);
+    super::update_chrome(app);
+    let work = super::BackgroundWork::new(app);
+    let app = Rc::downgrade(app);
+    glib::spawn_future_local(async move {
+        let inspected = action.clone();
+        let result = gio::spawn_blocking(move || {
+            if matches!(&inspected, undo::Action::Trash { .. }) && !crate::trash::home_trash_available() {
+                return Err("Trash access is unavailable. Restore the app's host Trash permission, then reopen Filescope; no files were changed.");
+            }
+            Ok(())
+        }).await;
+        let _work = work;
+        let Some(app) = app.upgrade() else { return; };
+        app.history_busy.set(false);
+        let stack = if undoing { &app.undo_stack } else { &app.redo_stack };
+        let index = if undoing { scope.undo_index } else { scope.redo_index };
+        let error = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some("The history check stopped; no files were changed."),
+        };
+        if error.is_none() {
+            apply(&app, action, scope);
+        } else {
+            if undoing || app.history_generation.get() == scope.generation {
+                let mut stack = stack.borrow_mut();
+                let index = index.min(stack.len());
+                stack.insert(index, action);
+            }
+            super::toast(&app, error.unwrap());
+        }
+        super::update_chrome(&app);
+    });
+}
+
+/// Reverse the most recent action.
+pub(super) fn undo(app: &Rc<super::App>) {
+    with_local_history(app, true, |app, action, scope| {
     let what = action.describe();
     let ok = match &action {
         // Put each entry back where it came from (newest first).
@@ -537,7 +627,7 @@ pub(super) fn undo(app: &Rc<super::App>) {
             start_job(app, ops::Kind::Delete, created, PathBuf::new(), false);
             true
         }
-        undo::Action::BatchRename { pending } => { batch_history(app, pending, true); return; }
+        undo::Action::BatchRename { pending } => { batch_history(app, pending, true, scope); return; }
         undo::Action::Rename { from, to } => {
             let ok = undo::move_exact(to, from).is_ok();
             if ok { super::navigation::renamed(app, &super::navigation::active_tab(app), to, from); }
@@ -548,22 +638,19 @@ pub(super) fn undo(app: &Rc<super::App>) {
             originals.iter().all(|p| undo::restore_from_trash(p))
         }
     };
-    app.redo_stack.borrow_mut().push(action);
+    if app.history_generation.get() == scope.generation { app.redo_stack.borrow_mut().push(action); }
     refresh_all(app);
     if ok {
         super::toast(app, &format!("Undid {what}"));
     } else {
         super::toast(app, &format!("Couldn't fully undo the {what}"));
     }
+    });
 }
 
 /// Re-apply the most recently undone action.
 pub(super) fn redo(app: &Rc<super::App>) {
-    if app.history_busy.get() { return; }
-    let Some(action) = app.redo_stack.borrow_mut().pop() else {
-        super::toast(app, "Nothing to redo");
-        return;
-    };
+    with_local_history(app, false, |app, action, scope| {
     let what = action.describe();
     let ok = match &action {
         undo::Action::Move { pairs } => {
@@ -578,7 +665,7 @@ pub(super) fn redo(app: &Rc<super::App>) {
             }
             true
         }
-        undo::Action::BatchRename { pending } => { batch_history(app, pending, false); return; }
+        undo::Action::BatchRename { pending } => { batch_history(app, pending, false, scope); return; }
         undo::Action::Rename { from, to } => {
             let ok = undo::move_exact(from, to).is_ok();
             if ok { super::navigation::renamed(app, &super::navigation::active_tab(app), from, to); }
@@ -596,13 +683,12 @@ pub(super) fn redo(app: &Rc<super::App>) {
     } else {
         super::toast(app, &format!("Couldn't fully redo the {what}"));
     }
+    });
 }
 
 /// Failed history requests stay on their original stack for a later retry.
-fn batch_history(app: &Rc<super::App>, pending: &[crate::batch_rename::Rename], undoing: bool) {
-    let undo_index = app.undo_stack.borrow().len();
-    let redo_index = app.redo_stack.borrow().len();
-    let generation = app.history_generation.get();
+fn batch_history(app: &Rc<super::App>, pending: &[crate::batch_rename::Rename], undoing: bool, scope: HistoryScope) {
+    let HistoryScope { generation, undo_index, redo_index } = scope;
     let pending = pending.to_vec();
     let hold = super::navigation::BatchRename::new(app, &pending);
     app.history_busy.set(true);
@@ -665,146 +751,12 @@ pub(super) fn refresh_all(app: &Rc<super::App>) {
 /// `record` pushes the result onto the undo stack; undo/redo pass `false` so
 /// their own jobs don't re-enter the history.
 pub(super) fn start_job(app: &Rc<super::App>, kind: ops::Kind, sources: Vec<PathBuf>, dest: PathBuf, record: bool) {
-    if sources.is_empty() {
-        return;
-    }
-    let (verb, past) = match kind {
-        ops::Kind::Copy => ("Copying", "Copied"),
-        ops::Kind::Move => ("Moving", "Moved"),
-        ops::Kind::Delete => ("Deleting", "Deleted"),
-    };
-
-    let mut removal = if matches!(kind, ops::Kind::Delete | ops::Kind::Move) {
-        super::navigation::RemovalSelection::capture(app, &sources)
-    } else { None };
-    let cancel = Arc::new(AtomicBool::new(false));
-    let (ev_tx, ev_rx) = async_channel::unbounded::<ops::Event>();
-    let (dec_tx, dec_rx) = std::sync::mpsc::channel::<ops::Decision>();
-
-    // Progress row: a title line and a bar with a stop button.
-    let title = gtk::Label::builder().xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::Middle).build();
-    title.add_css_class("caption");
-    title.set_label(&format!("{verb}…"));
-    let bar = gtk::ProgressBar::builder().hexpand(true).valign(gtk::Align::Center).build();
-    let stop = crate::icon::flat_button("process-stop-symbolic", "Cancel");
-    {
-        let cancel = cancel.clone();
-        stop.connect_clicked(move |_| cancel.store(true, AtomicOrdering::Relaxed));
-    }
-    let bar_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    bar_row.append(&bar);
-    bar_row.append(&stop);
-    let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    row.append(&title);
-    row.append(&bar_row);
-    app.progress_box.append(&row);
-    app.progress_revealer.set_reveal_child(true);
-
-    let work = super::BackgroundWork::new(app);
-    // Worker thread.
-    {
-        let cancel = cancel.clone();
-        std::thread::spawn(move || ops::run(kind, sources, dest, cancel, ev_tx, dec_rx));
-    }
-
-    // Pump events on the main loop.
-    let app = app.clone();
-    glib::spawn_future_local(async move {
-        let _work = work;
-        let (mut total_bytes, mut total_items) = (0u64, 0u64);
-        while let Ok(event) = ev_rx.recv().await {
-            match event {
-                ops::Event::Total { bytes, items } => {
-                    total_bytes = bytes;
-                    total_items = items;
-                }
-                ops::Event::Advance { bytes_done, items_done, current } => {
-                    let frac = if total_bytes > 0 {
-                        bytes_done as f64 / total_bytes as f64
-                    } else if total_items > 0 {
-                        items_done as f64 / total_items as f64
-                    } else {
-                        0.0
-                    };
-                    bar.set_fraction(frac.clamp(0.0, 1.0));
-                    let sizes = if total_bytes > 0 {
-                        format!(" · {} / {}", format::human_size(bytes_done), format::human_size(total_bytes))
-                    } else {
-                        String::new()
-                    };
-                    title.set_label(&format!("{verb} {current} — {items_done}/{total_items}{sizes}"));
-                }
-                ops::Event::Conflict { name } => {
-                    // A closed owner cannot answer; hiding/minimizing keeps its application.
-                    if app.window.application().is_none() {
-                        let _ = dec_tx.send(ops::Decision::Cancel);
-                        continue;
-                    }
-                    let dialog = adw::AlertDialog::new(
-                        Some(&format!("“{name}” already exists")),
-                        Some("An item with the same name is already in the destination."),
-                    );
-                    let apply_all = gtk::CheckButton::with_label("Apply to all conflicts");
-                    dialog.set_extra_child(Some(&apply_all));
-                    dialog.add_responses(&[
-                        ("cancel", "Cancel"),
-                        ("skip", "Skip"),
-                        ("rename", "Keep Both"),
-                        ("replace", "Replace"),
-                    ]);
-                    dialog.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
-                    dialog.set_default_response(Some("rename"));
-                    dialog.set_close_response("cancel");
-                    let dec_tx = dec_tx.clone();
-                    dialog.choose(&app.window, gio::Cancellable::NONE, move |resp| {
-                        let all = apply_all.is_active();
-                        let decision = match resp.as_str() {
-                            "replace" => if all { ops::Decision::ReplaceAll } else { ops::Decision::Replace },
-                            "skip" => if all { ops::Decision::SkipAll } else { ops::Decision::Skip },
-                            "rename" => ops::Decision::Rename,
-                            _ => ops::Decision::Cancel,
-                        };
-                        let _ = dec_tx.send(decision);
-                    });
-                }
-                ops::Event::Finished { ok, failed, pairs } => {
-                    app.progress_box.remove(&row);
-                    if app.progress_box.first_child().is_none() {
-                        app.progress_revealer.set_reveal_child(false);
-                    }
-                    // Record what actually happened so it can be undone.
-                    if record && !pairs.is_empty() {
-                        let action = match kind {
-                            ops::Kind::Copy => Some(undo::Action::Copy { pairs }),
-                            ops::Kind::Move => Some(undo::Action::Move { pairs }),
-                            ops::Kind::Delete => None, // permanent — not undoable
-                        };
-                        if let Some(action) = action {
-                            push_undo(&app, action);
-                        }
-                    }
-                    for tab in app.tabs.borrow().iter() {
-                        super::navigation::refresh(tab);
-                    }
-                    if let Some(removal) = removal.take() { removal.finish(&app); }
-                    super::update_chrome(&app);
-                    let message = if cancel.load(AtomicOrdering::Relaxed) {
-                        format!("{verb} cancelled — {ok} done")
-                    } else if failed > 0 {
-                        format!("{past} {ok}; {failed} failed")
-                    } else {
-                        format!("{past} {ok} item{}", super::plural(ok as usize))
-                    };
-                    super::toast(&app, &message);
-                    break;
-                }
-            }
-        }
-    });
+    super::transfers::start(app, kind, sources, dest, record);
 }
 
 pub(super) fn paste(app: &Rc<super::App>) {
     let tab = super::navigation::active_tab(app);
+    if super::location_access(&tab) == super::LocationAccess::Unavailable || tab.search.active.get() { return; }
     let Some(dir) = tab.current_dir().and_then(|f| f.path()) else { return };
     let clipboard = app.window.clipboard();
     let app = app.clone();
@@ -822,30 +774,45 @@ pub(super) fn paste(app: &Rc<super::App>) {
 
 pub(super) fn trash_selected(app: &Rc<super::App>) {
     let tab = super::navigation::active_tab(app);
+    if super::location_access(&tab) != super::LocationAccess::Local { return; }
     let items = selected(&tab);
     if items.is_empty() {
         return;
     }
-    let removal = super::navigation::RemovalSelection::capture(app, &items.iter().filter_map(|(f, _)| f.path()).collect::<Vec<_>>());
-    let (mut ok, mut failed) = (0u32, 0u32);
-    let mut trashed: Vec<PathBuf> = Vec::new();
-    for (file, _) in &items {
-        if file.trash(gio::Cancellable::NONE).is_ok() {
-            ok += 1;
-            if let Some(path) = file.path() {
-                trashed.push(path);
+    let paths: Vec<_> = items.iter().filter_map(|(file, _)| file.path()).collect();
+    let removal = super::navigation::RemovalSelection::capture(app, &paths);
+    let work = super::BackgroundWork::new(app);
+    let app = Rc::downgrade(app);
+    let tab = Rc::downgrade(&tab);
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || {
+            if !crate::trash::home_trash_available() {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+                    "Trash access is unavailable. Restore the app's host Trash permission, then reopen Filescope. No files were moved."));
             }
-        } else {
-            failed += 1
+            let mut trashed = Vec::new();
+            let mut failed = 0;
+            for path in paths {
+                if gio::File::for_path(&path).trash(gio::Cancellable::NONE).is_ok() { trashed.push(path); }
+                else { failed += 1; }
+            }
+            Ok((trashed, failed))
+        }).await;
+        let _work = work;
+        let Some(app) = app.upgrade() else { return; };
+        match result {
+            Ok(Ok((trashed, failed))) => {
+                let ok = trashed.len();
+                if !trashed.is_empty() { push_undo(&app, undo::Action::Trash { originals: trashed }); }
+                if let Some(tab) = tab.upgrade() { super::navigation::refresh(&tab); }
+                if let Some(removal) = removal { removal.finish(&app); }
+                super::toast(&app, &format!("Moved {ok} item{} to Trash{}", super::plural(ok),
+                    if failed > 0 { format!("; {failed} failed") } else { String::new() }));
+            }
+            Ok(Err(error)) => super::toast(&app, &error.to_string()),
+            Err(_) => super::toast(&app, "The Trash worker stopped; check the files before retrying"),
         }
-    }
-    if !trashed.is_empty() {
-        push_undo(app, undo::Action::Trash { originals: trashed });
-    }
-    super::navigation::refresh(&tab);
-    if let Some(removal) = removal { removal.finish(app); }
-    super::toast(app, &format!("Moved {ok} item{} to Trash{}", super::plural(ok as usize),
-        if failed > 0 { format!("; {failed} failed") } else { String::new() }));
+    });
 }
 
 pub(super) fn delete_selected(app: &Rc<super::App>) {
@@ -884,9 +851,15 @@ pub(super) fn rename_selected(app: &Rc<super::App>) {
         return;
     }
     if items.len() > 1 {
-        let paths: Option<Vec<_>> = items.iter().map(|(file, _)| file.path()).collect();
-        if let Some(paths) = paths { super::batch_rename::show(app, paths); }
-        else { super::toast(app, "Batch rename requires local files"); }
+        if super::location_access(&tab) != super::LocationAccess::Local {
+            super::toast(app, "Wait for the folder to finish opening");
+            return;
+        }
+        let Some(paths) = items.iter().map(|(file, _)| file.path()).collect::<Option<Vec<_>>>() else {
+            super::toast(app, "Batch rename requires local files");
+            return;
+        };
+        super::batch_rename::show(app, paths);
         return;
     }
     if super::view::start_inline_rename(app, &tab) {
@@ -902,6 +875,7 @@ pub(super) fn rename_with_dialog(app: &Rc<super::App>) {
         return;
     };
     let file = file.clone();
+    let old = info.display_name().to_string();
     let entry =
         gtk::Entry::builder().text(info.display_name().as_str()).activates_default(true).build();
     let dialog = adw::AlertDialog::new(Some("Rename"), None);
@@ -910,47 +884,114 @@ pub(super) fn rename_with_dialog(app: &Rc<super::App>) {
     dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("rename"));
     dialog.set_close_response("cancel");
-    let app = app.clone();
-    dialog.choose(&app.window.clone(), gio::Cancellable::NONE, move |resp| {
+    let generation = tab.navigation_generation.get();
+    let weak_app = Rc::downgrade(app);
+    let weak_tab = Rc::downgrade(&tab);
+    dialog.choose(&app.window, gio::Cancellable::NONE, move |resp| {
         if resp != "rename" {
             return;
         }
+        let (Some(app), Some(tab)) = (weak_app.upgrade(), weak_tab.upgrade()) else { return; };
+        if tab.navigation_generation.get() != generation { return; }
         let name = entry.text().to_string();
-        if name.is_empty() || name.contains('/') {
-            super::toast(&app, "Invalid name");
-            return;
-        }
-        let renamed = file
-            .path()
-            .ok_or(())
-            .and_then(|from| fileops::rename(&from, &name).map(|to| (from, to)).map_err(|_| ()));
-        match renamed {
-            Ok((from, to)) => {
-                super::navigation::renamed(&app, &tab, &from, &to);
+        if name != old { rename_file(&app, &tab, &file, &name); }
+    });
+}
+
+/// Rename I/O stays off GTK.
+pub(super) fn rename_file(app: &Rc<super::App>, tab: &Rc<super::Tab>, file: &gio::File, name: &str) {
+    if super::location_access(tab) == super::LocationAccess::Unavailable
+        || !app.tabs.borrow().iter().any(|open| Rc::ptr_eq(open, tab)) { return; }
+    if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
+        super::toast(app, "Invalid name");
+        return;
+    }
+    let Some(from) = file.path() else { return; };
+    let Some(parent) = from.parent() else { return; };
+    let to = parent.join(name);
+    if from == to { return; }
+    let name = name.to_owned();
+    let generation = tab.navigation_generation.get();
+    let intended = super::navigation::selected_uris(&super::visible_selection(tab));
+    let work = super::BackgroundWork::new(app);
+    let app = Rc::downgrade(app);
+    let tab = Rc::downgrade(tab);
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || {
+            fileops::rename(&from, &name)?;
+            Ok::<_, std::io::Error>((from, to))
+        }).await;
+        let _work = work;
+        let Some(app) = app.upgrade() else { return; };
+        match result {
+            Ok(Ok((from, to))) => {
+                let original = gio::File::for_path(&from).uri();
+                let renamed = gio::File::for_path(&to).uri();
+                let mapped: std::collections::HashSet<_> = intended.iter().map(|uri|
+                    if *uri == original { renamed.clone() } else { uri.clone() }).collect();
+                let origin = tab.upgrade();
+                let choose = origin.as_ref().is_some_and(|tab| {
+                    let current = super::navigation::selected_uris(&super::visible_selection(tab));
+                    tab.navigation_generation.get() == generation && !tab.search.active.get()
+                        && (current == intended || current == mapped)
+                        && Rc::ptr_eq(&super::navigation::active_tab(&app), tab)
+                });
+                super::navigation::renamed_paths(&app, &from, &to);
+                if choose && let Some(tab) = origin && let Some(name) = to.file_name().and_then(|name| name.to_str()) {
+                    let weak_app = Rc::downgrade(&app);
+                    let weak_tab = Rc::downgrade(&tab);
+                    let focus_app = weak_app.clone();
+                    let focus_tab = weak_tab.clone();
+                    super::navigation::select_names_if(&tab, &[name.to_owned()], move || {
+                        weak_app.upgrade().zip(weak_tab.upgrade()).is_some_and(|(app, tab)|
+                            tab.navigation_generation.get() == generation
+                                && Rc::ptr_eq(&super::navigation::active_tab(&app), &tab))
+                    }, move || {
+                        if let (Some(app), Some(tab)) = (focus_app.upgrade(), focus_tab.upgrade()) {
+                            super::navigation::focus_selection(&app, &tab);
+                        }
+                    });
+                }
                 push_undo(&app, undo::Action::Rename { from, to });
             }
-            Err(()) => super::toast(&app, "Couldn't rename"),
+            Ok(Err(error)) => super::toast(&app, &format!("Couldn't rename: {error}")),
+            Err(_) => super::toast(&app, "The rename worker stopped; check the files before retrying"),
         }
     });
 }
 
 pub(super) fn new_folder(app: &Rc<super::App>) {
     let tab = super::navigation::active_tab(app);
+    if super::location_access(&tab) == super::LocationAccess::Unavailable { return; }
     // This PC and Trash are not directories. The listing underneath may still be one.
     let Some(super::Place::Folder(file)) = super::navigation::here(&tab) else { return };
     let Some(dir) = file.path() else { return };
-    let name = fileops::new_folder_name(&dir);
-    match fileops::make_dir(&dir, &name) {
-        Ok(path) => {
+    let generation = tab.navigation_generation.get();
+    let intended = super::navigation::selected_uris(&super::visible_selection(&tab));
+    let initial_focus = gtk::prelude::RootExt::focus(&app.window).map(|widget| widget.downgrade());
+    let work = super::BackgroundWork::new(app);
+    let app = Rc::downgrade(app);
+    let tab = Rc::downgrade(&tab);
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || {
+            let name = fileops::new_folder_name(&dir);
+            let path = fileops::make_dir(&dir, &name)?;
+            Ok::<_, std::io::Error>((path, name))
+        }).await;
+        let _work = work;
+        let Some(app) = app.upgrade() else { return; };
+        match result {
+          Ok(Ok((path, name))) => {
             push_undo(&app, undo::Action::NewFolder { path });
-            // A search for something else would hide "New Folder".
-            tab.search_bar.set_search_mode(false);
+            let Some(tab) = tab.upgrade() else { return; };
+            if tab.navigation_generation.get() != generation
+                || !app.tabs.borrow().iter().any(|open| Rc::ptr_eq(open, &tab)) { return; }
             super::navigation::refresh(&tab);
+            if super::navigation::selected_uris(&super::visible_selection(&tab)) != intended { return; }
             let editing = Rc::downgrade(&tab);
-            let editing_app = Rc::downgrade(app);
+            let editing_app = Rc::downgrade(&app);
             let guard_tab = editing.clone();
             let guard_app = editing_app.clone();
-            let initial_focus = gtk::prelude::RootExt::focus(&app.window).map(|w| w.downgrade());
             super::navigation::select_names_if(&tab, &[name], move || {
                 let (Some(app), Some(tab)) = (guard_app.upgrade(), guard_tab.upgrade()) else { return false; };
                 let focus = gtk::prelude::RootExt::focus(&app.window);
@@ -958,11 +999,15 @@ pub(super) fn new_folder(app: &Rc<super::App>) {
                     && !(super::view::focus_is_text_input(app.window.upcast_ref())
                         && focus != initial_focus.as_ref().and_then(|w| w.upgrade()))
             }, move || {
-                if let (Some(app), Some(tab)) = (editing_app.upgrade(), editing.upgrade()) { edit_when_loaded(app, tab); }
+                if let (Some(app), Some(tab)) = (editing_app.upgrade(), editing.upgrade()) {
+                    edit_when_loaded(app, tab);
+                }
             });
+          }
+          Ok(Err(error)) => super::toast(&app, &format!("Couldn't create folder: {error}")),
+          Err(_) => super::toast(&app, "The folder worker stopped; check the location before retrying"),
         }
-        Err(_) => super::toast(&app, "Couldn't create folder"),
-    }
+    });
 }
 
 /// The listing arrives in batches. Edit only after it has finished, so a later
@@ -1050,18 +1095,26 @@ pub(super) fn show_properties(app: &Rc<super::App>) {
         return;
     };
     let file = file.clone();
-
-    // Re-query for the richer attributes the directory listing doesn't carry
-    // (access/created times, owner/group); fall back to the listing's info.
-    let full = file
-        .query_info(
+    let fallback = info.clone();
+    let generation = tab.navigation_generation.get();
+    let intended = super::navigation::selected_uris(&super::visible_selection(&tab));
+    let app = Rc::downgrade(app);
+    let tab = Rc::downgrade(&tab);
+    glib::spawn_future_local(async move {
+        let full = file.query_info_future(
             "standard::*,time::*,unix::*,owner::*",
             gio::FileQueryInfoFlags::NONE,
-            gio::Cancellable::NONE,
-        )
-        .ok();
-    let info: &gio::FileInfo = full.as_ref().unwrap_or(info);
+            glib::Priority::DEFAULT,
+        ).await.unwrap_or(fallback);
+        let (Some(app), Some(tab)) = (app.upgrade(), tab.upgrade()) else { return; };
+        if !app.window.is_visible() || tab.navigation_generation.get() != generation
+            || !matches!(super::location_access(&tab), super::LocationAccess::Local)
+            || super::navigation::selected_uris(&super::visible_selection(&tab)) != intended { return; }
+        properties_dialog(&app, &file, &full);
+    });
+}
 
+fn properties_dialog(app: &Rc<super::App>, file: &gio::File, info: &gio::FileInfo) {
     let name = info.display_name().to_string();
     let is_dir = info.file_type() == gio::FileType::Directory;
     let kind = if is_dir {
@@ -1106,10 +1159,11 @@ pub(super) fn show_properties(app: &Rc<super::App>) {
     if is_dir {
         size_row.set_subtitle("Calculating…");
         if let Some(path) = file.path() {
-            let size_row = size_row.clone();
+            let size_row = size_row.downgrade();
             glib::spawn_future_local(async move {
                 let (bytes, count) =
                     gio::spawn_blocking(move || fileops::dir_size(&path)).await.unwrap_or((0, 0));
+                let Some(size_row) = size_row.upgrade() else { return; };
                 size_row.set_subtitle(&format!(
                     "{} — {count} item{}",
                     format::human_size(bytes),
@@ -1231,4 +1285,22 @@ mod search_path_tests {
         assert!(file_from_info(&normal, Some(&scope)).unwrap().equal(&scope.child("report.txt")));
         assert!(file_from_info(&normal, None).is_none());
     }
+}
+
+pub(super) fn with_local_paths(app: &Rc<super::App>, tab: &Rc<super::Tab>, paths: Vec<PathBuf>, action: impl FnOnce(&Rc<super::App>, &Rc<super::Tab>) + 'static) {
+    let generation = tab.navigation_generation.get();
+    let selected = super::navigation::selected_uris(&super::visible_selection(tab));
+    let work = super::BackgroundWork::new(app);
+    let weak_app = Rc::downgrade(app); let weak_tab = Rc::downgrade(tab);
+    glib::spawn_future_local(async move {
+        let local = gio::spawn_blocking(move || paths.iter().all(|path| std::fs::symlink_metadata(path).is_ok())).await;
+        let _work = work;
+        let (Some(app), Some(tab)) = (weak_app.upgrade(), weak_tab.upgrade()) else { return; };
+        if tab.navigation_generation.get() != generation || !app.window.is_visible()
+            || !Rc::ptr_eq(&super::navigation::active_tab(&app), &tab)
+            || super::navigation::selected_uris(&super::visible_selection(&tab)) != selected
+        { return; }
+        if matches!(local, Ok(true)) { action(&app, &tab); }
+        else { super::toast(&app, "The selected files or folder are no longer available"); }
+    });
 }

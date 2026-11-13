@@ -55,9 +55,9 @@ not survive. Closing a window does not cancel an already-approved installation.
 1. Set the intended stable Cargo version and build the release binary on the
    oldest supported runtime for the target architecture.
 2. Run `python3 packaging/release.py --output /path/to/fresh-output`.
-   It validates the binary's probe and emits the archive plus `.sha256` file.
+   It validates the binary probe and emits the archive plus `.sha256` file.
    The archive includes the update manifest, shared install layout, installer,
-   launcher and icon. No key or credential is needed for packaging.
+   launcher and icon. No connection helper or account configuration is required.
 3. Test the archive on supported systems, then upload both files to the matching
    `vMAJOR.MINOR.PATCH` release in `dalpat/filescope`. Publishing remains a
    separate maintainer action. GitHub provides the authenticated asset digest.

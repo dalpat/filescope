@@ -11,11 +11,15 @@ fn bookmarks_file() -> PathBuf {
     dir
 }
 
-/// Load the saved bookmarks, dropping any that no longer point at a directory.
+/// Load existing local bookmark folders.
 pub fn load() -> Vec<PathBuf> {
     let Ok(text) = std::fs::read_to_string(bookmarks_file()) else {
         return Vec::new();
     };
+    parse(&text)
+}
+
+fn parse(text: &str) -> Vec<PathBuf> {
     text.lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
@@ -49,14 +53,17 @@ pub fn save(list: &[PathBuf]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let body: String =
-        list.iter().map(|p| format!("{}\n", p.to_string_lossy())).collect();
+    let body = serialize(list);
     let _ = std::fs::write(path, body);
 }
 
+fn serialize(list: &[PathBuf]) -> String {
+    list.iter().map(|p| format!("{}\n", p.to_string_lossy())).collect()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     fn paths(names: &[&str]) -> Vec<PathBuf> {
         names.iter().map(PathBuf::from).collect()

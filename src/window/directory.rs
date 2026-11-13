@@ -142,6 +142,7 @@ impl Contents {
 
     pub fn file(&self) -> Option<gio::File> { self.source.file() }
 
+
     pub fn contains_file(&self, file: &gio::File) -> bool { self.positions.borrow().contains_key(&file.uri()) }
 
     pub fn held(&self) -> bool { self.rename_holds.get() > 0 }
@@ -332,7 +333,9 @@ impl Contents {
             Some(&request), move |result| {
                 let Some(this) = weak.upgrade() else { return; };
                 if this.stopped.get() || this.requests.borrow().get(&uri) != Some(&current) { return; }
-                if let Ok(info) = &result { info.set_attribute_object("standard::file", &file_copy); }
+                if let Ok(info) = &result {
+                    info.set_attribute_object("standard::file", &file_copy);
+                }
                 this.ready.borrow_mut().push_back((uri, current, result));
                 this.schedule();
             });
@@ -475,6 +478,7 @@ mod tests {
             .filter_map(|i| contents.items.item(i).and_downcast::<gio::FileInfo>())
             .find(|info| info.name() == std::path::Path::new(name))
     }
+
 
     #[test]
     #[ignore = "requires an isolated graphical session"]

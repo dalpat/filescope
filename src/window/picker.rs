@@ -8,7 +8,16 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 
-#[derive(Clone, Debug)]
+mod save;
+mod memory;
+mod navigation;
+mod search;
+mod inspection;
+mod basket;
+mod acceptance;
+mod location;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Mode { Open { multiple: bool, directory: bool }, Save, SaveFiles(Vec<OsString>) }
 
 fn selection_paths(mode: &Mode, folder: &Path, selected: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
@@ -47,7 +56,7 @@ type ChoiceSpec = (String, String, Vec<(String, String)>, String);
 
 struct Options {
     mode: Mode,
-    folder: PathBuf,
+    requested_folders: Vec<PathBuf>,
     name: String,
     raw_name: Option<OsString>,
     filters: Vec<FilterSpec>,
@@ -91,9 +100,10 @@ impl Options {
             _ => return Err("Unsupported chooser request".into()),
         };
         let current_file = byte_path(&dict, "current_file")?;
-        let folder = byte_path(&dict, "current_folder")?
-            .or_else(|| current_file.as_deref().and_then(Path::parent).map(Path::to_path_buf))
-            .filter(|path| path.is_dir()).unwrap_or_else(glib::home_dir);
+        let requested_folder = byte_path(&dict, "current_folder")?;
+        let mut requested_folders: Vec<_> = requested_folder.into_iter().collect();
+        if let Some(parent) = current_file.as_deref().and_then(Path::parent)
+            && !requested_folders.iter().any(|path| path == parent) { requested_folders.push(parent.to_path_buf()); }
         let suggested_name = option::<String>(&dict, "current_name")?;
         let raw_name = if suggested_name.is_none() { current_file.as_deref().and_then(Path::file_name).map(OsStr::to_os_string) } else { None };
         let name = suggested_name.unwrap_or_else(|| current_file.as_deref()
@@ -119,7 +129,7 @@ impl Options {
                 if !values.iter().any(|(id, _)| id == selected) { return Err("Invalid selected choice".into()); }
             }
         }
-        Ok(Self { mode, folder, name, raw_name, filters, current_filter, choices,
+        Ok(Self { mode, requested_folders, name, raw_name, filters, current_filter, choices,
             accept_label: option(&dict, "accept_label")?.unwrap_or_else(|| if method == "OpenFile" { "_Open" } else { "_Save" }.into()),
             modal: option(&dict, "modal")?.unwrap_or(true) })
     }
@@ -144,9 +154,21 @@ struct Picker {
     source: gtk::DirectoryList,
     contents: Rc<super::directory::Contents>,
     selection: gtk::SelectionModel,
+    list: gtk::ColumnView,
+    filtered: gtk::FilterListModel,
+    sorted: gtk::SortListModel,
+    navigation: navigation::State,
+    search: search::State,
+    preview: Rc<crate::preview::pane::Pane>,
+    preview_button: gtk::ToggleButton,
+    basket: basket::State,
+    acceptance: acceptance::State,
+    location: location::State,
     path: gtk::Entry,
     name: gtk::Entry,
     raw_name: RefCell<Option<OsString>>,
+    save_feedback: gtk::Label,
+    suggest_name: gtk::Button,
     error: gtk::Label,
     filters: gtk::DropDown,
     choices: Vec<ChoiceControl>,
@@ -157,11 +179,39 @@ struct Picker {
 fn empty_results() -> glib::Variant { glib::VariantDict::new(None).end() }
 
 impl Picker {
-    fn folder(&self) -> Option<PathBuf> { self.source.file().and_then(|file| file.path()) }
+    fn folder(&self) -> Option<PathBuf> { self.source.file().and_then(|file| file.path()).or_else(|| self.location.current.borrow().clone()) }
 
     fn set_name(&self, name: &OsStr) {
         self.name.set_text(&name.to_string_lossy());
         self.raw_name.replace(Some(name.to_os_string()));
+        self.update_save_feedback();
+    }
+
+    fn set_user_name(&self, name: &OsStr) {
+        self.name.set_text(&name.to_string_lossy());
+        self.raw_name.replace(Some(name.to_os_string()));
+        self.update_save_feedback();
+    }
+
+    fn exact_name(&self) -> OsString {
+        self.raw_name.borrow().clone().unwrap_or_else(|| self.name.text().as_str().into())
+    }
+
+    fn update_save_feedback(&self) {
+        if !matches!(self.options.mode, Mode::Save) { return; }
+        let name = self.exact_name();
+        let filter = self.options.filters.get(self.filters.selected() as usize);
+        let mut feedback = save::name_feedback(&name, filter);
+        if feedback.message.is_empty()
+            && let Some(filter) = filter
+            && !file_filter(filter).match_(&save::known_name_info(&name))
+        {
+            feedback.message = format!("Filename does not match {}. It will be saved as entered.", filter.0);
+        }
+        self.save_feedback.set_label(&feedback.message);
+        self.suggest_name.set_visible(feedback.suggestion.is_some());
+        if feedback.invalid { self.save_feedback.add_css_class("error"); }
+        else { self.save_feedback.remove_css_class("error"); }
     }
 
     fn selected(&self) -> Vec<PathBuf> {
@@ -180,67 +230,55 @@ impl Picker {
     fn reply(&self, response: u32, results: glib::Variant) {
         let Some(complete) = self.complete.borrow_mut().take() else { return; };
         self.contents.stop();
+        self.acceptance.cancel();
+        self.location.close();
+        self.search.cancel();
+        self.basket.close();
+        self.preview.set_target(None);
+        self.preview.set_visible(false);
         if let Some(window) = self.window.upgrade() {
             unsafe { window.steal_data::<Rc<Self>>("fs-picker"); }
         }
         complete(response, if response == 0 { results } else { empty_results() });
     }
 
-    fn navigate(&self, path: &Path) {
-        if !path.is_absolute() || !path.is_dir() { self.error.set_label("Choose an existing local folder"); return; }
+    fn navigate(self: &Rc<Self>, path: &Path) {
+        location::open(self, vec![path.to_path_buf()], location::Intent::Visit(self.folder()));
+    }
+
+    fn set_folder(&self, path: &Path) -> bool {
+        if !path.is_absolute() { self.error.set_label("Choose an existing folder"); return false; }
+        self.basket.cancel();
+        search::stop(self, false);
         self.selection.unselect_all();
-        self.path.set_text(&path.to_string_lossy());
+        self.path.set_text(&location::display_path(path));
         self.source.set_file(Some(&gio::File::for_path(path)));
         self.error.set_label("");
+        true
+    }
+
+    fn destinations(&self) -> Result<acceptance::Input, String> {
+        acceptance::Input::capture(self)
     }
 
     fn accept(self: &Rc<Self>) {
-        if self.overwrite.get() || self.complete.borrow().is_none() { return; }
-        let Some(mut folder) = self.folder() else { return; };
-        let selected = self.selected();
-        if matches!(self.options.mode, Mode::SaveFiles(_)) && selected.len() == 1 && selected[0].is_dir() { folder = selected[0].clone(); }
+        if self.overwrite.get() || self.acceptance.busy.get() || self.complete.borrow().is_none() { return; }
+        if self.location.unresolved.get() { self.error.set_label("The requested folder is unavailable or still opening. Choose another location before continuing."); return; }
         if !matches!(self.options.mode, Mode::Open { directory: true, .. } | Mode::SaveFiles(_))
-            && selected.len() == 1 && selected[0].is_dir() {
-            self.navigate(&selected[0]); return;
+            && let Some(folder) = acceptance::selected_directory(self) {
+            self.navigate(&folder); return;
         }
-        let paths = match self.options.mode {
-            Mode::Open { .. } => selection_paths(&self.options.mode, &folder, &selected),
-            Mode::Save => match self.raw_name.borrow().as_ref() {
-                Some(name) => save_paths(&Mode::SaveFiles(vec![name.clone()]), &folder, ""),
-                None => save_paths(&Mode::Save, &folder, &self.name.text()),
-            },
-            _ => save_paths(&self.options.mode, &folder, &self.name.text()),
-        };
-        let paths = match paths { Ok(paths) => paths, Err(error) => { self.error.set_label(&error); return; } };
-        if matches!(self.options.mode, Mode::Open { directory: false, .. }) {
-            if let Some(spec) = self.options.filters.get(self.filters.selected() as usize) {
-                let filter = file_filter(spec);
-                if paths.iter().any(|path| gio::File::for_path(path).query_info("standard::*", gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
-                    .is_ok_and(|info| !filter.match_(&info))) {
-                    self.error.set_label("Select files matching the chosen file type"); return;
-                }
-            }
-        }
-        let existing: Vec<_> = if matches!(self.options.mode, Mode::Open { .. }) { Vec::new() }
-            else { paths.iter().filter(|path| path.symlink_metadata().is_ok()).collect() };
-        if existing.is_empty() { self.accepted(&paths); return; }
-        let Some(window) = self.window.upgrade() else { return; };
-        let message = existing.iter().filter_map(|path| path.file_name()).map(|name| name.to_string_lossy()).collect::<Vec<_>>().join("\n");
-        let dialog = adw::AlertDialog::new(Some("Replace existing files?"), Some(&message));
-        dialog.add_responses(&[("cancel", "Cancel"), ("replace", "Replace")]);
-        dialog.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        self.overwrite.set(true);
-        let weak = Rc::downgrade(self);
-        dialog.choose(&window, gio::Cancellable::NONE, move |response| {
-            let Some(this) = weak.upgrade() else { return; };
-            this.overwrite.set(false);
-            if response == "replace" { this.accepted(&paths); }
-        });
+        if self.basket.enabled { basket::accept(self); return; }
+        acceptance::start(self);
     }
 
-    fn accepted(&self, paths: &[PathBuf]) {
+
+    fn accepted_with(self: &Rc<Self>, paths: &[PathBuf], identities: Option<Vec<(u64, u64)>>) {
+        acceptance::grant(self, paths.to_vec(), None, None, identities);
+    }
+
+    fn complete_accepted(&self, paths: &[PathBuf]) {
+        if self.complete.borrow().is_none() { return; }
         let results = glib::VariantDict::new(None);
         let uris: Vec<_> = paths.iter().map(|path| gio::File::for_path(path).uri().to_string()).collect();
         results.insert("uris", uris);
@@ -252,13 +290,32 @@ impl Picker {
             }).collect();
             results.insert("choices", values);
         }
+        let remembered = match self.options.mode {
+            Mode::Save | Mode::SaveFiles(_) => paths.first().and_then(|path| path.parent()).map(Path::to_path_buf),
+            Mode::Open { directory: true, .. } => paths.first().cloned(),
+            _ => self.folder(),
+        };
+        if let Some(folder) = remembered {
+            match memory::remember(&self.navigation.app_id, &folder) {
+                Ok(Some(write)) => {
+                    let hold = self.window.upgrade().and_then(|window| window.application()).map(|application| application.hold());
+                    glib::spawn_future_local(async move {
+                        let result = gio::spawn_blocking(move || memory::persist(write)).await;
+                        if let Ok(Err(error)) = result { eprintln!("filescope: picker folder memory: {error}"); }
+                        drop(hold);
+                    });
+                }
+                Ok(None) => {},
+                Err(error) => eprintln!("filescope: picker folder memory: {error}"),
+            }
+        }
         self.finish(0, results.end());
     }
 
     fn activate(self: &Rc<Self>, position: u32) {
         let Some(info) = self.selection.item(position).and_downcast::<gio::FileInfo>() else { return; };
         let Some(path) = info.attribute_object("standard::file").and_downcast::<gio::File>().and_then(|file| file.path()) else { return; };
-        if path.is_dir() { self.navigate(&path); }
+        if info.file_type() == gio::FileType::Directory { self.navigate(&path); }
         else {
             self.selection.select_item(position, true);
             if matches!(self.options.mode, Mode::Save) { self.set_name(path.file_name().unwrap_or_default()); }
@@ -281,6 +338,8 @@ pub(crate) fn show(app: &adw::Application, method: &str, app_id: &str, parent_wi
             return window;
         }
     };
+    let navigation = navigation::State::new(app_id);
+    let folders = navigation.initial_folder(&options);
     // A modal request must not block another application's picker.
     gtk::WindowGroup::new().add_window(&window);
     window.set_modal(options.modal);
@@ -298,9 +357,16 @@ pub(crate) fn show(app: &adw::Application, method: &str, app_id: &str, parent_wi
     home.set_tooltip_text(Some("Home"));
     let path = gtk::Entry::builder().hexpand(true).placeholder_text("Folder path").build();
     path.update_property(&[gtk::accessible::Property::Label("Folder path")]);
+    crate::path_completion::attach(&path);
     let hidden = gtk::CheckButton::with_label("Hidden files");
-    toolbar.append(&up); toolbar.append(&home); toolbar.append(&path); toolbar.append(&hidden);
+    let preview_button = gtk::ToggleButton::with_label("Preview");
+    toolbar.append(&navigation.back); toolbar.append(&navigation.forward);
+    toolbar.append(&up); toolbar.append(&home); toolbar.append(&navigation.places); toolbar.append(&path); toolbar.append(&hidden); toolbar.append(&preview_button);
     body.append(&toolbar);
+    let search = search::State::new();
+    body.append(&search.widget);
+    let location = location::State::new();
+    body.append(&location.notice);
     let source = gtk::DirectoryList::new(Some(super::ATTRS), gio::File::NONE);
     source.set_monitored(false);
     let contents = super::directory::Contents::new(&source);
@@ -315,15 +381,18 @@ pub(crate) fn show(app: &adw::Application, method: &str, app_id: &str, parent_wi
         !directories_only && current.borrow().as_ref().is_none_or(|filter| filter.match_(info))
     });
     let filtered = gtk::FilterListModel::new(Some(contents.items.clone()), Some(filter.clone()));
-    let sorted = gtk::SortListModel::new(Some(filtered), None::<gtk::Sorter>);
+    let sorted = gtk::SortListModel::new(Some(filtered.clone()), None::<gtk::Sorter>);
     let selection: gtk::SelectionModel = if matches!(options.mode, Mode::Open { multiple: true, .. }) {
         gtk::MultiSelection::new(Some(sorted.clone())).upcast()
     } else { gtk::SingleSelection::builder().model(&sorted).autoselect(false).can_unselect(true).build().upcast() };
     let list = gtk::ColumnView::builder().model(&selection).hexpand(true).vexpand(true).enable_rubberband(true).build();
     super::view::fill_columns(None, &list, &Rc::new(Cell::new(80)));
+    list.append_column(&search.location);
     if let Some(sorter) = list.sorter() { sorted.set_sorter(Some(&super::view::with_hidden_last(&sorter))); }
     if let Some(column) = list.columns().item(0).and_downcast::<gtk::ColumnViewColumn>() { list.sort_by_column(Some(&column), gtk::SortType::Ascending); }
-    body.append(&gtk::ScrolledWindow::builder().child(&list).vexpand(true).build());
+    let preview = crate::preview::pane::Pane::new(false);
+    preview.split.set_start_child(Some(&gtk::ScrolledWindow::builder().child(&list).vexpand(true).build()));
+    body.append(&preview.split);
     let footer = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8)
         .margin_start(12).margin_end(12).margin_bottom(12).build();
     let name = gtk::Entry::builder().text(&options.name).hexpand(true).activates_default(true).build();
@@ -336,6 +405,13 @@ pub(crate) fn show(app: &adw::Application, method: &str, app_id: &str, parent_wi
         let names = names.iter().map(|name| name.to_string_lossy()).collect::<Vec<_>>().join(", ");
         footer.append(&gtk::Label::builder().label(format!("Files: {names}")).xalign(0.0).wrap(true).build());
     }
+    let save_feedback = gtk::Label::builder().xalign(0.0).wrap(true).build();
+    let suggest_name = gtk::Button::with_label("Use suggested name");
+    suggest_name.set_halign(gtk::Align::Start);
+    suggest_name.set_visible(false);
+    if matches!(options.mode, Mode::Save) { footer.append(&save_feedback); footer.append(&suggest_name); }
+    let basket = basket::State::new(&options.mode);
+    if basket.enabled { footer.append(&basket.widget); }
     let labels: Vec<_> = options.filters.iter().map(|(name, _)| name.as_str()).collect();
     let filters = gtk::DropDown::from_strings(&labels);
     filters.set_selected(options.current_filter);
@@ -358,6 +434,8 @@ pub(crate) fn show(app: &adw::Application, method: &str, app_id: &str, parent_wi
         }
     }
     let error = gtk::Label::builder().xalign(0.0).wrap(true).build();
+    let acceptance = acceptance::State::new();
+    footer.append(&acceptance.message);
     error.add_css_class("error"); footer.append(&error);
     let buttons = gtk::Box::builder().spacing(8).halign(gtk::Align::End).build();
     let cancel = gtk::Button::with_label("Cancel");
@@ -369,8 +447,8 @@ pub(crate) fn show(app: &adw::Application, method: &str, app_id: &str, parent_wi
     let raw_name = RefCell::new(options.raw_name.clone());
     let picker = Rc::new(Picker { window: window.downgrade(),
         #[cfg(test)] css: css.downgrade(),
-        options, source, contents, selection, raw_name,
-        path: path.clone(), name, error, filters: filters.clone(), choices, overwrite: Cell::new(false), complete: RefCell::new(Some(Box::new(complete))) });
+        options, source, contents, selection, list: list.clone(), filtered, sorted, navigation, search, preview, preview_button, basket, acceptance, location, raw_name,
+        path: path.clone(), name, save_feedback, suggest_name: suggest_name.clone(), error, filters: filters.clone(), choices, overwrite: Cell::new(false), complete: RefCell::new(Some(Box::new(complete))) });
     unsafe { window.set_data("fs-picker", picker.clone()); }
     let weak = Rc::downgrade(&picker);
     window.connect_close_request(move |_| { if let Some(picker) = weak.upgrade() { picker.finish(1, empty_results()); } glib::Propagation::Proceed });
@@ -391,18 +469,29 @@ pub(crate) fn show(app: &adw::Application, method: &str, app_id: &str, parent_wi
     let weak = Rc::downgrade(&picker);
     list.connect_activate(move |_, position| { if let Some(picker) = weak.upgrade() { picker.activate(position); } });
     let weak = Rc::downgrade(&picker);
-    picker.name.connect_changed(move |_| { if let Some(picker) = weak.upgrade() { picker.raw_name.borrow_mut().take(); } });
+    picker.name.connect_changed(move |_| { if let Some(picker) = weak.upgrade() { picker.acceptance.cancel(); picker.raw_name.borrow_mut().take(); picker.update_save_feedback(); } });
     let weak = Rc::downgrade(&picker);
-    picker.selection.connect_selection_changed(move |_, _, _| { if let Some(picker) = weak.upgrade() {
+    suggest_name.connect_clicked(move |_| { if let Some(picker) = weak.upgrade() {
+        if let Some(name) = save::name_feedback(&picker.exact_name(), picker.options.filters.get(picker.filters.selected() as usize)).suggestion { picker.set_user_name(&name); }
+    } });
+    let weak = Rc::downgrade(&picker);
+    picker.selection.connect_selection_changed(move |_, position, count| { if let Some(picker) = weak.upgrade() {
+        picker.acceptance.cancel();
+        basket::selection_changed(&picker, position, count);
+        inspection::update(&picker);
         if matches!(picker.options.mode, Mode::Save) {
             let paths = picker.selected();
-            if paths.len() == 1 && paths[0].is_file() { picker.set_name(paths[0].file_name().unwrap_or_default()); }
+            let selected = picker.selection.selection();
+            let regular = selected.size() == 1 && picker.selection.item(selected.nth(0)).and_downcast::<gio::FileInfo>().is_some_and(|info| info.file_type() == gio::FileType::Regular);
+            if paths.len() == 1 && regular { picker.set_name(paths[0].file_name().unwrap_or_default()); }
         }
     } });
     let weak = Rc::downgrade(&picker);
     path.connect_activate(move |entry| { if let Some(picker) = weak.upgrade() {
-        let file = gio::File::for_commandline_arg(entry.text().as_str());
-        if let Some(path) = file.path() { picker.navigate(&path); } else { picker.error.set_label("Choose a local folder"); }
+        let base = gio::File::for_path(picker.folder().unwrap_or_else(glib::home_dir));
+        if let Some(path) = crate::path_completion::resolve(entry.text().as_str(), &base).and_then(|file| file.path()) {
+            picker.navigate(&path);
+        } else { picker.error.set_label("Choose a local folder"); }
     } });
     let weak = Rc::downgrade(&picker);
     up.connect_clicked(move |_| { if let Some(picker) = weak.upgrade() { if let Some(parent) = picker.folder().as_deref().and_then(Path::parent) { picker.navigate(parent); } } });
@@ -411,28 +500,24 @@ pub(crate) fn show(app: &adw::Application, method: &str, app_id: &str, parent_wi
     let weak = Rc::downgrade(&picker);
     let changed_filter = filter.clone();
     filters.connect_selected_notify(move |dropdown| { if let Some(picker) = weak.upgrade() {
+        picker.acceptance.cancel();
         picker.selection.unselect_all(); *active_filter.borrow_mut() = picker.options.filters.get(dropdown.selected() as usize).map(file_filter);
         changed_filter.changed(gtk::FilterChange::Different);
+        basket::filter_changed(&picker);
+        picker.update_save_feedback();
     } });
     hidden.connect_toggled(move |_| filter.changed(gtk::FilterChange::Different));
     let weak = Rc::downgrade(&picker);
     picker.source.connect_loading_notify(move |source| { if !source.is_loading() { if let Some(picker) = weak.upgrade() {
         if let Some(error) = source.error() { picker.error.set_label(&error.to_string()); }
     } } });
-    let weak = Rc::downgrade(&picker);
-    let keys = gtk::EventControllerKey::new();
-    keys.connect_key_pressed(move |_, key, _, modifiers| {
-        let Some(picker) = weak.upgrade() else { return glib::Propagation::Proceed; };
-        match key {
-            gtk::gdk::Key::Escape => picker.finish(1, empty_results()),
-            gtk::gdk::Key::l if modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) => { picker.path.grab_focus(); picker.path.select_region(0, -1); },
-            gtk::gdk::Key::Up if modifiers.contains(gtk::gdk::ModifierType::ALT_MASK) => { if let Some(parent) = picker.folder().as_deref().and_then(Path::parent) { picker.navigate(parent); } },
-            _ => return glib::Propagation::Proceed,
-        }
-        glib::Propagation::Stop
-    });
-    window.add_controller(keys);
-    picker.navigate(&picker.options.folder);
+    navigation::connect(&picker);
+    search::connect(&picker);
+    inspection::connect(&picker);
+    basket::connect(&picker);
+    location::connect(&picker);
+    location::open(&picker, folders, location::Intent::Initial);
+    picker.update_save_feedback();
     gtk::prelude::WidgetExt::realize(&window);
     set_parent(&window, parent_window);
     window.present();
@@ -464,6 +549,10 @@ fn set_parent(window: &gtk::Window, parent: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("picker/save_tests.rs");
+    include!("picker/navigation_tests.rs");
+    include!("picker/search_tests.rs");
+    include!("picker/basket_tests.rs");
     fn fixture() -> PathBuf {
         let path = std::env::temp_dir().join(format!("filescope-picker-{}-{}", std::process::id(), gtk::glib::uuid_string_random()));
         std::fs::create_dir_all(path.join("folder")).unwrap();
@@ -518,7 +607,7 @@ mod tests {
         let mut raw_file = folder.join(OsString::from_vec(b"name-\xff.txt".to_vec())).as_os_str().as_bytes().to_vec(); raw_file.push(0);
         dict.insert("current_file", raw_file);
         let parsed = Options::parse("SaveFile", &dict.end()).unwrap();
-        assert_eq!(parsed.folder, folder);
+        assert_eq!(parsed.requested_folders.first(), Some(&folder));
         assert_eq!(parsed.raw_name.unwrap().as_bytes(), b"name-\xff.txt");
         std::fs::remove_dir_all(folder).unwrap();
     }
@@ -550,7 +639,9 @@ mod tests {
     }
 
     fn state(window: &gtk::Window) -> Rc<Picker> {
-        unsafe { window.data::<Rc<Picker>>("fs-picker").unwrap().as_ref().clone() }
+        let picker = unsafe { window.data::<Rc<Picker>>("fs-picker").unwrap().as_ref().clone() };
+        pump_until(|| picker.source.file().is_some() || !picker.error.label().is_empty());
+        picker
     }
 
     fn pump_until(ready: impl Fn() -> bool) {
@@ -562,7 +653,11 @@ mod tests {
         }
     }
 
-    fn load(picker: &Picker) { pump_until(|| !picker.source.is_loading() && picker.selection.n_items() > 0); }
+    fn load(picker: &Picker) { pump_until(|| !picker.location.unresolved.get() && picker.source.file().is_some() && !picker.source.is_loading() && picker.selection.n_items() > 0); }
+
+    fn wait_overwrite(picker: &Picker) {
+        pump_until(|| picker.overwrite.get() && picker.window.upgrade().and_downcast::<adw::ApplicationWindow>().is_some_and(|window| window.visible_dialog().is_some()));
+    }
 
     fn select(picker: &Picker, path: &Path, clear: bool) {
         let index = (0..picker.selection.n_items()).find(|index| picker.selection.item(*index)
@@ -590,6 +685,7 @@ mod tests {
         let a = state(&one); let b = state(&two); load(&a); load(&b);
         select(&a, &folder.join("one.txt"), true); select(&b, &folder.join("two.txt"), true);
         assert!(click(one.upcast_ref(), "_Open"));
+        pump_until(|| first.borrow().len() == 1);
         assert_eq!(first.borrow().len(), 1); assert!(second.borrow().is_empty());
         let uris = glib::VariantDict::new(Some(&first.borrow()[0].1)).lookup::<Vec<String>>("uris").unwrap().unwrap();
         assert_eq!(uris, vec![gio::File::for_path(folder.join("one.txt")).uri().to_string()]);
@@ -612,6 +708,7 @@ mod tests {
         let picker = state(&window); load(&picker);
         assert_eq!(picker.selection.n_items(), 3);
         select(&picker, &folder.join("one.txt"), true); select(&picker, &folder.join("two.txt"), false); picker.accept();
+        pump_until(|| result.borrow().is_some());
         let result = result.borrow(); let (code, values) = result.as_ref().unwrap(); assert_eq!(*code, 0);
         let values = glib::VariantDict::new(Some(values));
         assert_eq!(values.lookup::<Vec<String>>("uris").unwrap().unwrap().len(), 2);
@@ -621,6 +718,7 @@ mod tests {
         let result = Rc::new(RefCell::new(None)); let output = result.clone();
         let window = show(&app, "OpenFile", "test", "", "Folder", &dict.end(), move |code, results| { output.replace(Some((code, results))); });
         let picker = state(&window); load(&picker); assert_eq!(picker.selection.n_items(), 1); picker.accept();
+        pump_until(|| result.borrow().is_some());
         let result = result.borrow(); let (code, values) = result.as_ref().unwrap(); assert_eq!(*code, 0);
         assert_eq!(glib::VariantDict::new(Some(values)).lookup::<Vec<String>>("uris").unwrap().unwrap(), vec![gio::File::for_path(&folder).uri().to_string()]);
         let dict = options(&folder);
@@ -630,6 +728,7 @@ mod tests {
         let window = show(&app, "OpenFile", "test", "", "Image", &dict.end(), move |code, results| { output.replace(Some((code, results))); });
         let picker = state(&window); load(&picker); assert_eq!(picker.selection.n_items(), 2);
         select(&picker, &folder.join("other.png"), true); picker.accept();
+        pump_until(|| result.borrow().is_some());
         let result = result.borrow(); let (code, values) = result.as_ref().unwrap(); assert_eq!(*code, 0);
         assert_eq!(glib::VariantDict::new(Some(values)).lookup::<FilterSpec>("current_filter").unwrap().unwrap(), mime);
         std::fs::remove_dir_all(folder).unwrap();
@@ -642,11 +741,13 @@ mod tests {
         let result = Rc::new(RefCell::new(None)); let output = result.clone();
         let window = show(&app, "SaveFile", "test", "", "Save", &dict.end(), move |code, results| { output.replace(Some((code, results))); });
         let picker = state(&window); load(&picker); assert_eq!(picker.name.text(), "one.txt"); picker.accept();
+        wait_overwrite(&picker);
         assert!(result.borrow().is_none()); assert!(picker.overwrite.get());
         let parent = window.downcast_ref::<adw::ApplicationWindow>().unwrap();
         let dialog = parent.visible_dialog().unwrap();
         assert!(click(dialog.upcast_ref(), "Cancel")); pump_until(|| !picker.overwrite.get()); assert!(result.borrow().is_none());
         picker.accept();
+        wait_overwrite(&picker);
         let dialog = parent.visible_dialog().unwrap(); assert!(click(dialog.upcast_ref(), "Replace"));
         pump_until(|| result.borrow().is_some());
         let result = result.borrow(); let (code, values) = result.as_ref().unwrap(); assert_eq!(*code, 0);
@@ -671,12 +772,13 @@ mod tests {
             let picker = state(&window); load(&picker); select(&picker, &second, true);
             if suggested.is_some() { picker.activate(picker.selection.selection().nth(0)); }
             else { assert!(click(window.upcast_ref(), "_Save")); }
+            wait_overwrite(&picker);
             assert!(result.borrow().is_none(), "a selected existing raw filename needs overwrite confirmation");
             assert!(picker.overwrite.get());
             let parent = window.downcast_ref::<adw::ApplicationWindow>().unwrap();
             assert!(click(parent.visible_dialog().unwrap().upcast_ref(), "Cancel")); pump_until(|| !picker.overwrite.get());
             assert!(result.borrow().is_none()); assert!(!folder.join("name-\u{fffd}.txt").exists());
-            picker.accept(); assert!(click(parent.visible_dialog().unwrap().upcast_ref(), "Replace"));
+            picker.accept(); wait_overwrite(&picker); assert!(click(parent.visible_dialog().unwrap().upcast_ref(), "Replace"));
             pump_until(|| result.borrow().is_some());
             let result = result.borrow(); let (code, values) = result.as_ref().unwrap(); assert_eq!(*code, 0);
             assert_eq!(glib::VariantDict::new(Some(values)).lookup::<Vec<String>>("uris").unwrap().unwrap(), vec![gio::File::for_path(&second).uri().to_string()]);
@@ -687,10 +789,12 @@ mod tests {
         let result = Rc::new(RefCell::new(None)); let output = result.clone();
         let window = show(&app, "SaveFile", "test", "", "Save", &dict.end(), move |code, results| { output.replace(Some((code, results))); });
         let picker = state(&window); load(&picker); picker.accept();
+        wait_overwrite(&picker);
         assert!(result.borrow().is_none()); assert!(picker.overwrite.get());
         let parent = window.downcast_ref::<adw::ApplicationWindow>().unwrap();
         assert!(click(parent.visible_dialog().unwrap().upcast_ref(), "Cancel")); pump_until(|| !picker.overwrite.get());
         select(&picker, &second, true); picker.name.set_text("new-name.txt"); picker.accept();
+        pump_until(|| result.borrow().is_some());
         let result = result.borrow(); let (code, values) = result.as_ref().unwrap(); assert_eq!(*code, 0);
         assert_eq!(glib::VariantDict::new(Some(values)).lookup::<Vec<String>>("uris").unwrap().unwrap(), vec![gio::File::for_path(folder.join("new-name.txt")).uri().to_string()]);
         assert!(!folder.join("new-name.txt").exists());
@@ -705,6 +809,7 @@ mod tests {
         let result = Rc::new(RefCell::new(None)); let output = result.clone();
         let window = show(&app, "SaveFiles", "test", "", "Save", &dict.end(), move |code, results| { output.replace(Some((code, results))); });
         let picker = state(&window); load(&picker); select(&picker, &folder.join("folder"), true); picker.accept();
+        pump_until(|| result.borrow().is_some());
         let result = result.borrow(); let (code, values) = result.as_ref().unwrap(); assert_eq!(*code, 0);
         let uris = glib::VariantDict::new(Some(values)).lookup::<Vec<String>>("uris").unwrap().unwrap();
         assert_eq!(uris.len(), 2); assert!(uris[0].ends_with("a%20b.txt")); assert!(uris[1].ends_with("name-%FF.txt"));
@@ -720,6 +825,7 @@ mod tests {
         let result = Rc::new(RefCell::new(Vec::new())); let output = result.clone();
         let window = show(&app, "SaveFile", "test", "", "Save", &dict.end(), move |code, results| output.borrow_mut().push((code, results)));
         let picker = state(&window); let weak = Rc::downgrade(&picker); load(&picker); picker.accept();
+        wait_overwrite(&picker);
         let css = picker.css.clone(); assert!(css.upgrade().is_some());
         assert!(picker.overwrite.get());
         let dialog = window.downcast_ref::<adw::ApplicationWindow>().unwrap().visible_dialog().unwrap();

@@ -493,7 +493,7 @@ mod tests {
     #[ignore = "requires an isolated graphical session with SHELL=/bin/sh and temporary XDG_CONFIG_HOME"]
     fn terminal_window_can_shrink_after_growing() {
         use super::*;
-        use super::super::{self as window, navigation};
+        use crate::window::{self as window, navigation};
         assert!(std::env::var_os("XDG_CONFIG_HOME").is_some());
         adw::init().unwrap();
         gtk::Settings::default().unwrap().set_gtk_enable_animations(false);

@@ -17,10 +17,13 @@ mod commands;
 mod columns;
 mod directory;
 mod navigation;
+mod location;
 mod places;
+mod recovery;
 pub(crate) mod picker;
 mod search;
 mod terminal;
+mod transfers;
 mod trash_view;
 mod view;
 mod updates;
@@ -28,6 +31,10 @@ mod updates;
 mod preview_tests;
 #[cfg(test)]
 mod operation_tests;
+#[cfg(test)]
+mod capability_tests;
+#[cfg(test)]
+mod launch_tests;
 
 
 const CSS: &str = "
@@ -45,7 +52,7 @@ columnview > listview > row:hover { background: alpha(@window_fg_color, 0.06); }
 columnview > listview > row:selected,
 columnview > listview > row:selected:hover { background: alpha(@accent_bg_color, 0.22); }
 columnview > listview > row > cell { padding: 3px 10px; }
-.crumbs button { padding: 3px 8px; min-height: 0; }
+.crumbs button { padding: 3px 8px; min-height: 0; font-weight: normal; }
 .crumbs button.current { font-weight: bold; }
 button.place-card, button.drive-card {
   background: @card_bg_color;
@@ -139,14 +146,19 @@ struct Tab {
     terminal: terminal::Pane,
     /// Navigation and newer requests supersede pending terminal path inspections.
     navigation_generation: Cell<u64>,
+    pending_location: RefCell<Option<gio::File>>,
+    location: RefCell<Option<gio::File>>,
+    directory_target: RefCell<Option<(PathBuf, Result<PathBuf, String>)>>,
+    directory_check: RefCell<Option<(PathBuf, u64)>>,
 }
 
 impl Tab {
     fn current_dir(&self) -> Option<gio::File> {
+        if let Some(file) = self.pending_location.borrow().as_ref() { return Some(file.clone()); }
         if self.view_stack.visible_child_name().as_deref() == Some("columns") {
             return self.columns.file();
         }
-        self.dir_list.file()
+        self.dir_list.file().or_else(|| self.location.borrow().clone())
     }
 
     fn current_source(&self) -> gtk::DirectoryList {
@@ -157,6 +169,7 @@ impl Tab {
     }
 
     fn begin_navigation(&self) -> u64 {
+        self.pending_location.borrow_mut().take();
         let generation = self.navigation_generation.get().wrapping_add(1);
         self.navigation_generation.set(generation);
         generation
@@ -178,6 +191,31 @@ impl Tab {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocationAccess { Unavailable, Checking, Local }
+
+/// Use the asynchronous directory inspection without blocking GTK.
+fn location_access(tab: &Tab) -> LocationAccess {
+    if tab.pending_location.borrow().is_some()
+        || matches!(tab.view_stack.visible_child_name().as_deref(),
+            Some("computer" | "trash" | "unavailable"))
+        || tab.current_source().error().is_some()
+    {
+        return LocationAccess::Unavailable;
+    }
+    let Some(path) = tab.current_dir().and_then(|file| file.path()) else {
+        return LocationAccess::Unavailable;
+    };
+    let inspected = tab.directory_target.borrow();
+    let Some((requested, target)) = inspected.as_ref() else { return LocationAccess::Checking; };
+    if *requested != path { return LocationAccess::Checking; }
+    if target.is_ok() { LocationAccess::Local } else { LocationAccess::Unavailable }
+}
+
+fn terminal_visible(tab: &Tab) -> bool {
+    tab.terminal.widget().end_child().is_some_and(|child| child.is_visible())
+}
+
 /// The whole window and its shared state.
 struct App {
     window: adw::ApplicationWindow,
@@ -186,7 +224,7 @@ struct App {
     sidebar_list: gtk::ListBox,
     back_btn: gtk::Button,
     fwd_btn: gtk::Button,
-    up_btn: gtk::Button,
+    location: location::Bar,
     status: gtk::Label,
     tabs: RefCell<Vec<Rc<Tab>>>,
     /// Grid icon size in pixels (list scales from it); shared view mode.
@@ -214,6 +252,7 @@ struct App {
     /// New actions invalidate Redo even when a history worker is still running.
     history_generation: Cell<u64>,
     pending_renames: RefCell<Vec<std::rc::Weak<navigation::RenameScope>>>,
+    recovery: recovery::State,
     updates: updates::State,
 }
 
@@ -259,8 +298,10 @@ pub fn open_files(app: &adw::Application, files: &[gio::File]) {
     }
     let Some(state) = app_state(app) else { return };
     if fresh && files.is_empty() {
-        navigation::new_tab(&state, gio::File::for_path(glib::home_dir()), true);
-        places::show_computer(&state, &navigation::active_tab(&state));
+        if !recovery::restore_session(&state) {
+            navigation::new_tab(&state, gio::File::for_path(glib::home_dir()), true);
+            places::show_computer(&state, &navigation::active_tab(&state));
+        }
     } else {
         for file in files {
             open_gfile(&state, file);
@@ -308,7 +349,19 @@ pub fn open_targets(app: &adw::Application, targets: &[crate::file_manager::Targ
 }
 
 fn open_gfile(state: &Rc<App>, file: &gio::File) {
-    let Some(path) = file.path() else { return };
+    if is_trash_root(file) {
+        navigation::new_tab(state, gio::File::for_path(glib::home_dir()), true);
+        navigation::go_trash(state, &navigation::active_tab(state));
+        return;
+    }
+    let Some(path) = file.path() else {
+        if state.tabs.borrow().is_empty() {
+            navigation::new_tab(state, gio::File::for_path(glib::home_dir()), true);
+            places::show_computer(state, &navigation::active_tab(state));
+        }
+        toast(state, &format!("This location is not supported: {}", file.uri()));
+        return;
+    };
     if path.is_dir() {
         navigation::new_tab(state, gio::File::for_path(path), true);
         return;
@@ -322,19 +375,28 @@ fn open_gfile(state: &Rc<App>, file: &gio::File) {
     navigation::select_names(&navigation::active_tab(state), &[name], || {});
 }
 
+fn is_trash_root(file: &gio::File) -> bool {
+    let Ok(uri) = glib::Uri::parse(&file.uri(), glib::UriFlags::NONE) else { return false };
+    uri.scheme().eq_ignore_ascii_case("trash")
+        && uri.host().as_deref().is_none_or(str::is_empty)
+        && uri.userinfo().is_none()
+        && uri.port() == -1
+        && uri.query().is_none()
+        && uri.fragment().is_none()
+        && matches!(uri.path().as_str(), "" | "/")
+}
+
 fn build(app: &adw::Application) {
     install_css();
 
     let back_btn = crate::icon::flat_button("go-previous-symbolic", "Back (Alt+Left)");
     let fwd_btn = crate::icon::flat_button("go-next-symbolic", "Forward (Alt+Right)");
-    let up_btn = crate::icon::flat_button("go-up-symbolic", "Up (Alt+Up)");
     let sidebar_toggle = gtk::ToggleButton::builder()
         .child(&crate::icon::image_named("sidebar-show-symbolic", 16))
         .active(true)
         .tooltip_text("Toggle sidebar")
         .build();
     sidebar_toggle.add_css_class("flat");
-    let new_tab_btn = crate::icon::flat_button("tab-new-symbolic", "New tab (Ctrl+T)");
     let view_toggle = gtk::MenuButton::builder()
         .child(&crate::icon::image_named("view-grid-symbolic", 16))
         .tooltip_text("View: Grid, List or Columns").build();
@@ -344,14 +406,16 @@ fn build(app: &adw::Application) {
     }
     view_toggle.set_menu_model(Some(&view_menu));
     view_toggle.add_css_class("flat");
-    let sort_btn = gtk::MenuButton::builder()
-        .child(&crate::icon::image_named("view-sort-ascending-symbolic", 16))
-        .tooltip_text("Sort by")
-        .build();
-    sort_btn.add_css_class("flat");
-    sort_btn.set_menu_model(Some(&sort_menu()));
-    let zoom_out = crate::icon::flat_button("zoom-out-symbolic", "Zoom out (Ctrl+-)");
-    let zoom_in = crate::icon::flat_button("zoom-in-symbolic", "Zoom in (Ctrl++)");
+    view_menu.append_section(None, &sort_menu());
+    let zoom_menu = gio::Menu::new();
+    zoom_menu.append(Some("Zoom In"), Some("win.zoom-in"));
+    zoom_menu.append(Some("Zoom Out"), Some("win.zoom-out"));
+    view_menu.append_section(Some("Zoom"), &zoom_menu);
+    view_toggle.set_tooltip_text(Some("View options"));
+    view_toggle.set_widget_name("filescope-view-options");
+    let search_btn = crate::icon::flat_button("system-search-symbolic", "Search (Ctrl+F)");
+    search_btn.set_action_name(Some("win.find"));
+    let location = location::Bar::new();
     let menu_btn = gtk::MenuButton::builder().child(&crate::icon::image_named("open-menu-symbolic", 16)).build();
     menu_btn.set_menu_model(Some(&primary_menu()));
 
@@ -359,13 +423,10 @@ fn build(app: &adw::Application) {
     header.pack_start(&sidebar_toggle);
     header.pack_start(&back_btn);
     header.pack_start(&fwd_btn);
-    header.pack_start(&up_btn);
-    header.pack_start(&new_tab_btn);
     header.pack_end(&menu_btn);
-    header.pack_end(&sort_btn);
     header.pack_end(&view_toggle);
-    header.pack_end(&zoom_in);
-    header.pack_end(&zoom_out);
+    header.pack_end(&search_btn);
+    header.set_title_widget(Some(&location.widget));
 
     let tab_view = adw::TabView::new();
     // Autohide: the tab bar disappears when only one tab is open (no point
@@ -401,7 +462,11 @@ fn build(app: &adw::Application) {
 
     let sidebar_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).build();
     sidebar_list.add_css_class("navigation-sidebar");
-    let sidebar_scroller = gtk::ScrolledWindow::builder().vexpand(true).child(&sidebar_list).build();
+    let sidebar_scroller = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&sidebar_list)
+        .build();
     let sidebar_header = adw::HeaderBar::builder().show_end_title_buttons(false).build();
     sidebar_header.set_title_widget(Some(&adw::WindowTitle::new("filescope", "")));
     let sidebar = adw::ToolbarView::new();
@@ -427,6 +492,10 @@ fn build(app: &adw::Application) {
         .default_height(cfg.height)
         .content(&split)
         .build();
+    let narrow = adw::Breakpoint::new(adw::BreakpointCondition::parse("max-width: 800px").unwrap());
+    narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
+    narrow.add_setter(&split, "show-sidebar", Some(&false.to_value()));
+    window.add_breakpoint(narrow);
     if cfg.maximized {
         window.maximize();
     }
@@ -438,7 +507,7 @@ fn build(app: &adw::Application) {
         sidebar_list: sidebar_list.clone(),
         back_btn: back_btn.clone(),
         fwd_btn: fwd_btn.clone(),
-        up_btn: up_btn.clone(),
+        location,
         status,
         tabs: RefCell::new(Vec::new()),
         zoom: Cell::new(cfg.zoom),
@@ -457,10 +526,12 @@ fn build(app: &adw::Application) {
         history_busy: Cell::new(false),
         history_generation: Cell::new(0),
         pending_renames: RefCell::new(Vec::new()),
+        recovery: recovery::State::new(cfg.restore_session),
         updates: updates::State::new(cfg.automatic_updates),
     });
 
     install_actions(app, &state);
+    location::connect(&state);
     updates::setup(&state);
     places::populate_sidebar(&state);
 
@@ -480,11 +551,12 @@ fn build(app: &adw::Application) {
         let state = state.clone();
         let application = app.downgrade();
         window.connect_close_request(move |window| {
+            state.location.stop();
             preview::close_sushi(window);
+            save_settings(&state);
             for tab in state.tabs.borrow().iter() {
                 tab.shutdown();
             }
-            save_settings(&state);
             // The search service can outlive this window. Reopening must build
             // a new window instead of presenting the destroyed one.
             if let Some(application) = application.upgrade()
@@ -509,6 +581,7 @@ fn build(app: &adw::Application) {
                 tv.close_page_finish(page, false);
             } else {
                 for tab in state.tabs.borrow().iter().filter(|t| t.page.borrow().as_ref() == Some(page)) {
+                    recovery::remember(&state, tab);
                     tab.shutdown();
                 }
                 state.tabs.borrow_mut().retain(|t| t.page.borrow().as_ref() != Some(page));
@@ -525,22 +598,6 @@ fn build(app: &adw::Application) {
     {
         let s = state.clone();
         fwd_btn.connect_clicked(move |_| { let t = navigation::active_tab(&s); navigation::go_forward(&s, &t); });
-    }
-    {
-        let s = state.clone();
-        up_btn.connect_clicked(move |_| { let t = navigation::active_tab(&s); navigation::go_up(&s, &t); });
-    }
-    {
-        let s = state.clone();
-        new_tab_btn.connect_clicked(move |_| { navigation::new_tab(&s, gio::File::for_path(glib::home_dir()), true); });
-    }
-    {
-        let s = state.clone();
-        zoom_in.connect_clicked(move |_| zoom(&s, ZOOM_STEP));
-    }
-    {
-        let s = state.clone();
-        zoom_out.connect_clicked(move |_| zoom(&s, -ZOOM_STEP));
     }
     {
         // Explorer zooms with Ctrl+wheel. Plain scrolling still moves the page.
@@ -721,6 +778,7 @@ const ACCELS: &[(&str, &[&str])] = &[
     ("forward", &["<alt>Right"]),
     ("up", &["<alt>Up"]),
     ("home", &["<alt>Home"]),
+    ("location", &["<ctrl>l"]),
     ("copy", &["<ctrl>c"]),
     ("cut", &["<ctrl>x"]),
     ("paste", &["<ctrl>v"]),
@@ -728,6 +786,7 @@ const ACCELS: &[(&str, &[&str])] = &[
     ("new-folder", &["<ctrl><shift>n"]),
     ("new-tab", &["<ctrl>t"]),
     ("close-tab", &["<ctrl>w"]),
+    ("reopen-tab", &["<ctrl><shift>t"]),
     ("select-all", &["<ctrl>a"]),
     ("refresh", &["<ctrl>r", "F5"]),
     ("find", &["<ctrl>f"]),
@@ -745,6 +804,7 @@ const ACCELS: &[(&str, &[&str])] = &[
 // --- Actions ----------------------------------------------------------------
 
 fn install_actions(app: &adw::Application, state: &Rc<App>) {
+    recovery::setup(state);
     macro_rules! action {
         ($name:literal, $body:expr) => {{
             let act = gio::SimpleAction::new($name, None);
@@ -757,6 +817,7 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
     action!("forward", |s: &Rc<App>| { let t = navigation::active_tab(s); navigation::go_forward(s, &t); });
     action!("up", |s: &Rc<App>| { let t = navigation::active_tab(s); navigation::go_up(s, &t); });
     action!("home", |s: &Rc<App>| { let t = navigation::active_tab(s); navigation::navigate(s, &t, gio::File::for_path(glib::home_dir())); });
+    action!("location", location::edit);
     action!("open", commands::open_selected);
     action!("open-with", commands::open_with);
     action!("open-containing-folder", commands::open_containing_folder);
@@ -781,13 +842,18 @@ fn install_actions(app: &adw::Application, state: &Rc<App>) {
         if tab.view_stack.visible_child_name().as_deref() == Some("trash") {
             places::show_trash(s, &tab);
         } else {
+            tab.directory_target.borrow_mut().take();
             navigation::refresh(&tab);
+            navigation::inspect_directory(s, &tab);
+            update_chrome(s);
         }
     });
     action!("find", |s: &Rc<App>| {
         let t = navigation::active_tab(s);
         if matches!(t.view_stack.visible_child_name().as_deref(), Some("computer" | "trash")) {
             navigation::navigate(s, &t, gio::File::for_path(glib::home_dir()));
+        } else if location_access(&t) != LocationAccess::Local {
+            return;
         }
         let show = !t.search_bar.is_search_mode();
         t.search_bar.set_search_mode(show);
@@ -985,10 +1051,14 @@ fn visible_selection(tab: &Tab) -> gtk::MultiSelection {
 
 fn update_chrome(app: &Rc<App>) {
     let tab = navigation::active_tab(app);
+    navigation::inspect_directory(app, &tab);
     commands::set_action_state(app, "preview-pane", &tab.preview_pane.widget.is_visible().to_variant());
     app.back_btn.set_sensitive(!tab.back.borrow().is_empty());
     app.fwd_btn.set_sensitive(!tab.fwd.borrow().is_empty());
-    app.up_btn.set_sensitive(tab.current_dir().and_then(|f| f.parent()).is_some());
+    if let Some(action) = app.window.lookup_action("up").and_downcast::<gio::SimpleAction>() {
+        action.set_enabled(tab.current_dir().and_then(|f| f.parent()).is_some());
+    }
+    location::sync(app, &tab);
 
     // The window (and, via it, the header) title follows the active tab's
     // location, so it always names the folder you're in — or the special view.
@@ -1021,12 +1091,15 @@ fn update_chrome(app: &Rc<App>) {
 
 fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
     let trash = tab.view_stack.visible_child_name().as_deref() == Some("trash");
+    let access = location_access(tab);
+    let available = matches!(access, LocationAccess::Local);
+    let local = access == LocationAccess::Local;
     let busy = navigation::batch_busy(tab);
-    let count = if busy { 0 } else { visible_selection(tab).selection().size() };
+    let count = if busy || !available { 0 } else { visible_selection(tab).selection().size() };
     let has_sel = count > 0 && !trash;
     let one = count == 1 && !trash;
     let has_clip = clipboard_has_files(app);
-    let folder = !tab.search.active.get() && !trash && !busy;
+    let folder = available && !tab.search.active.get() && !trash && !busy;
     // "Extract Here" only makes sense when everything selected is an archive.
     // Open With and Preview only apply to a single file, not a folder.
     let sel = commands::selected(tab);
@@ -1039,16 +1112,18 @@ fn update_actions(app: &Rc<App>, tab: &Rc<Tab>) {
 
     for (name, enabled) in [
         ("open", has_sel), ("open-with", single_file), ("preview", single_file), ("cut", has_sel),
-        ("copy", has_sel), ("paste", has_clip && folder), ("rename", has_sel && tab.view_stack.visible_child_name().as_deref() != Some("computer")), ("trash", has_sel),
+        ("copy", has_sel), ("paste", has_clip && folder), ("rename", has_sel && (one || local)), ("trash", has_sel && local),
         ("copy-path", has_sel),
-        ("copy-folder-path", folder && tab.current_dir().is_some() && tab.view_stack.visible_child_name().as_deref() != Some("computer")),
+        ("copy-folder-path", !tab.search.active.get() && !trash && !busy && tab.current_dir().is_some() && tab.view_stack.visible_child_name().as_deref() != Some("computer")),
         ("delete", has_sel), ("properties", one),
-        ("extract", all_archives && folder), ("compress", has_sel && folder),
+        ("extract", all_archives && folder && local), ("compress", has_sel && folder && local),
         ("new-folder", folder), ("open-containing-folder", one && !folder),
-        ("bookmark", !busy), ("open-terminal", !busy),
+        ("bookmark", !busy), ("open-terminal", !busy && local),
+        ("terminal-pane", terminal_visible(tab) || !busy && local),
+        ("find", local || matches!(tab.view_stack.visible_child_name().as_deref(), Some("computer" | "trash"))),
         ("sort", folder), ("sort-descending", folder),
-        ("undo", !app.history_busy.get() && !app.undo_stack.borrow().is_empty()),
-        ("redo", !app.history_busy.get() && !app.redo_stack.borrow().is_empty()),
+        ("undo", !app.history_busy.get() && app.undo_stack.borrow().last().is_some_and(commands::history_is_local)),
+        ("redo", !app.history_busy.get() && app.redo_stack.borrow().last().is_some_and(commands::history_is_local)),
     ] {
         if let Some(act) = app.window.lookup_action(name) {
             act.downcast::<gio::SimpleAction>().unwrap().set_enabled(enabled);
@@ -1211,8 +1286,33 @@ fn set_view_mode(app: &Rc<App>, mode: ViewMode) {
 
 fn toggle_terminal_pane(app: &Rc<App>) {
     let tab = navigation::active_tab(app);
-    let cwd = navigation::here(&tab).as_ref().and_then(terminal_cwd);
-    tab.terminal.toggle(cwd.as_deref());
+    if terminal_visible(&tab) {
+        tab.terminal.toggle(None);
+        update_chrome(app);
+        return;
+    }
+    if location_access(&tab) != LocationAccess::Local { return; }
+    let Some(cwd) = navigation::here(&tab).as_ref().and_then(terminal_cwd) else { return; };
+    let generation = tab.begin_navigation();
+    let work = BackgroundWork::new(app);
+    let app = Rc::downgrade(app);
+    let tab = Rc::downgrade(&tab);
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || {
+            std::fs::canonicalize(&cwd)?;
+            Ok::<_, std::io::Error>(cwd)
+        }).await;
+        let _work = work;
+        let (Some(app), Some(tab)) = (app.upgrade(), tab.upgrade()) else { return; };
+        if !app.window.is_visible() || tab.navigation_generation.get() != generation
+            || !app.tabs.borrow().iter().any(|open| Rc::ptr_eq(open, &tab)) { return; }
+        match result {
+            Ok(Ok(cwd)) if !terminal_visible(&tab) => tab.terminal.toggle(Some(&cwd)),
+            Ok(Err(error)) => toast(&app, &error.to_string()),
+            _ => {},
+        }
+        update_chrome(&app);
+    });
 }
 
 fn save_settings(app: &App) {
@@ -1220,6 +1320,8 @@ fn save_settings(app: &App) {
         view_mode: app.view_mode.get(),
         preview_pane: app.preview_pane_default.get(),
         automatic_updates: app.updates.automatic.get(),
+        restore_session: app.recovery.restore_session.get(),
+        session: recovery::session(app),
         zoom: app.zoom.get(),
         sort_key: app.sort_key.get(),
         sort_desc: app.sort_desc.get(),
@@ -1234,6 +1336,7 @@ fn update_preview(tab: &Tab) {
     let model = visible_selection(tab);
     let selection = model.selection();
     let target = if selection.size() == 1
+        && matches!(location_access(tab), LocationAccess::Local)
         && !matches!(tab.view_stack.visible_child_name().as_deref(), Some("computer" | "trash"))
     {
         tab.current_dir().and_then(|dir| {
@@ -1251,6 +1354,9 @@ fn primary_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     let a = gio::Menu::new();
     a.append(Some("New Tab"), Some("win.new-tab"));
+    a.append(Some("Reopen Closed Tab"), Some("win.reopen-tab"));
+    a.append(Some("Enter Location"), Some("win.location"));
+    a.append(Some("Parent Folder"), Some("win.up"));
     a.append(Some("New Folder"), Some("win.new-folder"));
     a.append(Some("Open Terminal Here"), Some("win.open-terminal"));
     a.append(Some("Terminal Pane"), Some("win.terminal-pane"));
@@ -1260,13 +1366,12 @@ fn primary_menu() -> gio::Menu {
     b.append(Some("Search…"), Some("win.find"));
     b.append(Some("Show Hidden Files"), Some("win.toggle-hidden"));
     b.append(Some("Preview Pane"), Some("win.preview-pane"));
-    b.append(Some("Zoom In"), Some("win.zoom-in"));
-    b.append(Some("Zoom Out"), Some("win.zoom-out"));
     b.append(Some("Refresh"), Some("win.refresh"));
     menu.append_section(None, &b);
     let defaults = gio::Menu::new();
     defaults.append(Some("Default File Manager"), Some("win.default-file-manager"));
     defaults.append(Some("Use Filescope for Open/Save Dialogs"), Some("win.file-picker"));
+    defaults.append(Some("Restore Tabs on Startup"), Some("win.restore-session"));
     menu.append_section(None, &defaults);
     let c = gio::Menu::new();
     c.append(Some("Check for Updates…"), Some("win.check-updates"));

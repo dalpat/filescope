@@ -556,7 +556,7 @@ mod tests {
     }
 
     async fn batch_continuity(mode: super::super::ViewMode) {
-        use super::super::{self as window, commands, navigation};
+        use crate::window::{self as window, commands, navigation};
         assert!(std::env::var_os("XDG_CONFIG_HOME").is_some());
         adw::init().unwrap();
         gtk::Settings::default().unwrap().set_gtk_enable_animations(false);
@@ -630,7 +630,7 @@ mod tests {
     }
 
     async fn batch_boundary_fixture() -> (adw::Application, Rc<super::super::App>, Rc<super::super::Tab>, PathBuf) {
-        use super::super::{self as window, navigation};
+        use crate::window::{self as window, navigation};
         assert!(std::env::var_os("XDG_CONFIG_HOME").is_some());
         adw::init().unwrap();
         gtk::Settings::default().unwrap().set_gtk_enable_animations(false);
@@ -663,7 +663,7 @@ mod tests {
     #[test]
     #[ignore = "requires isolated GTK and temporary XDG directories"]
     fn batch_history_maps_chains_once_and_preserves_partial_failures() {
-        use super::super::{self as window, commands, navigation};
+        use crate::window::{self as window, commands, navigation};
         glib::MainContext::default().block_on(async {
             let (_application, app, parent, root) = batch_boundary_fixture().await;
             let a = open_selected_child(&app, &root.join("alias/A")).await;
@@ -709,7 +709,7 @@ mod tests {
     #[test]
     #[ignore = "requires isolated GTK and temporary XDG directories"]
     fn batch_rejected_swaps_release_held_views_without_changes() {
-        use super::super::{self as window, commands};
+        use crate::window::{self as window, commands};
         glib::MainContext::default().block_on(async {
             let (_application, app, parent, root) = batch_boundary_fixture().await;
             for destinations in [["B", "A"], ["B", "Other"]] {
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     #[ignore = "requires isolated GTK and temporary XDG directories"]
     fn batch_holds_preserve_newer_navigation_and_rebase_history() {
-        use super::super::{self as window, commands, navigation};
+        use crate::window::{self as window, commands, navigation};
         glib::MainContext::default().block_on(async {
             let (_application, app, parent, root) = batch_boundary_fixture().await;
             let child = open_selected_child(&app, &root.join("A")).await;
@@ -785,7 +785,7 @@ mod tests {
     #[test]
     #[ignore = "requires isolated GTK and temporary XDG directories"]
     fn batch_alias_navigation_and_search_scope_follow_successful_renames() {
-        use super::super::{self as window, commands, navigation};
+        use crate::window::{self as window, commands, navigation};
         glib::MainContext::default().block_on(async {
             let (_application, app, parent, root) = batch_boundary_fixture().await;
             std::os::unix::fs::symlink(root.join("A"), root.join("shortcut")).unwrap();
@@ -829,7 +829,7 @@ mod tests {
     #[test]
     #[ignore = "requires isolated GTK and temporary XDG directories"]
     fn batch_completion_keeps_newer_selection_and_rendered_rows() {
-        use super::super::{self as window, commands, navigation};
+        use crate::window::{self as window, commands, navigation};
         glib::MainContext::default().block_on(async {
             let (_application, app, parent, root) = batch_boundary_fixture().await;
             navigation::select_names(&parent, &["A".into(), "B".into()], || {});
@@ -861,7 +861,7 @@ mod tests {
     #[test]
     #[ignore = "requires isolated GTK and temporary XDG directories"]
     fn batch_renamed_symlink_keeps_open_descendants_through_history() {
-        use super::super::{self as window, commands};
+        use crate::window::{self as window, commands};
         glib::MainContext::default().block_on(async {
             let (_application, app, parent, root) = batch_boundary_fixture().await;
             std::os::unix::fs::symlink(root.join("A"), root.join("shortcut")).unwrap();
@@ -898,7 +898,7 @@ mod tests {
     }
 
     async fn batch_new_descendant(mode: super::super::ViewMode) {
-        use super::super::{self as window, commands, navigation};
+        use crate::window::{self as window, commands, navigation};
         let (_application, app, _parent, root) = batch_boundary_fixture().await;
         window::set_view_mode(&app, mode);
         std::fs::create_dir(root.join("A/deep")).unwrap();
@@ -939,7 +939,7 @@ mod tests {
     }
 
     async fn batch_replacement_navigation(mode: super::super::ViewMode) {
-        use super::super::{self as window, commands, navigation};
+        use crate::window::{self as window, commands, navigation};
         let (_application, app, _parent, root) = batch_boundary_fixture().await;
         window::set_view_mode(&app, mode);
         std::fs::create_dir(root.join("A/deep")).unwrap();
@@ -1018,7 +1018,7 @@ mod tests {
     }
 
     async fn batch_row_identity(mode: super::super::ViewMode, symlink: bool, replacement: bool) {
-        use super::super::{self as window, commands, navigation};
+        use crate::window::{self as window, commands, navigation};
         let (_application, app, _parent, root) = batch_boundary_fixture().await;
         window::set_view_mode(&app, mode);
         let source = if symlink {
@@ -1107,7 +1107,7 @@ mod tests {
     #[test]
     #[ignore = "requires isolated GTK and temporary XDG directories"]
     fn batch_unknown_entry_identity_does_not_authorize_remapping() {
-        use super::super::{self as window, commands, navigation};
+        use crate::window::{self as window, commands, navigation};
         glib::MainContext::default().block_on(async {
             let (_application, app, _parent, root) = batch_boundary_fixture().await;
             window::set_view_mode(&app, window::ViewMode::List);
@@ -1206,11 +1206,16 @@ mod tests {
             super::super::update_actions(&app, &tab);
             assert!(app.window.lookup_action("rename").unwrap().is_enabled());
             commands::rename_selected(&app);
-            let dialog = gtk::Window::list_toplevels()
-                .into_iter()
-                .filter_map(|w| w.downcast::<gtk::Window>().ok())
-                .find(|w| w.title().as_deref() == Some("Rename 3 Items"))
-                .expect("multi selection did not open batch dialog");
+            let mut dialog = None;
+            for _ in 0..100 {
+                dialog = gtk::Window::list_toplevels()
+                    .into_iter()
+                    .filter_map(|w| w.downcast::<gtk::Window>().ok())
+                    .find(|w| w.title().as_deref() == Some("Rename 3 Items"));
+                if dialog.is_some() { break; }
+                glib::timeout_future(std::time::Duration::from_millis(25)).await;
+            }
+            let dialog = dialog.expect("multi selection did not open batch dialog");
             dialog.close();
             drop(dialog);
             let state = build(&app, paths);
@@ -1414,6 +1419,7 @@ mod tests {
             assert!(matches!(&app.undo_stack.borrow()[1], Action::BatchRename { pending } if pending.len() == 1));
             assert!(matches!(app.undo_stack.borrow().last(), Some(Action::NewFolder { path }) if path == &later));
             commands::undo(&app);
+            history_ready(&app).await;
             assert!(!later.exists(), "the newer operation must remain first in Undo order");
             std::fs::remove_file(root.join("a.txt")).unwrap();
             commands::undo(&app); history_ready(&app).await;

@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.8.0] - 2026-11-13
+
+Everyday navigation, file-picker improvements and safer transfers. The release
+keeps the existing x86_64 tarball; native packages and Flatpak move to 0.9.0.
+See the [release notes](https://github.com/dalpat/filescope/releases/tag/v0.8.0)
+for the supported scope, known issues and validation limits.
+
+### Added
+
+- Reopen closed tabs with Ctrl+Shift+T and optionally restore tab locations on
+  startup. Restored tabs do not resume terminal sessions or operations.
+- Shared asynchronous path completion in the main location entry and picker.
+- Inline Ctrl+L editing in a compact navigation header. Breadcrumbs share the
+  header with Back/Forward and Search; sorting and zoom live in View options.
+  The sidebar collapses in narrow windows.
+- Picker Back/Forward/Up, per-application remembered folders, favorites, folder
+  search, previews, and a multi-folder file-selection basket.
+- Save filename feedback with explicit extension suggestions, preserving raw
+  filenames, caller filters/choices, and SaveFiles names.
+- Transfer measurements, pending/cancelled/failed outcomes, per-item details and
+  retry for eligible failed selections without repeating completed transfers.
+
+### Fixed
+
+- Compress accepts dangling symlink entries, and local file URI schemes are
+  case-insensitive.
+
+- External `trash://` and `trash:///` launches route to Trash, including primary
+  process forwarding and FileManager1 activation.
+- Missing recent files no longer leave blank layout positions in This PC; the
+  This PC sidebar entry has its own group between places and devices.
+- Transfer conflict/copy waits cannot remove a replaced source or discard the
+  source after the copied destination or a descendant changes.
+- Copies preserve raw names and private partial-file permissions, reject special
+  files safely, and cannot replace an ancestor containing their own source.
+- Picker Save rechecks both existing and previously missing destinations after
+  asynchronous access checks, so newly created files require a fresh decision.
+- Managed-location aliases retain capability restrictions and cannot silently
+  fall back to an unmounted local backing directory.
+
+### Support and known issues
+
+- Wayland desktops only; X11 is outside this release's support scope.
+- A terminal-link integration test fails for a quoted path containing spaces
+  and Japanese characters. The cause is unconfirmed and the issue is accepted
+  for now.
+- Manual desktop and tarball install/upgrade acceptance remain deferred. GTK
+  integration checks ran on Broadway and do not establish native Wayland acceptance.
+
 ## [0.7.0] - 2026-10-29
 
 Column browsing, batch rename, optional Open/Save dialogs, and verified updates.

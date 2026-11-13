@@ -261,6 +261,9 @@ fn user_file(path: &Path) -> Result<()> {
 }
 
 pub fn installed_binary() -> Result<PathBuf> {
+    if let Some(owner) = managed_owner() {
+        return Err(format!("This installation is managed by {owner}. Use that package manager to update Filescope.").into());
+    }
     let target = glib::home_dir()
         .join(".local/bin")
         .join(layout("UPDATE_BINARY"));
@@ -278,6 +281,25 @@ pub fn installed_binary() -> Result<PathBuf> {
         return Err("This installation is not registered for in-app updates. Reinstall with Filescope's installer first.".into());
     }
     Ok(target)
+}
+
+fn managed_owner() -> Option<&'static str> {
+    match option_env!("FILESCOPE_DISTRIBUTION") {
+        Some("deb") => Some("apt"),
+        Some("rpm") => Some("dnf"),
+        Some("flatpak") => Some("flatpak"),
+        _ => None,
+    }
+}
+
+/// Packaging diagnostics use the same guard as replacement, without GTK or networking.
+pub fn print_installation_info() {
+    let check = installed_binary();
+    println!("{}", serde_json::json!({
+        "format": "filescope-installation-v1", "version": env!("CARGO_PKG_VERSION"),
+        "update_owner": managed_owner().unwrap_or("user-installer"),
+        "self_update_allowed": check.is_ok(), "reason": check.err().map(|error| error.to_string()),
+    }));
 }
 
 struct Stage(PathBuf);
@@ -846,6 +868,7 @@ mod tests {
         );
         fs::remove_dir_all(dir).unwrap();
     }
+
 
     #[test]
     #[ignore = "contacts the public GitHub release API"]

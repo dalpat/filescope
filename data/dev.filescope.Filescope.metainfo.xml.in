@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.filescope.Filescope</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Filescope</name>
+  <summary>Browse and manage your files</summary>
+  <developer id="dev.filescope"><name>Filescope contributors</name></developer>
+  <description>
+    <p>Browse folders using grid, list or columns, with previews, tabs, search and an embedded terminal.</p>
+    <p>Manage local files on a Wayland desktop. Open and Save dialog integration is enabled only when you choose it.</p>
+  </description>
+  <launchable type="desktop-id">dev.filescope.Filescope.desktop</launchable>
+  <provides><binary>filescope</binary></provides>
+  <url type="homepage">https://github.com/dalpat/filescope</url>
+  <url type="bugtracker">https://github.com/dalpat/filescope/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases><release version="@VERSION@" date="@DATE@"/></releases>
+</component>

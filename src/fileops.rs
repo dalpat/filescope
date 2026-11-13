@@ -66,11 +66,11 @@ pub fn make_dir(dir: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Rename the entry at `path` to `new_name` (kept in the same directory).
+/// Rename within the same directory without replacing an existing destination.
 pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
     let parent = path.parent().ok_or_else(|| io::Error::other("no parent directory"))?;
     let dest = parent.join(new_name);
-    fs::rename(path, &dest)?;
+    rename_no_replace(path, &dest)?;
     Ok(dest)
 }
 
@@ -185,6 +185,19 @@ mod tests {
 #[cfg(test)]
 mod rename_tests {
     use super::*;
+
+    #[test]
+    fn single_rename_never_replaces_existing_files() {
+        let root = std::env::temp_dir().join(format!("filescope-single-rename-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        fs::write(&source, "source contents").unwrap();
+        fs::write(root.join("destination"), "keep destination").unwrap();
+        assert!(rename(&source, "destination").is_err());
+        assert_eq!(fs::read_to_string(&source).unwrap(), "source contents");
+        assert_eq!(fs::read_to_string(root.join("destination")).unwrap(), "keep destination");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn racing_renames_never_replace_the_winner() {

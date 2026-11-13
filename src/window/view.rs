@@ -8,7 +8,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use crate::{fileops, format, ops, undo};
+use crate::{fileops, format, ops};
 
 /// Name size follows the icon, the way a folder zoom does in Explorer.
 fn name_font(icon_px: i32) -> gtk::pango::AttrList {
@@ -278,9 +278,14 @@ pub(super) fn attach_drop_target(app: &Rc<super::App>, tab: &Rc<super::Tab>, vie
 
     {
         let view = view.as_ref().downgrade();
+        let tab = Rc::downgrade(tab);
         let hl = highlighted.clone();
         target.connect_motion(move |_, x, y| {
             let Some(view) = view.upgrade() else { return gdk::DragAction::empty(); };
+            if !tab.upgrade().is_some_and(|tab| super::location_access(&tab) != super::LocationAccess::Unavailable && !tab.search.active.get()) {
+                clear_drop_highlight(&hl);
+                return gdk::DragAction::empty();
+            }
             set_drop_highlight(&view, x, y, &hl);
             gdk::DragAction::COPY | gdk::DragAction::MOVE
         });
@@ -295,6 +300,7 @@ pub(super) fn attach_drop_target(app: &Rc<super::App>, tab: &Rc<super::Tab>, vie
         let view = view.as_ref().downgrade();
         target.connect_drop(move |target, value, x, y| {
             let (Some(app), Some(tab), Some(view)) = (app.upgrade(), tab.upgrade(), view.upgrade()) else { return false; };
+            if super::location_access(&tab) == super::LocationAccess::Unavailable || tab.search.active.get() { return false; }
             super::columns::focus_widget(&app, &tab, &view);
             if super::navigation::batch_busy(&tab) { return false; }
             clear_drop_highlight(&highlighted);
@@ -508,6 +514,7 @@ fn cell_at_position(widget: &gtk::Widget, position: u32) -> Option<gtk::Widget> 
 /// Start renaming the selected item in place. Returns false when the row isn't
 /// realized (e.g. scrolled out of view), so the caller can fall back to a dialog.
 pub(super) fn start_inline_rename(app: &Rc<super::App>, tab: &Rc<super::Tab>) -> bool {
+    if super::location_access(tab) != super::LocationAccess::Local { return false; }
     if tab.search.active.get() { return false; } // Search uses the rename dialog.
     let bitset = super::visible_selection(tab).selection();
     if bitset.size() != 1 {
@@ -598,24 +605,11 @@ pub(super) fn start_inline_rename(app: &Rc<super::App>, tab: &Rc<super::Tab>) ->
 
 /// Apply an inline rename, recording it for undo.
 fn commit_inline_rename(app: &Rc<super::App>, tab: &Rc<super::Tab>, file: &gio::File, old: &str, new: &str) {
+    if super::location_access(tab) != super::LocationAccess::Local { return; }
     if new == old {
         return; // nothing to do
     }
-    if new.is_empty() || new.contains('/') {
-        super::toast(app, "Invalid name");
-        return;
-    }
-    let renamed = file
-        .path()
-        .ok_or(())
-        .and_then(|from| fileops::rename(&from, new).map(|to| (from, to)).map_err(|_| ()));
-    match renamed {
-        Ok((from, to)) => {
-            super::navigation::renamed(app, tab, &from, &to);
-            super::commands::push_undo(app, undo::Action::Rename { from, to });
-        }
-        Err(()) => super::toast(app, "Couldn't rename"),
-    }
+    super::commands::rename_file(app, tab, file, new);
 }
 
 // GTK can retain a bound cell for the same FileInfo after metadata or sort changes.

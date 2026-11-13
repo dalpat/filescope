@@ -9,6 +9,17 @@ Built with **Rust + GTK4 + libadwaita**.
 
 ![status](https://img.shields.io/badge/status-alpha-orange)
 
+**0.8.0** is a local file-manager release. See the
+[release notes](https://github.com/dalpat/filescope/releases/tag/v0.8.0).
+It keeps the x86_64 tarball channel; native packages and Flatpak move to 0.9.0.
+An application build alone does not establish installed-tarball acceptance.
+
+Version 0.8.0 supports **Wayland desktops only**. X11 is outside this release's
+support scope. Manual desktop and tarball install/upgrade acceptance are deferred.
+A terminal-link integration test fails for a quoted path containing spaces and
+Japanese characters; the cause is not confirmed. This is an accepted known issue
+for this release.
+
 ## Screenshots
 
 <p align="center">
@@ -42,11 +53,24 @@ Built with **Rust + GTK4 + libadwaita**.
 - **Remembers your setup** — view mode, zoom, sort, show-hidden, and window size
   are restored next launch.
 - **Tabs** — each tab is an independent folder with its own history and
-  breadcrumb (Ctrl+T new, Ctrl+W close).
+  breadcrumb (Ctrl+T new, Ctrl+W close). **Ctrl+Shift+T** reopens the last closed
+  tab. **Restore Tabs on Startup** in the main menu is optional and off by
+  default; it restores locations and preview settings, without restarting shells
+  or replaying operations. An unavailable saved location offers Retry.
+- **Compact navigation header** — Back/Forward, breadcrumbs, Search, View options
+  and the main menu share one row. View options contains sorting and zoom; the
+  main menu keeps New Tab and Parent Folder. The sidebar folds away in narrow windows.
+- **Path completion** — **Ctrl+L** replaces header breadcrumbs with a selected
+  path field; Enter opens the folder and Escape restores breadcrumbs. The picker
+  shares the same completion. Use absolute paths, `~/`, file URIs, arrows and Tab.
 - **Optional Open/Save dialogs** — turn on **Use Filescope for Open/Save Dialogs**
   in the main menu to use Filescope in applications that support the FileChooser
   portal. Changes apply automatically; turning it off restores your previous
   chooser. Finish active desktop dialogs or screen sharing before changing it.
+  Dialogs include Back/Forward/Up, remembered places per calling application,
+  **Ctrl+F** search, previews, and a selection basket for opening files from
+  several folders. Save preserves the exact name, offers an explicit extension
+  suggestion, and checks overwrite decisions again before returning a destination.
 - **GNOME Overview search** — find visible file and folder names under your home
   directory using GNOME's LocalSearch/Tracker index, then open their parent folder
   with the result selected. Results show file-type icons and readable parent paths.
@@ -90,7 +114,8 @@ Built with **Rust + GTK4 + libadwaita**.
   the owning tab while the shell keeps its working directory. Hiding the pane
   retains the session; closing the tab stops it.
 - **This PC** — a Windows-Explorer-style drives overview with a capacity bar and
-  "X free of Y" for each volume.
+  "X free of Y" for each volume. Its sidebar entry has a separate group. Missing
+  recent files release their layout positions instead of leaving blank gaps.
 - **Mount & unmount drives** — click an unmounted partition to mount it; NTFS
   volumes fall back to **ntfs-3g** automatically when the system mount can't
   handle them. Eject/unmount from the sidebar.
@@ -106,7 +131,8 @@ Built with **Rust + GTK4 + libadwaita**.
 - **Background operations** — copy / move / delete run on a worker thread with a
   live **progress bar** and **Cancel**, so the window never freezes on a big
   transfer. Name clashes raise a **conflict dialog** (Replace / Skip / Keep Both,
-  with “apply to all”).
+  with “apply to all”). Feedback distinguishes unknown totals, stalls and cancellation. **Retry Failed** retries eligible failed selections, rechecks
+  conflicts and leaves completed transfers alone.
 - **Undo / redo** (`Ctrl+Z` / `Ctrl+Shift+Z`) — take back a move, copy, rename,
   new folder, or an accidental trash (restored from the Trash). Permanent deletes
   aren’t undoable, and neither is a conflict you chose to *Replace* — those are
@@ -140,6 +166,7 @@ Built with **Rust + GTK4 + libadwaita**.
 | `Delete` / `Shift+Delete` | Trash / Delete permanently |
 | `Ctrl+Shift+N` | New folder |
 | `Ctrl+T` / `Ctrl+W` | New tab / Close tab |
+| `Ctrl+Shift+T` | Reopen last closed tab |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / Redo |
 | `Ctrl+A` | Select all |
 | `Ctrl+H` | Show hidden files |
@@ -216,6 +243,11 @@ folder.
 
 ```sh
 cargo test
+# Isolated GTK regressions, including picker, Trash and This PC:
+python3 tests/gtk.py --list
+python3 tests/gtk.py 'window::picker::tests::*'
+# Optional X11-only regression harness; outside 0.8.0 support (requires Xvfb):
+python3 tests/launch.py
 # Installer regression checks (requires bubblewrap and system Python with PyGObject):
 python3 tests/install.py
 # Automatic chooser switching and recovery on a private bus (requires xdg-desktop-portal and PyGObject):

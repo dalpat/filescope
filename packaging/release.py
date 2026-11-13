@@ -2,11 +2,16 @@
 """Build the release archive and SHA-256 file accepted by Filescope's updater."""
 import argparse
 import hashlib
+import gzip
+import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import tarfile
 import tempfile
+
+import stage
 
 
 def package(binary: Path, output: Path):
@@ -28,11 +33,21 @@ def package(binary: Path, output: Path):
     if archive.exists() or checksum.exists():
         raise FileExistsError("Release artifacts already exist; choose a fresh output directory")
     with tempfile.TemporaryDirectory(prefix="filescope-release-") as temp:
+        epoch = int(os.environ.get("SOURCE_DATE_EPOCH", binary.stat().st_mtime))
         manifest = Path(temp) / "update-manifest"
         manifest.write_text("\n".join(probe) + "\n")
+        metadata = Path(temp) / "distribution.json"
+        distribution = stage.distribution(version, arch, "tarball")
+        metadata.write_text(json.dumps(distribution, indent=2) + "\n")
+        appstream = Path(temp) / f"{stage.APP_ID}.metainfo.xml"
+        appstream.write_text(stage.appstream(version, epoch))
+        notices = Path(temp) / "THIRD_PARTY_LICENSES"
+        notices.write_text(stage.third_party_licenses())
         files = {
             "filescope": binary,
             "update-manifest": manifest,
+            "distribution.json": metadata,
+            f"{stage.APP_ID}.metainfo.xml": appstream,
             "install.sh": root / "packaging/install-release.sh",
             "install-binary.sh": root / "packaging/install-binary.sh",
             "update-layout": root / "packaging/update-layout",
@@ -41,12 +56,20 @@ def package(binary: Path, output: Path):
             "README.md": root / "README.md",
             "CHANGELOG.md": root / "CHANGELOG.md",
             "LICENSE": root / "LICENSE",
+            "THIRD_PARTY_LICENSES": notices,
         }
         try:
             with archive.open("xb") as destination:
-                with tarfile.open(fileobj=destination, mode="w:gz", format=tarfile.USTAR_FORMAT) as bundle:
-                    for entry, source in files.items():
-                        bundle.add(source, arcname=f"{name}/{entry}", recursive=False)
+                with gzip.GzipFile(fileobj=destination, mode="wb", filename="", mtime=epoch) as compressed:
+                    with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as bundle:
+                        for entry, source in files.items():
+                            info = bundle.gettarinfo(str(source), arcname=f"{name}/{entry}")
+                            info.uid = info.gid = 0
+                            info.uname = info.gname = ""
+                            info.mtime = epoch
+                            info.mode = 0o755 if entry in ["filescope", "install.sh", "install-binary.sh"] else 0o644
+                            with source.open("rb") as contents:
+                                bundle.addfile(info, contents)
             sha = hashlib.sha256(archive.read_bytes()).hexdigest()
             with checksum.open("x") as destination:
                 destination.write(f"{sha}  {archive.name}\n")

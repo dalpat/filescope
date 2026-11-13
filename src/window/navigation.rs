@@ -59,15 +59,7 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
 
     let breadcrumb = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
     breadcrumb.add_css_class("crumbs");
-    breadcrumb.add_css_class("linked");
-    breadcrumb.set_margin_start(8);
-    breadcrumb.set_margin_top(6);
-    breadcrumb.set_margin_bottom(6);
-    let crumb_scroller = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::External)
-        .vscrollbar_policy(gtk::PolicyType::Never)
-        .child(&breadcrumb)
-        .build();
+    breadcrumb.set_valign(gtk::Align::Center);
 
     let search_entry = gtk::SearchEntry::builder().placeholder_text("Search this folder and subfolders").hexpand(true).build();
     let search_bar = gtk::SearchBar::builder().build();
@@ -77,9 +69,7 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
     view_stack.add_named(&search.widget, Some("search"));
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content.append(&crumb_scroller);
     content.append(&search_bar);
-    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     let preview_pane = crate::preview::pane::Pane::new(app.preview_pane_default.get());
     let browser = preview_pane.split.clone();
     view_stack.set_hexpand(true);
@@ -114,6 +104,10 @@ pub(super) fn new_tab(app: &Rc<super::App>, dir: gio::File, select: bool) {
         list_zoom: Rc::new(Cell::new(grid_size)),
         terminal: terminal_pane,
         navigation_generation: Cell::new(0),
+        pending_location: RefCell::new(None),
+        location: RefCell::new(None),
+        directory_target: RefCell::new(None),
+        directory_check: RefCell::new(None),
     });
 
     tab.view_stack.add_named(&tab.columns.widget, Some("columns"));
@@ -282,6 +276,9 @@ fn advance(back: &mut Vec<super::Place>, fwd: &mut Vec<super::Place>, here: supe
 
 /// Where the tab is showing right now, for the back/forward stack.
 pub(super) fn here(tab: &super::Tab) -> Option<super::Place> {
+    if let Some(file) = tab.pending_location.borrow().as_ref() {
+        return Some(super::Place::Folder(file.clone()));
+    }
     if tab.search.active.get() {
         return tab.dir_list.file().map(|root| super::Place::Search { root, query: tab.search.query.borrow().clone() });
     }
@@ -292,7 +289,7 @@ pub(super) fn here(tab: &super::Tab) -> Option<super::Place> {
     }
 }
 
-fn open_place(app: &Rc<super::App>, tab: &Rc<super::Tab>, place: super::Place) {
+pub(super) fn open_place(app: &Rc<super::App>, tab: &Rc<super::Tab>, place: super::Place) {
     match place {
         super::Place::Computer => super::places::show_computer(app, tab),
         super::Place::Trash => super::places::show_trash(app, tab),
@@ -314,9 +311,11 @@ pub(super) fn go_up(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
 
 /// Point `tab` at `file`, leaving any "This PC" view, and refresh chrome.
 pub(super) fn set_dir(app: &Rc<super::App>, tab: &Rc<super::Tab>, file: &gio::File) {
-    tab.begin_navigation();
-    // A new folder starts unfiltered — close any open search from the last one.
+    *tab.location.borrow_mut() = Some(file.clone());
+    // A new folder starts unfiltered, including a restored location.
     tab.search_bar.set_search_mode(false);
+    tab.begin_navigation();
+    tab.directory_target.borrow_mut().take();
     tab.dir_list.set_file(Some(file));
     protect_batch_directory(app, &tab.directory, true);
     if app.view_mode.get() == super::ViewMode::Columns {
@@ -338,6 +337,7 @@ pub(super) fn set_dir(app: &Rc<super::App>, tab: &Rc<super::Tab>, file: &gio::Fi
         page.set_title(&title);
     }
     super::places::sync_sidebar(app);
+    inspect_directory(app, tab);
     super::update_chrome(app);
 }
 
@@ -353,7 +353,7 @@ pub(super) fn refresh_view_mode(app: &Rc<super::App>, tab: &Rc<super::Tab>, forc
         return;
     }
     let showing = tab.view_stack.visible_child_name();
-    if !force && matches!(showing.as_deref(), Some("computer") | Some("trash")) {
+    if !force && matches!(showing.as_deref(), Some("computer" | "trash")) {
         return;
     }
     if app.view_mode.get() == super::ViewMode::Columns {
@@ -362,6 +362,10 @@ pub(super) fn refresh_view_mode(app: &Rc<super::App>, tab: &Rc<super::Tab>, forc
         }
         tab.view_stack.set_visible_child_name("columns");
         super::apply_visible_zoom(app, tab);
+        return;
+    }
+    if !tab.dir_list.is_loading() && tab.dir_list.error().is_some() {
+        super::recovery::show_unavailable(app, tab);
         return;
     }
     let empty = !tab.dir_list.is_loading() && tab.selection.n_items() == 0;
@@ -376,20 +380,21 @@ pub(super) fn refresh_view_mode(app: &Rc<super::App>, tab: &Rc<super::Tab>, forc
     super::apply_visible_zoom(app, tab);
 }
 
-/// The path bar names a folder. This PC has no path, so it is hidden there.
+/// Special views use their own header title instead of folder breadcrumbs.
 pub(super) fn set_path_visible(tab: &super::Tab, on: bool) {
-    if let Some(parent) = tab.breadcrumb.parent() {
-        parent.set_visible(on);
-    }
-    if let Some(sep) = tab.search_bar.next_sibling() {
-        sep.set_visible(on);
-    }
+    tab.breadcrumb.set_visible(on);
 }
 
 pub(super) fn refresh(tab: &Rc<super::Tab>) {
     if tab.search.active.get() { super::search::refresh(tab); return; }
     if tab.view_stack.visible_child_name().as_deref() == Some("columns") { tab.columns.refresh(); return; }
-    tab.directory.refresh();
+    if tab.dir_list.error().is_some() {
+        let file = tab.dir_list.file();
+        tab.dir_list.set_file(gio::File::NONE);
+        tab.dir_list.set_file(file.as_ref());
+    } else {
+        tab.directory.refresh();
+    }
 }
 
 pub(super) fn renamed_location(file: &gio::File, from: &gio::File, to: &gio::File) -> Option<gio::File> {
@@ -540,6 +545,12 @@ impl BatchRename {
 }
 
 /// The filesystem rename already succeeded. Keep open paths and item identities in sync.
+pub(super) fn renamed_paths(app: &Rc<super::App>, from: &std::path::Path, to: &std::path::Path) {
+    let pairs = [(gio::File::for_path(from), gio::File::for_path(to))];
+    apply_renames(app, &pairs, &pairs, None, |_| true);
+}
+
+/// Synchronous history operations still select their renamed item.
 pub(super) fn renamed(app: &Rc<super::App>, origin: &Rc<super::Tab>, from: &std::path::Path, to: &std::path::Path) {
     let from = gio::File::for_path(from); let to = gio::File::for_path(to);
     let pairs = [(from, to.clone())];
@@ -782,11 +793,24 @@ pub(super) fn rebuild_breadcrumb(app: &Rc<super::App>, tab: &Rc<super::Tab>, fil
         chain.push(f);
     }
     chain.reverse();
+    let home = gio::File::for_path(glib::home_dir());
+    if let Some(index) = chain.iter().position(|file| file.equal(&home)) {
+        chain.drain(..index);
+    }
     let last = chain.len().saturating_sub(1);
     for (i, f) in chain.into_iter().enumerate() {
-        let label =
-            f.basename().map(|b| b.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into());
-        let button = gtk::Button::builder().label(&label).build();
+        if i > 0 {
+            let separator = crate::icon::image_named("go-next-symbolic", 12);
+            separator.add_css_class("dim-label");
+            tab.breadcrumb.append(&separator);
+        }
+        let label = if f.equal(&home) { "Home".into() } else {
+            f.basename().map(|b| b.to_string_lossy().into_owned()).unwrap_or_else(|| "Filesystem".into())
+        };
+        let label_widget = gtk::Label::builder().label(&label)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle).max_width_chars(24).build();
+        let button = gtk::Button::builder().child(&label_widget).build();
+        button.set_tooltip_text(Some(&f.parse_name()));
         button.add_css_class("flat");
         if i == last {
             button.add_css_class("current");
@@ -841,4 +865,36 @@ mod tests {
         let back_to = super::retreat(&mut back, &mut fwd, Place::Trash);
         assert!(matches!(back_to, Some(Place::Computer)));
     }
+}
+
+pub(super) fn inspect_directory(app: &Rc<super::App>, tab: &Rc<super::Tab>) {
+    if tab.pending_location.borrow().is_some()
+        || matches!(tab.view_stack.visible_child_name().as_deref(), Some("computer" | "trash" | "unavailable"))
+    { return; }
+    let Some(path) = tab.current_dir().and_then(|file| file.path()) else { return; };
+    if tab.directory_target.borrow().as_ref().is_some_and(|(requested, _)| *requested == path)
+    { return; }
+    let generation = tab.navigation_generation.get();
+    if tab.directory_check.borrow().as_ref().is_some_and(|check| *check == (path.clone(), generation)) { return; }
+    *tab.directory_check.borrow_mut() = Some((path.clone(), generation));
+    let work = super::BackgroundWork::new(app);
+    let weak_app = Rc::downgrade(app); let weak_tab = Rc::downgrade(tab);
+    glib::spawn_future_local(async move {
+        let requested = path.clone();
+        let resolved = gio::spawn_blocking(move || std::fs::canonicalize(&path).map_err(|error| error.to_string()))
+            .await.unwrap_or_else(|_| Err("The directory inspection stopped".into()));
+        let _work = work;
+        let (Some(app), Some(tab)) = (weak_app.upgrade(), weak_tab.upgrade()) else { return; };
+        let owns_check = tab.directory_check.borrow().as_ref() == Some(&(requested.clone(), generation));
+        if owns_check {
+            tab.directory_check.borrow_mut().take();
+        }
+        if tab.navigation_generation.get() != generation
+            || tab.current_dir().and_then(|file| file.path()).as_ref() != Some(&requested)
+            || !app.tabs.borrow().iter().any(|open| Rc::ptr_eq(open, &tab)) || !app.window.is_visible()
+        { return; }
+        *tab.directory_target.borrow_mut() = Some((requested, resolved));
+        super::update_preview(&tab);
+        super::update_chrome(&app);
+    });
 }

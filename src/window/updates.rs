@@ -495,19 +495,9 @@ mod review_probes {
             glib::uuid_string_random()
         ));
         std::fs::create_dir_all(root.join("dest")).unwrap();
-        let fifo = root.join("slow-source");
-        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        let (writer_ready, ready) = std::sync::mpsc::channel();
-        let (release, release_rx) = std::sync::mpsc::channel();
-        let writer_path = fifo.clone();
-        let writer = std::thread::spawn(move || {
-            let mut file = std::fs::File::create(writer_path).unwrap();
-            file.write_all(b"first chunk").unwrap();
-            writer_ready.send(()).unwrap();
-            release_rx.recv().unwrap();
-            file.write_all(b"final chunk").unwrap();
-        });
+        let source = root.join("slow-source");
+        std::fs::write(&source, b"first chunkfinal chunk").unwrap();
+        let (release, ready) = crate::ops::pause_next_copy();
         open_files(&application, &[gio::File::for_path(&root)]);
         let old = app_state(&application).unwrap();
         *old.updates.installed.borrow_mut() = Some(update::Installed {
@@ -517,7 +507,7 @@ mod review_probes {
         commands::start_job(
             &old,
             crate::ops::Kind::Copy,
-            vec![fifo],
+            vec![source],
             root.join("dest"),
             true,
         );
@@ -553,7 +543,6 @@ mod review_probes {
             println!("reopened window shows: {heading:?}");
 
             release.send(()).unwrap();
-            writer.join().unwrap();
             for _ in 0..50 {
                 if old.progress_box.first_child().is_none() {
                     break;
@@ -572,6 +561,9 @@ mod review_probes {
                 "finished copy must release its guard"
             );
             // Archive callbacks and batch/history scopes must survive the old window too.
+            let archive_input = root.join("archive-input");
+            let c = std::ffi::CString::new(archive_input.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
             commands::run_tool(
                 &new,
                 "Test archive job",
@@ -582,7 +574,7 @@ mod review_probes {
                     "-c".into(),
                     "read line < \"$1\"".into(),
                     "archive-test".into(),
-                    root.join("slow-source").into_os_string(),
+                    archive_input.clone().into_os_string(),
                 ],
                 &root,
                 |_, _| {},
@@ -594,7 +586,7 @@ mod review_probes {
             let archive_blocked = restart_reason(&latest).is_some();
             let batch = navigation::BatchRename::new(&archive_owner, &[]);
             let overlapping = BackgroundWork::new(&archive_owner);
-            std::fs::write(root.join("slow-source"), b"done\n").unwrap();
+            std::fs::File::create(archive_input).unwrap().write_all(b"done\n").unwrap();
             for _ in 0..50 {
                 if archive_owner.progress_box.first_child().is_none() {
                     break;
@@ -641,7 +633,6 @@ mod conflict_tests {
     #[test]
     #[ignore = "requires an isolated graphical session and temporary XDG_CONFIG_HOME"]
     fn closed_owner_conflicts_cancel_without_losing_sources() {
-        use std::io::Write;
         assert!(std::env::var_os("XDG_CONFIG_HOME").is_some());
         adw::init().unwrap();
         let application = adw::Application::builder()
@@ -656,26 +647,17 @@ mod conflict_tests {
                 glib::uuid_string_random()
             ));
             std::fs::create_dir_all(root.join("dest")).unwrap();
-            let fifo = root.join("slow-source");
-            let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
-            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            let source = root.join("slow-source");
+            std::fs::write(&source, b"first item").unwrap();
             std::fs::write(root.join("conflict"), b"source").unwrap();
             std::fs::write(root.join("dest/conflict"), b"existing target").unwrap();
-            let (ready_tx, ready) = std::sync::mpsc::channel();
-            let (release, release_rx) = std::sync::mpsc::channel();
-            let path = fifo.clone();
-            let writer = std::thread::spawn(move || {
-                let mut file = std::fs::File::create(path).unwrap();
-                file.write_all(b"first item").unwrap();
-                ready_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-            });
+            let (release, ready) = crate::ops::pause_next_copy();
             open_files(&application, &[gio::File::for_path(&root)]);
             let owner = app_state(&application).unwrap();
             commands::start_job(
                 &owner,
                 crate::ops::Kind::Copy,
-                vec![fifo.clone(), root.join("conflict")],
+                vec![source.clone(), root.join("conflict")],
                 root.join("dest"),
                 true,
             );
@@ -690,7 +672,6 @@ mod conflict_tests {
                     owner.window.set_visible(false);
                 }
                 release.send(()).unwrap();
-                writer.join().unwrap();
                 if mode != "closed-before" {
                     for _ in 0..50 {
                         if owner.window.visible_dialog().is_some() {
@@ -735,7 +716,7 @@ mod conflict_tests {
                     owner.window.visible_dialog().unwrap().force_close();
                 }
                 for _ in 0..50 {
-                    if owner.progress_box.first_child().is_none() {
+                    if owner.progress_box.first_child().is_none() && restart_reason(&current).is_none() {
                         break;
                     }
                     glib::timeout_future(std::time::Duration::from_millis(20)).await;
@@ -749,7 +730,7 @@ mod conflict_tests {
                     dialog.force_close();
                 }
                 for _ in 0..50 {
-                    if owner.progress_box.first_child().is_none() {
+                    if owner.progress_box.first_child().is_none() && !BackgroundWork::active() {
                         break;
                     }
                     glib::timeout_future(std::time::Duration::from_millis(20)).await;
@@ -762,7 +743,7 @@ mod conflict_tests {
                     !BackgroundWork::active(),
                     "{mode}: background hold was leaked"
                 );
-                assert!(fifo.exists());
+                assert!(source.exists());
                 assert_eq!(std::fs::read(root.join("conflict")).unwrap(), b"source");
                 assert_eq!(
                     std::fs::read(root.join("dest/conflict")).unwrap(),
