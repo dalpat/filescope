@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1] - 2026-11-18
+
+### Fixed
+
+- Cards in This PC stay in their sections when Drives is expanded on GTK 4.16.
+  [Issue #1](https://github.com/dalpat/filescope/issues/1)
+
 ## [0.8.0] - 2026-11-13
 
 Everyday navigation, file-picker improvements and safer transfers. The release

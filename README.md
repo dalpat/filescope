@@ -9,12 +9,12 @@ Built with **Rust + GTK4 + libadwaita**.
 
 ![status](https://img.shields.io/badge/status-alpha-orange)
 
-**0.8.0** is a local file-manager release. See the
-[release notes](https://github.com/dalpat/filescope/releases/tag/v0.8.0).
+**0.8.1** fixes overlapping cards in This PC. See the
+[release notes](https://github.com/dalpat/filescope/releases/tag/v0.8.1).
 It keeps the x86_64 tarball channel; native packages and Flatpak move to 0.9.0.
 An application build alone does not establish installed-tarball acceptance.
 
-Version 0.8.0 supports **Wayland desktops only**. X11 is outside this release's
+Version 0.8.1 supports **Wayland desktops only**. X11 is outside this release's
 support scope. Manual desktop and tarball install/upgrade acceptance are deferred.
 A terminal-link integration test fails for a quoted path containing spaces and
 Japanese characters; the cause is not confirmed. This is an accepted known issue
@@ -246,7 +246,7 @@ cargo test
 # Isolated GTK regressions, including picker, Trash and This PC:
 python3 tests/gtk.py --list
 python3 tests/gtk.py 'window::picker::tests::*'
-# Optional X11-only regression harness; outside 0.8.0 support (requires Xvfb):
+# Optional X11-only regression harness; outside release support (requires Xvfb):
 python3 tests/launch.py
 # Installer regression checks (requires bubblewrap and system Python with PyGObject):
 python3 tests/install.py
