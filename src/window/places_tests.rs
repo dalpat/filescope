@@ -477,10 +477,11 @@ fn recent_layout_wraps_after_async_removal() {
                 assert!(allocation.width() > 0.0 && allocation.height() > 0.0);
                 if let Some(last) = previous {
                     if allocation.y() == last.y() {
+                        // A filled row distributes spare width between its cards.
+                        let gap = allocation.x() - (last.x() + last.width());
                         assert!(
-                            allocation.x()
-                                <= last.x() + last.width() + flow.column_spacing() as f32 + 1.0,
-                            "empty horizontal position"
+                            gap >= 0.0 && gap < last.width(),
+                            "adjacent cards overlap or leave an empty slot"
                         );
                     } else {
                         rows += 1;

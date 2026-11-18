@@ -136,7 +136,7 @@ fn tile_row(list: bool) -> gtk::FlowBox {
         .min_children_per_line(1)
         .homogeneous(false)
         .hexpand(true)
-        .halign(if list { gtk::Align::Fill } else { gtk::Align::Start })
+        .halign(gtk::Align::Fill)
         .valign(gtk::Align::Start)
         .css_classes(["pc-tiles"])
         .build()
